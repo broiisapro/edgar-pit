@@ -1,0 +1,71 @@
+# Form 8-K item codes and their SEC item titles.
+#
+# `items` are the current items (effective August 23, 2004), taken verbatim
+# from the General Instructions of Form 8-K on sec.gov, section "Item 1.01
+# ... Item 9.01" (retrieved 2026-10-17):
+#   https://www.sec.gov/files/form8-k.pdf
+#
+# `legacy` are the pre-August-2004 single-number items. Their titles were read
+# from the item headings of actual filings in the SEC Archives with a
+# pre-2004-08-23 filing date, for example:
+#   Item 1:  https://www.sec.gov/Archives/edgar/data/1022962/000102296201500009/eight-k.htm
+#   Item 3:  https://www.sec.gov/Archives/edgar/data/1135185/000095013404000956/d12305awe8vk.htm
+#   Item 6:  https://www.sec.gov/Archives/edgar/data/1109448/000091205701512440/a2047501z8-k.htm
+#   Item 8:  https://www.sec.gov/Archives/edgar/data/95052/000009505204000046/form_8k.txt
+#   Item 11: https://www.sec.gov/Archives/edgar/data/34151/000095015204004468/l07967ae8vk.htm
+# Note: the `items` field of pre-2004 filings is unreliable -- for many
+# filings it disagrees with the filing body (for example WFC
+# 0000072971-96-000098 is tagged "1" but reports Items 5 and 7, and JNJ
+# 0000200406-01-500009 is tagged "6" but reports Item 5), so these labels
+# describe the codes as received rather than the events the filing reported.
+# Before 2001 some filings used the shorter legacy title "Financial Statements
+# and Exhibits" for item 7.
+
+items:
+  "1.01": "Entry into a Material Definitive Agreement"
+  "1.02": "Termination of a Material Definitive Agreement"
+  "1.03": "Bankruptcy or Receivership"
+  "1.04": "Mine Safety – Reporting of Shutdowns and Patterns of Violations"
+  "1.05": "Material Cybersecurity Incidents"
+  "2.01": "Completion of Acquisition or Disposition of Assets"
+  "2.02": "Results of Operations and Financial Condition"
+  "2.03": "Creation of a Direct Financial Obligation or an Obligation under an Off-Balance Sheet Arrangement of a Registrant"
+  "2.04": "Triggering Events That Accelerate or Increase a Direct Financial Obligation or an Obligation under an Off-Balance Sheet Arrangement"
+  "2.05": "Costs Associated with Exit or Disposal Activities"
+  "2.06": "Material Impairments"
+  "3.01": "Notice of Delisting or Failure to Satisfy a Continued Listing Rule or Standard; Transfer of Listing"
+  "3.02": "Unregistered Sales of Equity Securities"
+  "3.03": "Material Modification to Rights of Security Holders"
+  "4.01": "Changes in Registrant’s Certifying Accountant"
+  "4.02": "Non-Reliance on Previously Issued Financial Statements or a Related Audit Report or Completed Interim Review"
+  "5.01": "Changes in Control of Registrant"
+  "5.02": "Departure of Directors or Certain Officers; Election of Directors; Appointment of Certain Officers; Compensatory Arrangements of Certain Officers"
+  "5.03": "Amendments to Articles of Incorporation or Bylaws; Change in Fiscal Year"
+  "5.04": "Temporary Suspension of Trading Under Registrant’s Employee Benefit Plans"
+  "5.05": "Amendments to the Registrant’s Code of Ethics, or Waiver of a Provision of the Code of Ethics"
+  "5.06": "Change in Shell Company Status"
+  "5.07": "Submission of Matters to a Vote of Security Holders"
+  "5.08": "Shareholder Director Nominations"
+  "6.01": "ABS Informational and Computational Material"
+  "6.02": "Change of Servicer or Trustee"
+  "6.03": "Change in Credit Enhancement or Other External Support"
+  "6.04": "Failure to Make a Required Distribution"
+  "6.05": "Securities Act Updating Disclosure"
+  "6.06": "Static Pool"
+  "7.01": "Regulation FD Disclosure"
+  "8.01": "Other Events"
+  "9.01": "Financial Statements and Exhibits"
+
+legacy:
+  "1": "Change in Control of Registrant"
+  "2": "Acquisition or Disposition of Assets"
+  "3": "Bankruptcy or Receivership"
+  "4": "Changes in Registrant’s Certifying Accountant"
+  "5": "Other Events"
+  "6": "Resignations of Registrant’s Directors"
+  "7": "Financial Statements, Pro Forma Financial Information and Exhibits"
+  "8": "Change in Fiscal Year"
+  "9": "Regulation FD Disclosure"
+  "10": "Amendments to the Registrant’s Code of Ethics, or Waiver of a Provision of the Code of Ethics"
+  "11": "Temporary Suspension of Trading Under Registrant’s Employee Benefit Plans"
+  "12": "Results of Operations and Financial Condition"

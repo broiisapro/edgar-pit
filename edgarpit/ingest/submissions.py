@@ -11,16 +11,36 @@ literally (the trailing ``Z`` is taken at face value); the authoritative
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import polars as pl
+import yaml
+
+from edgarpit.schemas import Events8kSchema
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ITEM_LABELS_PATH = Path(__file__).resolve().parents[2] / "config" / "8k_items.yaml"
 
 _CIK_RE = r"^\d{10}$"
 _ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
+_ITEM_CODE_RE = re.compile(r"\d+(?:\.\d{2})?")
 _EVENT_FORMS = frozenset({"8-K", "8-K/A"})
+
+_EVENTS_DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
+    "cik": pl.String,
+    "accession": pl.String,
+    "form": pl.String,
+    "acceptance_ts": pl.Datetime("us", "UTC"),
+    "ts_imputed": pl.Boolean,
+    "item_code": pl.String,
+    "item_label": pl.String,
+}
 
 _FILINGS_DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
     "cik": pl.String,
@@ -199,11 +219,75 @@ def parse_submissions(main: Mapping[str, Any], pages: Sequence[Mapping[str, Any]
     return pl.DataFrame(columns, schema=_FILINGS_DTYPES)
 
 
+def load_item_labels(path: Path | None = None) -> dict[str, str]:
+    """Load the Form 8-K item-code labels from ``path``.
+
+    The YAML file has an ``items`` mapping of current item code (``"2.02"``) to
+    SEC item title and an optional ``legacy`` mapping of pre-August-2004
+    single-number codes. Returns the merged ``{item_code: label}`` dict; the
+    default path is ``config/8k_items.yaml``. Raises ``ValueError`` when the
+    file cannot be read, has no ``items`` mapping, defines a code twice or
+    outside the code format, or gives a code an empty label.
+    """
+    source = DEFAULT_ITEM_LABELS_PATH if path is None else Path(path)
+    try:
+        raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read item labels {source}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML in item labels {source}: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), dict):
+        raise ValueError(f"item labels {source} must contain an 'items' mapping")
+    labels: dict[str, str] = {}
+    for section in ("items", "legacy"):
+        entries = raw.get(section, {})
+        if not isinstance(entries, dict):
+            raise ValueError(f"item labels {source}: section {section!r} must be a mapping")
+        for code, label in entries.items():
+            key = str(code)
+            if not _ITEM_CODE_RE.fullmatch(key):
+                raise ValueError(f"item labels {source}: code {key!r} is not an item code")
+            if key in labels:
+                raise ValueError(f"item labels {source}: code {key!r} is defined more than once")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(f"item labels {source}: code {key!r} has no label")
+            labels[key] = label.strip()
+    return labels
+
+
 def explode_8k_items(filings: pl.DataFrame, item_labels: Mapping[str, str]) -> pl.DataFrame:
     """Explode every 8-K/8-K/A filing's ``items`` into one row per item code.
 
-    ``item_labels`` maps an item code (``"2.02"``) to its label; codes that are
-    missing from the mapping get the label ``"unknown"``. Returns a frame valid
-    under :class:`edgarpit.schemas.Events8kSchema`.
+    ``filings`` is a frame with ``cik``, ``accession``, ``form``,
+    ``acceptance_ts`` (aware UTC), ``ts_imputed`` and the raw comma-separated
+    ``items`` column; ``item_labels`` maps an item code (``"2.02"``) to its
+    label. Each 8-K/8-K/A row yields one row per distinct, stripped item code,
+    carrying the filing's ``acceptance_ts`` and ``ts_imputed``; codes missing
+    from the mapping get the label ``"unknown"``. Filings whose ``items`` is
+    null, empty or only separators produce no rows; the count of such filings
+    is logged. Returns a frame valid under
+    :class:`edgarpit.schemas.Events8kSchema` (unique on
+    ``(accession, item_code)``).
     """
-    raise NotImplementedError
+    eight_ks = filings.filter(pl.col("form").is_in(sorted(_EVENT_FORMS)))
+    events = (
+        eight_ks.select("cik", "accession", "form", "acceptance_ts", "ts_imputed", "items")
+        .with_columns(pl.col("items").str.split(","))
+        .explode("items", empty_as_null=True)
+        .with_columns(pl.col("items").str.strip_chars().alias("item_code"))
+        .filter(pl.col("item_code").is_not_null() & (pl.col("item_code") != ""))
+        .unique(subset=["accession", "item_code"], keep="first", maintain_order=True)
+        .with_columns(
+            pl.col("item_code").replace_strict(item_labels, default="unknown").alias("item_label")
+        )
+        .select(*_EVENTS_DTYPES)
+    )
+    filers = events["accession"].n_unique()
+    logger.info(
+        "exploded %d 8-K item rows from %d filings; %d filings carry no items",
+        events.height,
+        filers,
+        eight_ks.height - filers,
+    )
+    Events8kSchema.validate(events)
+    return events
