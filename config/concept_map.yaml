@@ -1,0 +1,185 @@
+# Canonical fundamentals fields (decision S-8). Rank is position in each
+# ordered list: rank 1 is the field's preferred concept for that taxonomy.
+#
+# kind: duration | instant
+# unit_family: currency | shares | currency_per_share
+fields:
+  revenue:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - RevenueFromContractWithCustomerExcludingAssessedTax
+      - Revenues
+      - RevenueFromContractWithCustomerIncludingAssessedTax
+      - SalesRevenueNet
+    ifrs-full:
+      - Revenue
+      - RevenueFromContractsWithCustomers
+
+  gross_profit:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - GrossProfit
+    ifrs-full:
+      - GrossProfit
+
+  operating_income:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - OperatingIncomeLoss
+    ifrs-full:
+      - ProfitLossFromOperatingActivities
+
+  net_income:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - NetIncomeLoss
+      - ProfitLoss
+    ifrs-full:
+      - ProfitLoss
+      - ProfitLossAttributableToOwnersOfParent
+
+  income_before_tax:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest
+      - IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments
+    ifrs-full:
+      - ProfitLossBeforeTax
+
+  eps_basic:
+    kind: duration
+    unit_family: currency_per_share
+    us-gaap:
+      - EarningsPerShareBasic
+      - IncomeLossFromContinuingOperationsPerBasicShare
+    ifrs-full:
+      - BasicEarningsLossPerShare
+
+  eps_diluted:
+    kind: duration
+    unit_family: currency_per_share
+    us-gaap:
+      - EarningsPerShareDiluted
+      - IncomeLossFromContinuingOperationsPerDilutedShare
+    ifrs-full:
+      - DilutedEarningsLossPerShare
+
+  research_and_development_expense:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - ResearchAndDevelopmentExpense
+    ifrs-full:
+      - ResearchAndDevelopmentExpense
+
+  operating_cash_flow:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - NetCashProvidedByUsedInOperatingActivities
+      - NetCashProvidedByUsedInOperatingActivitiesContinuingOperations
+    ifrs-full:
+      - CashFlowsFromUsedInOperatingActivities
+
+  capex:
+    kind: duration
+    unit_family: currency
+    us-gaap:
+      - PaymentsToAcquirePropertyPlantAndEquipment
+      - PaymentsToAcquireProductiveAssets
+    ifrs-full:
+      - PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities
+
+  total_assets:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - Assets
+    ifrs-full:
+      - Assets
+
+  current_assets:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - AssetsCurrent
+    ifrs-full:
+      - CurrentAssets
+
+  cash:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - CashAndCashEquivalentsAtCarryingValue
+      - CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
+    ifrs-full:
+      - CashAndCashEquivalents
+
+  inventory:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - InventoryNet
+    ifrs-full:
+      - Inventories
+
+  accounts_receivable:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - AccountsReceivableNetCurrent
+      - ReceivablesNetCurrent
+      - AccountsAndOtherReceivablesNetCurrent
+    ifrs-full:
+      - TradeAndOtherReceivables
+
+  total_liabilities:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - Liabilities
+    ifrs-full:
+      - Liabilities
+
+  current_liabilities:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - LiabilitiesCurrent
+    ifrs-full:
+      - CurrentLiabilities
+
+  long_term_debt:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - LongTermDebt
+      - LongTermDebtNoncurrent
+      - LongTermDebtAndCapitalLeaseObligations
+    ifrs-full:
+      - LongtermBorrowings
+      - Borrowings
+
+  total_equity:
+    kind: instant
+    unit_family: currency
+    us-gaap:
+      - StockholdersEquity
+      - StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+    ifrs-full:
+      - Equity
+      - EquityAttributableToOwnersOfParent
+
+  shares_outstanding:
+    kind: instant
+    unit_family: shares
+    us-gaap:
+      - CommonStockSharesOutstanding
+      - EntityCommonStockSharesOutstanding
+    ifrs-full:
+      - NumberOfSharesOutstanding
