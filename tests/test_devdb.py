@@ -147,7 +147,8 @@ def test_reference_tables_are_loaded_from_config(tmp_path: Path) -> None:
             "WHERE field = 'revenue' ORDER BY taxonomy, concept_rank"
         ).fetchall()
         assert ("ifrs-full", "Revenue", 1) in revenue
-        assert ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", 1) in revenue
+        assert ("us-gaap", "Revenues", 1) in revenue
+        assert ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", 3) in revenue
     finally:
         con.close()
 
