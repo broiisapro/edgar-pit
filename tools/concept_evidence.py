@@ -341,7 +341,6 @@ class IssuerEvidence:
     country: str
     filer_type: str
     fys: list[int]
-    facts: list[AnnualFact]
     fields: dict[str, dict[str, Any]]
     unmapped: list[dict[str, Any]]
     latest_accession: str | None
@@ -396,7 +395,6 @@ def build_issuer(
         country=row["country"],
         filer_type=row["filer_type"],
         fys=fys,
-        facts=facts,
         fields=fields,
         unmapped=unmapped_large(facts, fys, mapping, top_unmapped),
         latest_accession=latest_accession,
@@ -464,7 +462,6 @@ def collect(
                         country=row["country"],
                         filer_type=row["filer_type"],
                         fys=[],
-                        facts=[],
                         fields={},
                         unmapped=[],
                         latest_accession=None,
