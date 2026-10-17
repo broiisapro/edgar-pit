@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: stg_filings
+    description: Pass-through of raw.filings (foundation smoke model).
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+  - name: stg_facts
+    description: Pass-through of raw.facts_raw (foundation smoke model).
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+  - name: stg_events_8k
+    description: Pass-through of raw.events_8k (foundation smoke model).
+    columns:
+      - name: accession
+        tests:
+          - not_null
+      - name: item_code
+        tests:
+          - not_null
