@@ -1,0 +1,34 @@
+# Orchestration and agent worktrees: never committed
+.orchestration/
+.worktrees/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+dist/
+build/
+
+# Data and build outputs (fixtures under tests/fixtures/ are committed)
+/data/
+/release/
+*.duckdb
+*.duckdb.wal
+
+# dbt
+transform/target/
+transform/logs/
+transform/dbt_packages/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
