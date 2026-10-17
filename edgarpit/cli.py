@@ -7,6 +7,7 @@ Commands::
     edgarpit build (--offline --fixtures DIR | --data DIR) --out DIR
     edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS
         [--period FY|Q] [--n N] [--json]
+    edgarpit qa --db PATH
 
 Exit codes: ``0`` success, ``1`` a data or fetch failure (missing value,
 unresolved issuer, HTTP errors after retries, build failure), ``2`` a usage
@@ -22,11 +23,13 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, cast
 
+import duckdb
 import typer
 
 from edgarpit.config import ConfigError, Settings
 from edgarpit.fetch import FetchReport, fetch_universe
 from edgarpit.load import build_from_raw
+from edgarpit.qa import QaReport, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
 from edgarpit.rawcache import RawCache
@@ -291,6 +294,116 @@ def asof(
         typer.echo(f"period_end: {_iso_date(row.period_end)}")
         typer.echo(f"accession: {row.accession}")
         typer.echo(f"acceptance_ts: {_iso_ts(row.acceptance_ts)}")
+
+
+def _year_list(years: list[int]) -> str:
+    return ", ".join(str(year) for year in years) if years else "none"
+
+
+def _period(period_start: date | None, period_end: date) -> str:
+    start = _iso_date(period_start) or "instant"
+    return f"{start}..{period_end.isoformat()}"
+
+
+def _print_qa(report: QaReport) -> None:
+    typer.echo(
+        f"Coverage ({report.canonical_fields} canonical fields, "
+        f"{report.universe_issuers} universe issuers)"
+    )
+    for issuer_coverage in report.coverage:
+        name = f" {issuer_coverage.name}" if issuer_coverage.name else ""
+        typer.echo(
+            f"  {issuer_coverage.cik} {issuer_coverage.ticker or '-'}{name}: "
+            f"{len(issuer_coverage.by_field)} fields, "
+            f"FY {_year_list(issuer_coverage.fy_years)}, {issuer_coverage.rows} rows"
+        )
+        for field_name, field_years in issuer_coverage.by_field.items():
+            typer.echo(f"    {field_name}: {_year_list(field_years)}")
+    for missing in report.issuers_without_rows:
+        typer.echo(f"  no rows: {missing.cik} {missing.ticker} {missing.name}")
+
+    typer.echo("Restatements")
+    for restatement_count in report.restatement_counts:
+        typer.echo(
+            f"  {restatement_count.cik} {restatement_count.field}: {restatement_count.count}"
+        )
+    for restatement in report.top_restatements:
+        change = (
+            ""
+            if restatement.pct_change_vs_first is None
+            else f" ({restatement.pct_change_vs_first:+.1%})"
+        )
+        typer.echo(
+            f"  {restatement.cik} {restatement.field} "
+            f"{_period(restatement.period_start, restatement.period_end)}: "
+            f"{_format_value(restatement.first_value)} "
+            f"@ {_iso_ts(restatement.first_acceptance_ts)} -> "
+            f"{_format_value(restatement.value)} @ {_iso_ts(restatement.acceptance_ts)}{change}"
+        )
+
+    typer.echo("Imputed timestamps")
+    for source, imputed_count in report.imputed_by_source.items():
+        typer.echo(f"  {source}: {imputed_count}")
+    typer.echo(f"Header-vs-API disagreements over 60 s: {report.disagreement_count}")
+    for disagreement in report.disagreements:
+        typer.echo(
+            f"  {disagreement.cik} {disagreement.accession}: "
+            f"{_iso_ts(disagreement.acceptance_ts)} vs "
+            f"{_iso_ts(disagreement.acceptance_ts_api)} ({disagreement.seconds:.0f} s)"
+        )
+
+    typer.echo("Unmapped concepts")
+    for unmapped in report.unmapped_concepts:
+        typer.echo(f"  {unmapped.taxonomy}:{unmapped.concept}: {unmapped.count}")
+
+    typer.echo("Unit anomalies")
+    for multi_currency in report.multi_currency:
+        typer.echo(
+            f"  {multi_currency.cik} {multi_currency.field}: "
+            f"multiple currencies {', '.join(multi_currency.currencies)}"
+        )
+    for unexpected_unit in report.unexpected_units:
+        families = ", ".join(unexpected_unit.expected_families) or "no declared family"
+        typer.echo(
+            f"  {unexpected_unit.cik} {unexpected_unit.field} unit {unexpected_unit.unit}: "
+            f"expected {families}"
+        )
+
+    typer.echo("Conflicting values within one accession")
+    for conflict in report.conflicting_values:
+        values = ", ".join(_format_value(value) for value in conflict.values)
+        typer.echo(
+            f"  {conflict.cik} {conflict.accession} {conflict.taxonomy}:{conflict.concept} "
+            f"{conflict.unit} {_period(conflict.period_start, conflict.period_end)}: {values}"
+        )
+
+    if report.ok:
+        typer.echo("Key uniqueness: OK")
+    else:
+        typer.echo("Key uniqueness: violated")
+        for violation in report.key_violations:
+            typer.echo(
+                f"  {violation.table} ({violation.key}): {violation.duplicates} duplicate keys"
+            )
+
+
+@app.command()
+def qa(db: Annotated[Path, typer.Option("--db", help="DuckDB file to report on")]) -> None:
+    """Print the data-quality report; exit 1 when a contract key is duplicated."""
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+    except Exception as error:  # the CLI boundary turns any connect failure into exit 1
+        _fail(f"{type(error).__name__}: {error}")
+    try:
+        report = run_qa(con)
+    except Exception as error:  # a missing table or failed query is a data failure
+        _fail(f"{type(error).__name__}: {error}")
+    finally:
+        con.close()
+    _print_qa(report)
+    if not report.ok:
+        tables = ", ".join(violation.table for violation in report.key_violations)
+        _fail(f"key uniqueness violated in {tables}")
 
 
 if __name__ == "__main__":  # pragma: no cover - console-script entry is `edgarpit.cli:app`
