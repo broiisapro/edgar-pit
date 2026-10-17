@@ -11,6 +11,7 @@ literally (the trailing ``Z`` is taken at face value); the authoritative
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Mapping, Sequence
@@ -21,6 +22,8 @@ from typing import Any
 import polars as pl
 import yaml
 
+from edgarpit.ingest.headers import HeaderInfo, apply_acceptance, parse_header
+from edgarpit.rawcache import RawCache
 from edgarpit.schemas import Events8kSchema
 
 logger = logging.getLogger(__name__)
@@ -291,3 +294,48 @@ def explode_8k_items(filings: pl.DataFrame, item_labels: Mapping[str, str]) -> p
     )
     Events8kSchema.validate(events)
     return events
+
+
+def ingest_filings(
+    raw: RawCache, cik: str, item_labels: Mapping[str, str]
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Ingest one issuer's cached filings and 8-K events from a raw cache.
+
+    ``raw`` is the cache root (a fetched-data directory or the uncompressed
+    fixture tree), ``cik`` the issuer's ten-character CIK and ``item_labels``
+    the Form 8-K code labels from
+    :func:`edgarpit.ingest.submissions.load_item_labels`. Reads the latest
+    submissions document, every page file it lists (in listed order) and every
+    cached SGML header for the issuer, then attaches the authoritative
+    acceptance times from the headers (decision A-1). Returns ``(filings,
+    events_8k)``, valid under :class:`edgarpit.schemas.FilingsSchema` and
+    :class:`edgarpit.schemas.Events8kSchema`. Raises ``ValueError`` when the
+    issuer has no cached submissions document, or when a page listed by the
+    document is not in the cache.
+    """
+    main_body = raw.latest("submissions", cik)
+    if main_body is None:
+        raise ValueError(f"no cached submissions document for CIK {cik}")
+    main = json.loads(main_body)
+    filings_block = main.get("filings")
+    file_entries = filings_block.get("files", []) if isinstance(filings_block, Mapping) else []
+    if not isinstance(file_entries, list):
+        raise ValueError(f"submissions document for {cik} has a non-list filings.files")
+    pages: list[Mapping[str, Any]] = []
+    for entry in file_entries:
+        name = str(entry["name"])
+        body = raw.latest("submissions_page", cik, name.removesuffix(".json"))
+        if body is None:
+            raise ValueError(f"missing cached submissions page {name} for CIK {cik}")
+        pages.append(json.loads(body))
+
+    headers: dict[str, HeaderInfo] = {}
+    for accession in raw.keys("headers", cik):
+        body = raw.latest("headers", cik, accession)
+        if body is None:  # pragma: no cover - keys() lists existing directories only
+            continue
+        headers[accession] = parse_header(body.decode("utf-8"))
+
+    filings = apply_acceptance(parse_submissions(main, pages), headers)
+    events = explode_8k_items(filings, item_labels)
+    return filings, events
