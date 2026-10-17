@@ -151,7 +151,8 @@ def test_every_fixture_header_parses_and_matches_its_directory() -> None:
             assert info.acceptance_ts.utcoffset() == timedelta(0)
             assert info.form
             assert info.items is None or info.items
-            assert info.period is None or isinstance(info.period, date)
+            # Every fixture header carries exactly one non-empty <PERIOD>.
+            assert info.period is not None
             total += 1
     assert total > 400, f"only {total} fixture headers"
 
