@@ -7,13 +7,24 @@ and ``raw.universe`` from ``config/concept_map.yaml`` and
 ``config/universe.csv``. Both set the connection's session timezone to UTC
 (decision A-5) and both are transactional: a validation error or a failed
 insert leaves the previously loaded tables untouched.
+
+:func:`build_from_raw` runs the whole offline pipeline for a raw cache:
+ingest every cached issuer, load the frames and the reference tables, then run
+the dbt project with ``dbt build``. ``python -m edgarpit.load --raw DIR --out
+DIR`` does the same and prints the loaded row counts and the dbt summary.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import re
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 import polars as pl
@@ -24,9 +35,21 @@ from edgarpit.concepts import (
     ConceptMap,
     load_concept_map,
 )
-from edgarpit.schemas import SCHEMAS, duckdb_ddl
+from edgarpit.ingest.companyfacts import ingest_facts
+from edgarpit.ingest.submissions import ingest_filings, load_item_labels
+from edgarpit.rawcache import RawCache
+from edgarpit.schemas import COLUMNS, SCHEMAS, duckdb_ddl
+
+if TYPE_CHECKING:
+    from dbt.cli.main import dbtRunnerResult
+
+DB_NAME = "edgarpit.duckdb"
+DBT_TARGET_DIRNAME = "dbt-target"
+TRANSFORM_DIR = Path(__file__).resolve().parents[1] / "transform"
 
 DEFAULT_UNIVERSE_CSV = Path(__file__).resolve().parents[1] / "config" / "universe.csv"
+
+_CIK_DIR = re.compile(r"^\d{10}$")
 
 REFERENCE_TYPES: dict[str, dict[str, str]] = {
     "concept_map": {
@@ -185,10 +208,147 @@ def load_reference_tables(
             _insert_frame(con, table, frame)
 
 
+def _cached_ciks(raw: RawCache) -> list[str]:
+    """Return the sorted CIKs that have a cached submissions document."""
+    directory = raw.raw_dir / "submissions"
+    ciks = (
+        sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_dir() and _CIK_DIR.fullmatch(entry.name)
+        )
+        if directory.is_dir()
+        else []
+    )
+    if not ciks:
+        raise FileNotFoundError(f"no cached submissions documents under {directory}")
+    return ciks
+
+
+def _run_dbt(db_path: Path, target_path: Path) -> dbtRunnerResult:
+    """Run ``dbt build --target build`` against ``db_path`` and return the result.
+
+    dbt is imported lazily so that importing :mod:`edgarpit.load` stays cheap
+    for the non-build commands. The dbt profile reads the database path from
+    ``EDGARPIT_DB``, which is set for the duration of the run and restored
+    afterwards. Artifacts (including ``run_results.json``) are written under
+    ``target_path``; every path given to dbt is absolute.
+    """
+    from dbt.cli.main import dbtRunner
+
+    previous = os.environ.get("EDGARPIT_DB")
+    os.environ["EDGARPIT_DB"] = str(db_path)
+    try:
+        runner = dbtRunner()
+        return runner.invoke(
+            [
+                "build",
+                "--project-dir",
+                str(TRANSFORM_DIR),
+                "--profiles-dir",
+                str(TRANSFORM_DIR),
+                "--target",
+                "build",
+                "--target-path",
+                str(target_path),
+            ]
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("EDGARPIT_DB", None)
+        else:
+            os.environ["EDGARPIT_DB"] = previous
+
+
 def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     """Build the database from a raw cache directory.
 
-    Runs ingest -> load -> dbt and returns the path of the built DuckDB file
-    (``<out_dir>/edgarpit.duckdb``).
+    ``raw_dir`` is a cache root as written by the fetcher (``raw/submissions``,
+    ``raw/submissions_page``, ``raw/companyfacts``, ``raw/headers``). Every CIK
+    with a cached submissions document, in ascending order, is ingested with
+    :func:`edgarpit.ingest.submissions.ingest_filings` (item labels from
+    ``config/8k_items.yaml``) and :func:`edgarpit.ingest.companyfacts.ingest_facts`;
+    the frames are concatenated, validated and loaded into
+    ``<out_dir>/edgarpit.duckdb`` together with the reference tables, the
+    connection is closed, and dbt runs ``build --target build`` on the project
+    in ``transform/`` with ``EDGARPIT_DB`` pointing at the database. dbt
+    artifacts go to ``<out_dir>/dbt-target``.
+
+    Returns the database path. Raises the ingest, Pandera, DuckDB or dbt error
+    unchanged, and :class:`RuntimeError` when dbt reports a failed node, so a
+    caller never receives a database whose tests did not pass. No network is
+    used: everything comes from the cache.
     """
-    raise NotImplementedError
+    raw = RawCache(Path(raw_dir))
+    out = Path(out_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    db_path = out / DB_NAME
+    item_labels = load_item_labels()
+    filings_frames: list[pl.DataFrame] = []
+    events_frames: list[pl.DataFrame] = []
+    facts_frames: list[pl.DataFrame] = []
+    for cik in _cached_ciks(raw):
+        filings, events_8k = ingest_filings(raw, cik, item_labels)
+        filings_frames.append(filings)
+        events_frames.append(events_8k)
+        facts_frames.append(ingest_facts(raw, cik))
+    con = duckdb.connect(str(db_path))
+    try:
+        load_tables(
+            con,
+            filings=pl.concat(filings_frames),
+            events_8k=pl.concat(events_frames),
+            facts_raw=pl.concat(facts_frames),
+        )
+        load_reference_tables(con)
+    finally:
+        con.close()
+    result = _run_dbt(db_path, out / DBT_TARGET_DIRNAME)
+    if not result.success:
+        failed = result.exception if result.exception is not None else "dbt reported failed nodes"
+        raise RuntimeError(f"dbt build failed for {db_path}: {failed}")
+    return db_path
+
+
+def _dbt_summary(target_path: Path) -> str:
+    """Return the dbt node-status summary of a finished run."""
+    results = json.loads((target_path / "run_results.json").read_text(encoding="utf-8"))
+    statuses = Counter(result["status"] for result in results["results"])
+    passed = statuses["success"] + statuses["pass"]
+    failed = statuses["error"] + statuses["fail"]
+    return (
+        f"PASS={passed} WARN={statuses['warn']} ERROR={failed} "
+        f"SKIP={statuses['skipped']} TOTAL={len(results['results'])}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m edgarpit.load --raw DIR --out DIR``.
+
+    Builds the database from the raw cache, prints the row count of every
+    ``raw`` table and the dbt node summary, then the database path. Returns 0;
+    a build failure propagates as an exception and a non-zero exit.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m edgarpit.load",
+        description="Build edgarpit.duckdb from a raw cache: ingest, load, dbt.",
+    )
+    parser.add_argument("--raw", type=Path, required=True, help="raw cache directory")
+    parser.add_argument("--out", type=Path, required=True, help="output directory")
+    args = parser.parse_args(argv)
+    db_path = build_from_raw(args.raw, args.out)
+    con = duckdb.connect(str(db_path))
+    try:
+        for table in (*COLUMNS, *REFERENCE_TYPES):
+            row = con.execute(f"SELECT count(*) FROM raw.{table}").fetchone()
+            assert row is not None
+            print(f"raw.{table}: {int(row[0])} rows")
+    finally:
+        con.close()
+    print(f"dbt build: {_dbt_summary(args.out / DBT_TARGET_DIRNAME)}")
+    print(f"database: {db_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
