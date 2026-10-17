@@ -2,11 +2,14 @@
 
 These tests never touch the network.  They verify the tree produced by
 ``tools/build_fixtures.py``: layout, size budget, manifest hashes, the
-required issuer cases, and that every kept accession has a parsed header.
+required issuer cases, that every kept accession has a parsed header, and
+that the staging CSVs and ``expected_asof.json`` are consistent with the
+fixture tree and the frozen staging schemas.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
@@ -16,10 +19,17 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import polars as pl
+
+from edgarpit.concepts import load_concept_map
+from edgarpit.schemas import COLUMNS, DUCKDB_TYPES, SCHEMAS
+
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 SEC_ROOT = FIXTURE_ROOT / "sec"
 RAW_DIR = SEC_ROOT / "raw"
 MANIFEST_PATH = RAW_DIR / "manifest.jsonl"
+STAGING_DIR = FIXTURE_ROOT / "staging"
+EXPECTED_ASOF_PATH = FIXTURE_ROOT / "expected_asof.json"
 
 CIKS = ("0001000275", "0000320193", "0001594805")
 APPLE_CIK = "0000320193"
@@ -293,3 +303,193 @@ def test_fact_rows_are_recent_enough() -> None:
     for cik in CIKS:
         for row in fact_rows(cik):
             assert row["end"] >= FACT_CUTOFF, row
+
+
+# --- staging CSVs (issue #7) -------------------------------------------------
+
+_POLARS_TYPES: dict[str, Any] = {
+    "VARCHAR(10)": pl.String,
+    "VARCHAR": pl.String,
+    "DATE": pl.Date,
+    "TIMESTAMPTZ": pl.Datetime("us", "UTC"),
+    "BOOLEAN": pl.Boolean,
+    "DOUBLE": pl.Float64,
+    "INTEGER": pl.Int64,
+}
+
+
+def read_staging_csv(table: str) -> pl.DataFrame:
+    overrides = {column: _POLARS_TYPES[dtype] for column, dtype in DUCKDB_TYPES[table].items()}
+    return pl.read_csv(
+        STAGING_DIR / f"{table}.csv",
+        schema_overrides=overrides,
+    ).select(COLUMNS[table])
+
+
+def read_staging_rows(table: str) -> list[dict[str, str]]:
+    with (STAGING_DIR / f"{table}.csv").open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+_FACT_ENTRY_CACHE: dict[str, dict[str, set[tuple[Any, ...]]]] = {}
+
+
+def companyfacts_entries(cik: str) -> dict[str, set[tuple[Any, ...]]]:
+    """Fixture companyfacts tuples keyed by accession, for tracing."""
+    if cik not in _FACT_ENTRY_CACHE:
+        document = load_companyfacts(cik)
+        by_accession: dict[str, set[tuple[Any, ...]]] = {}
+        for taxonomy, concepts in document["facts"].items():
+            for concept, entry in concepts.items():
+                for unit, rows in entry["units"].items():
+                    for row in rows:
+                        by_accession.setdefault(row["accn"], set()).add(
+                            (
+                                cik,
+                                taxonomy,
+                                concept,
+                                unit,
+                                float(row["val"]),
+                                row.get("start"),
+                                row["end"],
+                                row.get("fy"),
+                                row.get("fp"),
+                                row["form"],
+                                row["accn"],
+                                row["filed"],
+                                row.get("frame"),
+                            )
+                        )
+        _FACT_ENTRY_CACHE[cik] = by_accession
+    return _FACT_ENTRY_CACHE[cik]
+
+
+def test_staging_csv_headers_match_the_frozen_columns() -> None:
+    for table, columns in COLUMNS.items():
+        with (STAGING_DIR / f"{table}.csv").open(encoding="utf-8") as handle:
+            assert handle.readline().strip().split(",") == columns
+
+
+def test_staging_csvs_validate_against_the_pandera_schemas() -> None:
+    for table, schema in SCHEMAS.items():
+        frame = read_staging_csv(table)
+        schema.validate(frame)
+
+
+def test_staging_selection_size_is_within_the_issue_budget() -> None:
+    total = sum(len(read_staging_rows(table)) for table in COLUMNS)
+    assert 150 <= total <= 300, f"staging has {total} rows"
+
+
+def test_staging_facts_trace_to_fixture_companyfacts() -> None:
+    seen = 0
+    for row in read_staging_rows("facts_raw"):
+        entries = companyfacts_entries(row["cik"]).get(row["accession"], set())
+        match = (
+            row["cik"],
+            row["taxonomy"],
+            row["concept"],
+            row["unit"],
+            float(row["value"]),
+            row["period_start"] or None,
+            row["period_end"],
+            int(row["fy"]) if row["fy"] else None,
+            row["fp"] or None,
+            row["form"],
+            row["accession"],
+            row["filed"],
+            row["frame"] or None,
+        )
+        assert match in entries, row
+        seen += 1
+    assert seen > 100
+
+
+def test_staging_facts_cover_the_ry_restatement() -> None:
+    revenue = [
+        row
+        for row in read_staging_rows("facts_raw")
+        if row["cik"] == RY_CIK
+        and row["concept"] == "Revenue"
+        and row["period_start"] == "2022-11-01"
+        and row["period_end"] == "2023-10-31"
+    ]
+    values = {float(row["value"]) for row in revenue}
+    assert {56129000000.0, 51464000000.0} <= values
+    accessions = {row["accession"] for row in revenue}
+    assert {RY_FY2023_40F, RY_FY2023_RESTATED_40F} <= accessions
+
+
+def test_staging_filings_acceptance_ts_equals_their_headers() -> None:
+    rows = read_staging_rows("filings")
+    assert rows
+    for row in rows:
+        expected = header_acceptance(row["cik"], row["accession"])
+        expected_iso = expected.strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert row["acceptance_ts"] == expected_iso, row
+        assert row["acceptance_ts_source"] == "sgml_header"
+        assert row["ts_imputed"] == "false"
+        assert row["acceptance_ts_api"] != ""
+
+
+def test_staging_events_explode_at_least_ten_apple_8ks() -> None:
+    events = read_staging_rows("events_8k")
+    assert events
+    accessions = {row["accession"] for row in events}
+    assert len(accessions) >= 10
+    assert all(row["cik"] == APPLE_CIK for row in events)
+    assert all(row["form"] in EVENT_FORMS for row in events)
+    assert all(row["item_label"] == "unknown" for row in events)
+    keys = [(row["accession"], row["item_code"]) for row in events]
+    assert len(keys) == len(set(keys))
+    for row in events:
+        assert row["acceptance_ts"] == read_filing_acceptance(row["accession"])
+
+
+def read_filing_acceptance(accession: str) -> str:
+    rows = [row for row in read_staging_rows("filings") if row["accession"] == accession]
+    assert len(rows) == 1, accession
+    return rows[0]["acceptance_ts"]
+
+
+def test_expected_asof_is_consistent_with_the_staging_rows() -> None:
+    expected = json.loads(EXPECTED_ASOF_PATH.read_text(encoding="utf-8"))
+    assert expected["cik"] == RY_CIK
+    filings = {row["accession"]: row for row in read_staging_rows("filings")}
+    filing = filings[expected["accession"]]
+    assert expected["acceptance_ts"] == filing["acceptance_ts"]
+    candidates = [
+        row
+        for row in read_staging_rows("facts_raw")
+        if row["cik"] == expected["cik"]
+        and row["period_start"] == expected["period_start"]
+        and row["period_end"] == expected["period_end"]
+        and float(row["value"]) == float(expected["value"])
+        and row["accession"] == expected["accession"]
+        and row["unit"] == expected["unit"]
+    ]
+    assert len(candidates) == 1
+    concept_map = load_concept_map()
+    asof = datetime.fromisoformat(expected["asof"].replace("Z", "+00:00"))
+    known = [
+        row
+        for row in read_staging_rows("facts_raw")
+        if row["cik"] == expected["cik"]
+        and (concept_map.lookup(row["taxonomy"], row["concept"]) or ("",))[0] == "revenue"
+        and row["period_start"] == expected["period_start"]
+        and row["period_end"] == expected["period_end"]
+        and datetime.fromisoformat(
+            filings[row["accession"]]["acceptance_ts"].replace("Z", "+00:00")
+        )
+        <= asof
+    ]
+    assert known, "expected_asof has no version known at the as-of time"
+    latest = max(
+        known,
+        key=lambda row: datetime.fromisoformat(
+            filings[row["accession"]]["acceptance_ts"].replace("Z", "+00:00")
+        ),
+    )
+    assert latest["accession"] == expected["accession"]
+    assert latest["concept"] == "Revenue"
+    assert expected["currency"] == "CAD" == expected["unit"]

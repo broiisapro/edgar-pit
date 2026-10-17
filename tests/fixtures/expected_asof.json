@@ -1,0 +1,13 @@
+{
+ "cik": "0001000275",
+ "field": "revenue",
+ "asof": "2024-01-15T00:00:00Z",
+ "period": "FY",
+ "value": 56129000000,
+ "unit": "CAD",
+ "currency": "CAD",
+ "period_start": "2022-11-01",
+ "period_end": "2023-10-31",
+ "accession": "0001193125-23-285639",
+ "acceptance_ts": "2023-11-30T11:45:12Z"
+}
