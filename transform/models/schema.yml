@@ -2,7 +2,7 @@ version: 2
 
 models:
   - name: stg_filings
-    description: Pass-through of raw.filings (foundation smoke model).
+    description: Pass-through of raw.filings.
     columns:
       - name: cik
         tests:
@@ -11,7 +11,7 @@ models:
         tests:
           - not_null
   - name: stg_facts
-    description: Pass-through of raw.facts_raw (foundation smoke model).
+    description: raw.facts_raw with exact duplicate rows removed.
     columns:
       - name: cik
         tests:
@@ -20,11 +20,119 @@ models:
         tests:
           - not_null
   - name: stg_events_8k
-    description: Pass-through of raw.events_8k (foundation smoke model).
+    description: Pass-through of raw.events_8k.
     columns:
       - name: accession
         tests:
           - not_null
       - name: item_code
+        tests:
+          - not_null
+  - name: int_facts_mapped
+    description: >-
+      raw facts joined to raw.concept_map; acceptance_ts and ts_imputed come
+      from raw.filings on accession, otherwise from `filed` 23:59:59
+      America/New_York (UTC) with ts_imputed=true.
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: field
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: ts_imputed
+        tests:
+          - not_null
+      - name: concept_rank
+        tests:
+          - not_null
+      - name: value
+        tests:
+          - not_null
+  - name: fundamentals_pit
+    description: >-
+      One row per (cik, field, period_start, period_end, accession) with the
+      version of the period ordered by (acceptance_ts, accession).
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [cik, field, period_start, period_end, accession]
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: field
+        tests:
+          - not_null
+      - name: period_end
+        tests:
+          - not_null
+      - name: period_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["FY", "Q", "OTHER"]
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: ts_imputed
+        tests:
+          - not_null
+      - name: value
+        tests:
+          - not_null
+      - name: concept_rank
+        tests:
+          - not_null
+      - name: version
+        tests:
+          - not_null
+      - name: first_value
+        tests:
+          - not_null
+      - name: is_restatement
+        tests:
+          - not_null
+  - name: filings
+    description: raw.filings plus the issuer ticker from raw.universe.
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: acceptance_ts_source
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["sgml_header", "filing_date_eod"]
+  - name: events_8k
+    description: raw.events_8k plus the issuer ticker from raw.universe.
+    columns:
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: item_code
+        tests:
+          - not_null
+      - name: item_label
         tests:
           - not_null
