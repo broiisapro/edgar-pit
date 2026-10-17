@@ -26,6 +26,16 @@ logger = logging.getLogger(__name__)
 
 KEPT_TAXONOMIES: tuple[str, ...] = ("us-gaap", "ifrs-full", "dei")
 
+CONFLICT_KEY_COLUMNS: tuple[str, ...] = (
+    "cik",
+    "taxonomy",
+    "concept",
+    "unit",
+    "period_start",
+    "period_end",
+    "accession",
+)
+
 _COLUMN_TYPES: dict[str, Any] = {
     "cik": pl.String,
     "taxonomy": pl.String,
@@ -162,6 +172,27 @@ def parse_companyfacts(doc: Mapping[str, Any]) -> pl.DataFrame:
         pl.col(column).str.to_date(format=_DATE_FORMAT) for column in _DATE_COLUMNS
     )
     return frame.unique(maintain_order=True).select(list(_COLUMN_TYPES))
+
+
+def conflicting_values(facts_raw: pl.DataFrame) -> pl.DataFrame:
+    """Rows that disagree on ``value`` within one companyfacts key.
+
+    The key is :data:`CONFLICT_KEY_COLUMNS`: ``(cik, taxonomy, concept, unit,
+    period_start, period_end, accession)``.  Every complete row of a group
+    that holds more than one distinct ``value`` is returned, in the input's
+    column order and dtypes, so the conflict can be reported rather than
+    resolved (decision A-7).  Returns an empty frame with the input schema
+    when no group conflicts.  Raises
+    ``polars.exceptions.ColumnNotFoundError`` when a key column is missing
+    from ``facts_raw``.
+    """
+    keys = list(CONFLICT_KEY_COLUMNS)
+    distinct = pl.col("value").n_unique().over(keys).alias("_distinct_values")
+    return (
+        facts_raw.with_columns(distinct)
+        .filter(pl.col("_distinct_values") > 1)
+        .drop("_distinct_values")
+    )
 
 
 def ingest_facts(raw: RawCache, cik: str) -> pl.DataFrame:
