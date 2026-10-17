@@ -1,0 +1,212 @@
+"""Tests for the immutable raw cache (decision A-4)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import zstandard
+
+from edgarpit.rawcache import RawCache, utc_stamp
+
+FIXTURES = Path(__file__).parent / "fixtures" / "sec"
+REPO_ROOT = Path(__file__).parent.parent
+
+STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
+
+
+def test_utc_stamp_shape() -> None:
+    stamp = utc_stamp()
+    assert STAMP_RE.fullmatch(stamp)
+    assert stamp.endswith("Z")
+
+
+def test_write_layout_manifest_and_latest(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b'{"hello": "world"}'
+    path = cache.write(
+        "submissions",
+        "0001000275",
+        "",
+        body,
+        url="https://data.sec.gov/submissions/CIK0001000275.json",
+        http_status=200,
+    )
+    assert path.parent == tmp_path / "raw" / "submissions" / "0001000275"
+    assert STAMP_RE.fullmatch(path.name.removesuffix(".json.zst"))
+    assert path.name.endswith(".json.zst")
+    stored = path.read_bytes()
+    assert zstandard.ZstdDecompressor().decompress(stored) == body
+    rows = cache.manifest_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["path"] == path.relative_to(tmp_path).as_posix()
+    assert row["url"] == "https://data.sec.gov/submissions/CIK0001000275.json"
+    assert row["endpoint"] == "submissions"
+    assert row["cik"] == "0001000275"
+    assert row["sha256"] == hashlib.sha256(body).hexdigest()
+    assert row["bytes"] == len(body)
+    assert row["http_status"] == 200
+    assert row["fetched_at"] in path.name
+    assert cache.latest("submissions", "0001000275") == body
+    assert cache.latest("submissions", "9999999999") is None
+
+
+def test_latest_prefers_the_newest_stamp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    stamps = iter(["20260101T000000000001Z", "20260101T000000000002Z"])
+    monkeypatch.setattr("edgarpit.rawcache.utc_stamp", lambda: next(stamps))
+    url = "https://data.sec.gov/submissions/CIK0001000275.json"
+    first = cache.write("submissions", "0001000275", "", b"one", url=url, http_status=200)
+    second = cache.write("submissions", "0001000275", "", b"two", url=url, http_status=200)
+    assert first != second
+    assert cache.latest("submissions", "0001000275") == b"two"
+
+
+def test_write_never_overwrites(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    monkeypatch.setattr("edgarpit.rawcache.utc_stamp", lambda: "20260101T000000000000Z")
+    url = "https://data.sec.gov/submissions/CIK0001000275.json"
+    path = cache.write("submissions", "0001000275", "", b"first", url=url, http_status=200)
+    with pytest.raises(FileExistsError):
+        cache.write("submissions", "0001000275", "", b"second", url=url, http_status=200)
+    assert cache.latest("submissions", "0001000275") == b"first"
+    assert path.read_bytes() != b"second"
+    assert not list(path.parent.glob("*.tmp"))
+    assert len(cache.manifest_rows()) == 1
+
+
+def test_keys_and_page_layout(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    url = "https://data.sec.gov/submissions/CIK0000320193-submissions-001.json"
+    cache.write(
+        "submissions_page",
+        "0000320193",
+        "CIK0000320193-submissions-001",
+        b"{}",
+        url=url,
+        http_status=200,
+    )
+    cache.write(
+        "submissions_page",
+        "0000320193",
+        "CIK0000320193-submissions-000",
+        b"{}",
+        url=url,
+        http_status=200,
+    )
+    cache.write(
+        "headers",
+        "0000320193",
+        "0000320193-19-000066",
+        b"<SEC-HEADER>",
+        url="https://www.sec.gov/Archives/edgar/data/320193/000032019319000066/0000320193-19-000066.hdr.sgml",
+        http_status=200,
+    )
+    assert cache.keys("submissions_page", "0000320193") == [
+        "CIK0000320193-submissions-000",
+        "CIK0000320193-submissions-001",
+    ]
+    assert cache.keys("headers", "0000320193") == ["0000320193-19-000066"]
+    assert cache.keys("submissions", "0000320193") == []
+    assert cache.latest("submissions_page", "0000320193", "CIK0000320193-submissions-001") == b"{}"
+    assert cache.latest("headers", "0000320193", "0000320193-19-000066") == b"<SEC-HEADER>"
+    assert cache.latest("headers", "0000320193", "0000320193-99-999999") is None
+    with pytest.raises(ValueError, match="unknown cache endpoint"):
+        cache.latest("nope", "0000320193")
+
+
+def test_latest_reads_uncompressed_fixture_files(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    directory = tmp_path / "raw" / "submissions" / "0001000275"
+    directory.mkdir(parents=True)
+    (directory / "20260101T000000000000Z.json").write_bytes(b'{"cik": "1000275"}')
+    assert cache.latest("submissions", "0001000275") == b'{"cik": "1000275"}'
+
+
+def test_verify_reports_bad_rows(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    url = "https://data.sec.gov/submissions/CIK0001000275.json"
+    path = cache.write("submissions", "0001000275", "", b"body", url=url, http_status=200)
+    report = cache.verify()
+    assert report.ok
+    assert report.checked == 1
+    assert report.inventory == {"0001000275": {"submissions": 1}}
+
+    path.write_bytes(zstandard.ZstdCompressor().compress(b"tampered"))
+    report = cache.verify()
+    assert not report.ok
+    assert report.mismatched == [path.relative_to(tmp_path).as_posix()]
+    assert report.missing == []
+
+    path.unlink()
+    (path.parent / "20260101T000000000000Z.json").write_bytes(b"extra")
+    report = cache.verify()
+    assert not report.ok
+    assert report.missing == [path.relative_to(tmp_path).as_posix()]
+    assert report.unlisted == [
+        (path.parent / "20260101T000000000000Z.json").relative_to(tmp_path).as_posix()
+    ]
+
+
+def test_verify_without_manifest_is_not_ok(tmp_path: Path) -> None:
+    report = RawCache(tmp_path / "empty").verify()
+    assert not report.ok
+    assert report.missing == ["manifest.jsonl"]
+
+
+def test_verify_fixture_manifest() -> None:
+    report = RawCache(FIXTURES).verify()
+    assert report.ok, (report.missing[:5], report.mismatched[:5], report.unlisted[:5])
+    assert report.checked == 455
+    assert set(report.inventory) == {"0001000275", "0000320193", "0001594805"}
+
+
+def test_cli_verify_fixtures_and_tampered_cache(tmp_path: Path) -> None:
+    good = subprocess.run(
+        [sys.executable, "-m", "edgarpit.rawcache", "verify", str(FIXTURES)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert good.returncode == 0, good.stderr
+    assert "manifest OK" in good.stdout
+    assert "0001000275: 210 files" in good.stdout
+
+    cache = RawCache(tmp_path)
+    cache.write(
+        "companyfacts",
+        "0001000275",
+        "",
+        b"{}",
+        url="https://data.sec.gov/api/xbrl/companyfacts/CIK0001000275.json",
+        http_status=200,
+    )
+    for path in (tmp_path / "raw" / "companyfacts" / "0001000275").glob("*.zst"):
+        path.write_bytes(zstandard.ZstdCompressor().compress(b"changed"))
+    bad = subprocess.run(
+        [sys.executable, "-m", "edgarpit.rawcache", "verify", str(tmp_path)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad.returncode == 1
+    assert "sha256 mismatch" in bad.stderr
+
+
+def test_manifest_is_jsonl(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    url = "https://data.sec.gov/uploads"
+    cache.write("companyfacts", "0001000275", "", b"a", url=url, http_status=200)
+    cache.write("companyfacts", "0001000275", "", b"b", url=url, http_status=200)
+    lines = cache.manifest_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert [json.loads(line)["bytes"] for line in lines] == [1, 1]
+    assert cache.latest("companyfacts", "0001000275") == b"b"
