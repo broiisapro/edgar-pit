@@ -5,8 +5,9 @@ One synchronous :class:`httpx.Client` (decision A-2) is used with:
 - an in-house token bucket enforcing a minimum spacing of
   ``1 / settings.rate_limit_rps`` seconds between request starts (so no
   rolling one-second window ever holds more than the configured rate),
-- tenacity retries (exponential backoff with jitter) on 429/500/502/503/504
-  and transport errors, honouring ``Retry-After``, for at most six attempts,
+- tenacity retries (exponential backoff with jitter, capped at 60 s) on
+  429/500/502/503/504 and transport errors, honouring ``Retry-After`` (both
+  delta-seconds and HTTP-date forms, capped at 120 s), for at most six attempts,
 - immediate failures on 403 (:class:`SecAccessDenied`, with a User-Agent hint)
   and 404 (:class:`SecNotFound`).
 
@@ -25,6 +26,8 @@ import random
 import re
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -40,7 +43,8 @@ ARCHIVES_HOST = "https://www.sec.gov"
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 6
-MAX_BACKOFF_SECONDS = 30.0
+MAX_BACKOFF_SECONDS = 60.0
+MAX_RETRY_AFTER_SECONDS = 120.0
 REQUEST_TIMEOUT_SECONDS = 30.0
 
 # A hair more than 1/rate so that no rolling one-second window can ever hold
@@ -143,24 +147,45 @@ def classify(url: str) -> tuple[str, str, str]:
     raise ValueError(f"cannot classify SEC URL: {url}")
 
 
-def _parse_retry_after(value: str | None) -> float | None:
+def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
+    """Parse a ``Retry-After`` header (RFC 9110) into seconds to wait.
+
+    Accepts both forms: delta-seconds (a non-negative integer) and an
+    HTTP-date (IMF-fixdate or the obsolete RFC 850 / asctime formats, via
+    :func:`email.utils.parsedate_to_datetime`). A date at or before ``now``
+    (default: the current UTC time) yields ``0``. Returns ``None`` for a
+    missing or unparseable value so the caller falls back to backoff.
+    """
     if value is None:
         return None
     text = value.strip()
     if text.isdigit():
         return float(text)
-    return None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        # The obsolete asctime form carries no zone and is defined as GMT.
+        when = when.replace(tzinfo=UTC)
+    moment = now if now is not None else datetime.now(UTC)
+    return max(0.0, (when - moment).total_seconds())
 
 
 def _retry_wait(state: RetryCallState) -> float:
-    """Honour ``Retry-After``; otherwise exponential backoff with jitter."""
+    """Wait before the next attempt: ``Retry-After`` or jittered backoff.
+
+    A ``Retry-After`` wait is capped at :data:`MAX_RETRY_AFTER_SECONDS`; the
+    exponential backoff (base ``0.5 * 2 ** (attempt - 1)``, jitter 0.5 to
+    1.5 times the base) is capped at :data:`MAX_BACKOFF_SECONDS`.
+    """
     outcome = state.outcome
     if outcome is not None:
         error = outcome.exception()
         if isinstance(error, _RetryableStatus) and error.retry_after is not None:
-            return max(0.0, error.retry_after)
-    base = float(min(0.5 * 2 ** (state.attempt_number - 1), MAX_BACKOFF_SECONDS))
-    return base * random.uniform(0.5, 1.5)
+            return min(MAX_RETRY_AFTER_SECONDS, max(0.0, error.retry_after))
+    base: float = 0.5 * 2 ** (int(state.attempt_number) - 1)
+    return min(MAX_BACKOFF_SECONDS, base * random.uniform(0.5, 1.5))
 
 
 class SecClient:
