@@ -184,7 +184,7 @@ def test_duplicate_accession_keeps_the_recent_row() -> None:
     assert frame["source"].to_list() == ["recent"]
 
 
-def test_zero_row_page_without_files_is_allowed() -> None:
+def test_document_without_pages_is_allowed() -> None:
     main = {"cik": "0000000000", "filings": {"recent": _document_arrays(), "files": []}}
     frame = parse_submissions(main, [])
     assert len(frame) == 1
