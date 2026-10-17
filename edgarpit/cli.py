@@ -8,6 +8,7 @@ Commands::
     edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS
         [--period FY|Q] [--n N] [--json]
     edgarpit qa --db PATH
+    edgarpit export --db PATH --out DIR
 
 Exit codes: ``0`` success, ``1`` a data or fetch failure (missing value,
 unresolved issuer, HTTP errors after retries, build failure), ``2`` a usage
@@ -27,12 +28,13 @@ import duckdb
 import typer
 
 from edgarpit.config import ConfigError, Settings
+from edgarpit.export import export_release
 from edgarpit.fetch import FetchReport, fetch_universe
 from edgarpit.load import build_from_raw
 from edgarpit.qa import QaReport, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
-from edgarpit.rawcache import RawCache
+from edgarpit.rawcache import MANIFEST_NAME, RawCache
 from edgarpit.sec_client import SecClient, SecClientError, company_tickers_url
 from edgarpit.universe import ResolveReport, UniverseError, load_universe, resolve, write_universe
 
@@ -404,6 +406,44 @@ def qa(db: Annotated[Path, typer.Option("--db", help="DuckDB file to report on")
     if not report.ok:
         tables = ", ".join(violation.table for violation in report.key_violations)
         _fail(f"key uniqueness violated in {tables}")
+
+
+@app.command()
+def export(
+    db: Annotated[Path, typer.Option("--db", help="DuckDB file to export")],
+    out: Annotated[Path, typer.Option("--out", help="output directory for the Parquet release")],
+    data: Annotated[
+        Path | None,
+        typer.Option(
+            "--data",
+            help="raw-cache directory whose raw/manifest.jsonl supplies the SEC fetch range",
+        ),
+    ] = None,
+) -> None:
+    """Write one Parquet file per released table plus ``manifest.json``.
+
+    With ``--data`` the release manifest also records the SEC fetch date range
+    (min/max ``fetched_at``) from ``<data>/raw/manifest.jsonl``.
+    """
+    raw_manifest: Path | None = None
+    if data is not None:
+        candidate = Path(data) / "raw" / MANIFEST_NAME
+        if not candidate.is_file():
+            _fail(f"no raw manifest under {data}; expected {candidate}")
+        raw_manifest = candidate
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+    except Exception as error:  # the CLI boundary turns a connect failure into exit 1
+        _fail(f"{type(error).__name__}: {error}")
+    try:
+        manifest = export_release(con, out, raw_manifest=raw_manifest)
+    except Exception as error:  # a missing table or failed write is a data failure
+        _fail(f"{type(error).__name__}: {error}")
+    finally:
+        con.close()
+    for entry in manifest.files:
+        typer.echo(f"{entry.file}: {entry.rows} rows, sha256 {entry.sha256}")
+    typer.echo(f"manifest: {Path(out) / 'manifest.json'}")
 
 
 if __name__ == "__main__":  # pragma: no cover - console-script entry is `edgarpit.cli:app`
