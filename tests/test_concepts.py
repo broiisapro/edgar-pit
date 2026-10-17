@@ -55,10 +55,50 @@ def test_ifrs_and_usgaap_revenue_map_to_the_same_field() -> None:
     concept_map = load_concept_map()
     us = concept_map.lookup("us-gaap", "Revenues")
     ifrs = concept_map.lookup("ifrs-full", "Revenue")
-    contract = concept_map.lookup("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax")
-    assert us == ("revenue", 2)
+    assert us == ("revenue", 1)
     assert ifrs == ("revenue", 1)
-    assert contract == ("revenue", 1)
+
+
+def test_revenues_outranks_contract_revenue() -> None:
+    """Banks and energy issuers tag totals that contract revenue misses.
+
+    JPM and BAC report only ``Revenues``; JPM's FY2023 accession carries no
+    contract revenue at all, and ENB's contract revenue (29.3B CAD FY2025)
+    is a component of its ``Revenues`` total (65.2B CAD).  The per-accession
+    "lowest rank wins" rule (docs/architecture.md section 7) must therefore
+    pick ``Revenues`` whenever both are reported.
+    """
+    concept_map = load_concept_map()
+    candidates = [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+    ]
+    picked = min(candidates, key=lambda concept: concept_map.lookup("us-gaap", concept)[1])
+    assert picked == "Revenues"
+
+
+def test_bank_revenue_total_is_mapped() -> None:
+    """Wells Fargo reports no Revenues; its total is RevenuesNetOfInterestExpense.
+
+    WFC files FY2023-FY2025 10-Ks that tag ``RevenuesNetOfInterestExpense``
+    (83,699,000,000 USD FY2025) and no ``Revenues`` or contract revenue, so
+    the bank total needs its own rank between ``Revenues`` and contract
+    revenue.
+    """
+    concept_map = load_concept_map()
+    assert concept_map.lookup("us-gaap", "RevenuesNetOfInterestExpense") == ("revenue", 2)
+    assert concept_map.lookup("us-gaap", "Revenues") == ("revenue", 1)
+    assert concept_map.lookup("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax") == (
+        "revenue",
+        3,
+    )
+
+
+def test_ifrs_bank_revenue_concept_is_pinned() -> None:
+    """The Canadian banks (RY, TD, BNS, BMO, CM) report ifrs-full:Revenue."""
+    concept_map = load_concept_map()
+    assert concept_map.lookup("ifrs-full", "Revenue") == ("revenue", 1)
+    assert concept_map.lookup("ifrs-full", "RevenueFromContractsWithCustomers") == ("revenue", 2)
 
 
 def test_rank_is_position_in_the_ordered_list() -> None:
