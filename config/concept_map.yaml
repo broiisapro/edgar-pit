@@ -3,15 +3,31 @@
 #
 # kind: duration | instant
 # unit_family: currency | shares | currency_per_share
+#
+# Ranks were set from issuer evidence, not from a few fixtures: the annual
+# facts of every issuer in config/universe.csv were collected with
+# tools/concept_evidence.py (2026-10) and each choice below that is not
+# self-evident names the issuers that needed it.
 fields:
   revenue:
     kind: duration
     unit_family: currency
+    # Total revenue first (decision A-18). Contract revenue is a component
+    # for banks (JPM, BAC tag only Revenues; WFC tags only its total net
+    # revenue, RevenuesNetOfInterestExpense) and for energy and retail
+    # issuers: ENB FY2025 Revenues 65,194,000,000 CAD vs contract revenue
+    # 29,329,000,000, and TRP, CVX, CP and WMT show the same gap.
     us-gaap:
-      - RevenueFromContractWithCustomerExcludingAssessedTax
       - Revenues
+      - RevenuesNetOfInterestExpense
+      - RevenueFromContractWithCustomerExcludingAssessedTax
       - RevenueFromContractWithCustomerIncludingAssessedTax
       - SalesRevenueNet
+    # `Revenue` is the IFRS total for the Canadian banks (RY, TD, BNS, BMO,
+    # CM) and the energy and rail issuers; SU, NTR and TECK report only
+    # RevenueFromContractsWithCustomers. MFC tags only its fee/other revenue
+    # as Revenue: IFRS 17 insurers tag no single total-revenue element, so
+    # revenue inherits that gap for insurers and QA reports coverage.
     ifrs-full:
       - Revenue
       - RevenueFromContractsWithCustomers
@@ -111,6 +127,8 @@ fields:
     ifrs-full:
       - CurrentAssets
 
+  # Narrow cash first; JPM, BAC, WFC, CVX and PG report only the
+  # restricted-cash-inclusive total, which is therefore the fallback.
   cash:
     kind: instant
     unit_family: currency
@@ -154,6 +172,9 @@ fields:
     ifrs-full:
       - CurrentLiabilities
 
+  # LongTermDebt is the total (current and noncurrent); PG, UNH, V and MA
+  # tag only LongTermDebtNoncurrent, and CP, WCN, CVX and KO only
+  # LongTermDebtAndCapitalLeaseObligations, so both are fallbacks.
   long_term_debt:
     kind: instant
     unit_family: currency
@@ -165,6 +186,8 @@ fields:
       - LongtermBorrowings
       - Borrowings
 
+  # StockholdersEquity is the parent's equity; JNJ, PG, UNH and V tag only
+  # the NCI-inclusive total, which is the fallback.
   total_equity:
     kind: instant
     unit_family: currency
@@ -175,6 +198,11 @@ fields:
       - Equity
       - EquityAttributableToOwnersOfParent
 
+  # Most IFRS issuers (RY, BNS, BMO, CM, MFC, SLF, CNQ, SU, CVE, NTR) report
+  # shares outstanding only as dei:EntityCommonStockSharesOutstanding, which
+  # the map cannot carry, so shares_outstanding stays unmapped for them; TD
+  # and TECK report ifrs-full:NumberOfSharesOutstanding. QA reports the
+  # coverage gap.
   shares_outstanding:
     kind: instant
     unit_family: shares
