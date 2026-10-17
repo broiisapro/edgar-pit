@@ -307,20 +307,14 @@ def _fetch(url: str, *, agent: str, limiter: RateLimiter) -> tuple[int, bytes]:
             if error.code not in RETRY_STATUSES:
                 raise FixtureError(f"unexpected {last_error} for {url}") from error
             retry_after = error.headers.get("Retry-After")
-            delay = (
-                float(retry_after)
-                if retry_after and retry_after.isdigit()
-                else 0.5 * attempt
-            )
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else 0.5 * attempt
             if attempt < MAX_ATTEMPTS:
                 time.sleep(delay)
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             last_error = f"{type(error).__name__}: {error}"
             if attempt < MAX_ATTEMPTS:
                 time.sleep(0.5 * attempt)
-    raise FixtureError(
-        f"giving up on {url} after {MAX_ATTEMPTS} attempts ({last_error})"
-    )
+    raise FixtureError(f"giving up on {url} after {MAX_ATTEMPTS} attempts ({last_error})")
 
 
 def now_stamp() -> str:
@@ -337,10 +331,7 @@ def keep_row(form: Any, filing_date: Any) -> bool:
         isinstance(form, str)
         and isinstance(filing_date, str)
         and filing_date >= ANNUAL_CUTOFF
-        and (
-            form in ANNUAL_FORMS
-            or (form in EVENT_FORMS and filing_date >= EVENT_CUTOFF)
-        )
+        and (form in ANNUAL_FORMS or (form in EVENT_FORMS and filing_date >= EVENT_CUTOFF))
     )
 
 
@@ -383,9 +374,7 @@ def trim_submissions_main(
     return trimmed
 
 
-def trim_submissions_page(
-    page: dict[str, Any], extra_accessions: frozenset[str]
-) -> dict[str, Any]:
+def trim_submissions_page(page: dict[str, Any], extra_accessions: frozenset[str]) -> dict[str, Any]:
     """Trim a paginated submissions page (a bare dict of parallel arrays)."""
     return trim_arrays(page, select_rows(page, extra_accessions))
 
@@ -442,16 +431,11 @@ def fact_accessions(document: dict[str, Any]) -> set[str]:
 def submissions_rows(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Flatten the parallel arrays of a submissions document or page."""
     filings = document.get("filings")
-    if isinstance(filings, dict) and "recent" in filings:
-        arrays = filings["recent"]
-    else:
-        arrays = document
+    arrays = filings["recent"] if isinstance(filings, dict) and "recent" in filings else document
     keys = [key for key, value in arrays.items() if isinstance(value, list)]
     rows: dict[str, dict[str, Any]] = {}
     for index in range(len(arrays["accessionNumber"])):
-        rows[arrays["accessionNumber"][index]] = {
-            key: arrays[key][index] for key in keys
-        }
+        rows[arrays["accessionNumber"][index]] = {key: arrays[key][index] for key in keys}
     return rows
 
 
@@ -506,9 +490,7 @@ class Manifest:
 
     def write(self) -> None:
         rows = sorted(self.rows, key=lambda row: row["path"])
-        lines = "".join(
-            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows
-        )
+        lines = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
         (RAW_DIR / "manifest.jsonl").write_text(lines, encoding="utf-8")
 
 
@@ -546,9 +528,7 @@ def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
         companyfacts = trim_companyfacts(json.loads(cf_body))
         fact_acces = fact_accessions(companyfacts)
         issuer["companyfacts_accessions"] = len(fact_acces)
-        issuer["companyfacts_concepts"] = sum(
-            len(c) for c in companyfacts["facts"].values()
-        )
+        issuer["companyfacts_concepts"] = sum(len(c) for c in companyfacts["facts"].values())
 
         extra = frozenset(fact_acces) | FORCED_ACCESSIONS.get(cik, frozenset())
 
@@ -591,9 +571,7 @@ def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
         kept_filing_accessions = set(kept_rows)
         issuer["filings_kept"] = len(kept_filing_accessions)
         for accession in sorted(extra - kept_filing_accessions):
-            summary["missing_from_submissions"].append(
-                {"cik": cik, "accession": accession}
-            )
+            summary["missing_from_submissions"].append({"cik": cik, "accession": accession})
 
         accessions = sorted(kept_filing_accessions | extra)
         fetched = missing = 0
@@ -639,9 +617,7 @@ def main() -> int:
     except FixtureError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    total_bytes = sum(
-        path.stat().st_size for path in FIXTURE_ROOT.rglob("*") if path.is_file()
-    )
+    total_bytes = sum(path.stat().st_size for path in FIXTURE_ROOT.rglob("*") if path.is_file())
     summary["fixture_bytes"] = total_bytes
     print(json.dumps(summary, indent=2))
     print(f"fixtures written to {FIXTURE_ROOT} ({total_bytes / 1e6:.2f} MB)")
