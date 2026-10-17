@@ -133,6 +133,10 @@ def events_table(at: AppTest) -> pd.DataFrame:
 def test_app_renders_the_chart_and_the_events_table(app_test: AppTest) -> None:
     assert not app_test.exception
 
+    app_test.date_input(key="asof").set_value(date(2025, 1, 1))
+    app_test.run()
+    assert not app_test.exception
+
     charts = app_test.get("vega_lite_chart")
     assert len(charts) == 1
     spec = json.loads(charts[0].spec)
