@@ -16,6 +16,7 @@ Layout (decision A-4, uncompressed so PR diffs are reviewable)::
     tests/fixtures/sec/raw/submissions_page/<cik10>/<page-stem>/<fetched_at>.json
     tests/fixtures/sec/raw/companyfacts/<cik10>/<fetched_at>.json
     tests/fixtures/sec/raw/headers/<cik10>/<accession>/<fetched_at>.hdr.sgml
+    tests/fixtures/sec/raw/company_tickers/_/<fetched_at>.json
     tests/fixtures/sec/raw/manifest.jsonl
 
 ``fetched_at`` is ``YYYYMMDDTHHMMSSffffffZ`` (UTC, microseconds).  The
@@ -57,6 +58,13 @@ exploded items of the ten most recent Apple 8-Ks.  Within each
 present in the fixtures is used.  Timestamps come from the SGML headers
 (America/New_York -> UTC) and headers match ``edgarpit.schemas.COLUMNS``.
 Run it with ``uv run python tools/build_fixtures.py --staging``.
+
+``--company-tickers`` refreshes only ``raw/company_tickers/_/<fetched_at>.json``
+(decision A-17): SEC's ``company_tickers.json`` trimmed, by deleting entries
+only, to the tickers in ``config/universe.csv`` plus ``EXTRA_TICKERS``.  The
+rest of the fixture tree is left untouched and the manifest is rewritten with
+the refreshed row.  Run it with ``uv run python tools/build_fixtures.py
+--company-tickers``.
 """
 
 from __future__ import annotations
@@ -84,6 +92,7 @@ FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec"
 RAW_DIR = FIXTURE_ROOT / "raw"
 STAGING_DIR = REPO_ROOT / "tests" / "fixtures" / "staging"
 EXPECTED_ASOF_PATH = REPO_ROOT / "tests" / "fixtures" / "expected_asof.json"
+UNIVERSE_PATH = REPO_ROOT / "config" / "universe.csv"
 
 ISSUERS: tuple[tuple[str, str], ...] = (
     ("0001000275", "Royal Bank of Canada"),
@@ -163,6 +172,10 @@ UNMAPPED_SELECTION: dict[str, tuple[str, str]] = {
 
 APPLE_CIK = "0000320193"
 APPLE_8K_COUNT = 10
+
+# The trimmed ``company_tickers.json`` fixture keeps the universe's tickers and
+# a few real tickers outside it, so resolution sees non-universe entries too.
+EXTRA_TICKERS: tuple[str, ...] = ("IBM", "TSLA", "NFLX", "AMD", "INTC")
 EXPECTED_ASOF: dict[str, Any] = {
     "cik": "0001000275",
     "field": "revenue",
@@ -300,6 +313,7 @@ _ACCEPTANCE_RE = re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})")
 
 DATA_HOST = "https://data.sec.gov"
 ARCHIVES_HOST = "https://www.sec.gov"
+COMPANY_TICKERS_URL = f"{ARCHIVES_HOST}/files/company_tickers.json"
 RATE_LIMIT_RPS = 4.0
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 5
@@ -528,8 +542,8 @@ def header_url(cik: str, accession: str) -> str:
 class Manifest:
     """Collects ``raw/manifest.jsonl`` rows while storing fixture files."""
 
-    def __init__(self) -> None:
-        self.rows: list[dict[str, Any]] = []
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self.rows: list[dict[str, Any]] = list(rows or [])
 
     def store(
         self,
@@ -542,7 +556,7 @@ class Manifest:
         body: bytes,
         http_status: int,
     ) -> Path:
-        relative = Path("raw") / endpoint / cik
+        relative = Path("raw") / endpoint / (cik or "_")
         if key:
             relative = relative / key
         stamp = now_stamp()
@@ -571,6 +585,73 @@ class Manifest:
         rows = sorted(self.rows, key=lambda row: row["path"])
         lines = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
         (RAW_DIR / "manifest.jsonl").write_text(lines, encoding="utf-8")
+
+
+def load_manifest_rows() -> list[dict[str, Any]]:
+    """Read the stored fixture manifest, or return an empty list when absent."""
+    path = RAW_DIR / "manifest.jsonl"
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+
+def read_universe_tickers() -> set[str]:
+    """Return the tickers of ``config/universe.csv``."""
+    with UNIVERSE_PATH.open(encoding="utf-8", newline="") as handle:
+        return {row["ticker"] for row in csv.DictReader(handle)}
+
+
+def trim_company_tickers(document: dict[str, Any], tickers: set[str]) -> dict[str, Any]:
+    """Keep the entries whose ``ticker`` is wanted; top-level keys are unchanged.
+
+    Entries are deleted whole; no value or key inside a kept entry is edited
+    (decision A-15). Raises :class:`FixtureError` when a wanted ticker is not
+    in the document.
+    """
+    kept = {
+        key: entry
+        for key, entry in document.items()
+        if isinstance(entry, dict) and entry.get("ticker") in tickers
+    }
+    found = {entry["ticker"] for entry in kept.values()}
+    missing = sorted(tickers - found)
+    if missing:
+        raise FixtureError(f"company_tickers.json is missing tickers: {missing}")
+    return kept
+
+
+def build_company_tickers(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
+    """Fetch, trim and store ``company_tickers.json`` without touching the tree."""
+    status, body = _fetch(COMPANY_TICKERS_URL, agent=agent, limiter=limiter)
+    tickers = read_universe_tickers() | set(EXTRA_TICKERS)
+    trimmed = trim_company_tickers(json.loads(body), tickers)
+    body_out = json_bytes(trimmed)
+
+    manifest = Manifest(load_manifest_rows())
+    kept_rows: list[dict[str, Any]] = []
+    for row in manifest.rows:
+        if row["endpoint"] == "company_tickers":
+            (FIXTURE_ROOT / row["path"]).unlink(missing_ok=True)
+        else:
+            kept_rows.append(row)
+    manifest.rows = kept_rows
+    path = manifest.store(
+        endpoint="company_tickers",
+        cik="",
+        key="",
+        suffix=".json",
+        url=COMPANY_TICKERS_URL,
+        body=body_out,
+        http_status=status,
+    )
+    manifest.write()
+    return {
+        "path": path.relative_to(FIXTURE_ROOT).as_posix(),
+        "tickers": len(trimmed),
+        "bytes": len(body_out),
+    }
 
 
 def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
@@ -1035,6 +1116,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write tests/fixtures/staging/*.csv and expected_asof.json from the fixture tree",
     )
+    parser.add_argument(
+        "--company-tickers",
+        action="store_true",
+        help="refresh only raw/company_tickers/_/<fetched_at>.json (decision A-17)",
+    )
     args = parser.parse_args(argv)
     if args.staging:
         try:
@@ -1051,6 +1137,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
     limiter = RateLimiter(RATE_LIMIT_RPS)
+    if args.company_tickers:
+        try:
+            summary_tickers = build_company_tickers(agent=agent, limiter=limiter)
+        except FixtureError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary_tickers, indent=2))
+        print(f"company tickers written to {FIXTURE_ROOT}")
+        return 0
     try:
         summary = build(agent=agent, limiter=limiter)
     except FixtureError as error:
