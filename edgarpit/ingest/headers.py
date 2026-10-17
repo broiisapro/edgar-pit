@@ -1,43 +1,216 @@
-"""Filing SGML headers: the authoritative acceptance time (decisions A-1, A-16)."""
+"""Filing SGML headers: the authoritative acceptance time (decisions A-1, A-16).
+
+EDGAR writes each filing's acceptance time into its ``.hdr.sgml`` header as
+``<ACCEPTANCE-DATETIME>YYYYMMDDHHMMSS`` in America/New_York. That wall time is
+the only acceptance time edgar-pit trusts: the submissions API's
+``acceptanceDateTime`` is kept as ``acceptance_ts_api`` for diagnostics only.
+The conversion to UTC is DST-aware (decision A-22): an ambiguous wall time (the
+repeated hour when DST ends, 01:00-02:00) resolves to the later UTC instant so
+the result is never earlier than the truth, and a wall time in the skipped hour
+when DST starts raises ``ValueError``.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import polars as pl
+
+from edgarpit.schemas import FilingsSchema
+
+NEW_YORK = ZoneInfo("America/New_York")
+"""Timezone of EDGAR's SGML wall times (``America/New_York``)."""
+
+_ACCEPTANCE_RE = re.compile(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})")
+_DATE_RE = re.compile(r"\d{8}")
+_ACCESSION_RE = re.compile(r"\d{10}-\d{2}-\d{6}")
+_TAG_RE = re.compile(r"<([A-Z0-9_.-]+)>([^<]*)")
+_EVENT_FORMS = frozenset({"8-K", "8-K/A"})
 
 
 @dataclass(frozen=True)
 class HeaderInfo:
-    """The fields edgar-pit keeps from one ``.hdr.sgml`` filing header."""
+    """The fields edgar-pit keeps from one ``.hdr.sgml`` filing header.
+
+    ``acceptance_ts`` is timezone-aware UTC, ``filing_date`` is New York local,
+    ``period`` is the reported period (``None`` for headers without a non-empty
+    ``<PERIOD>``, e.g. registration statements) and ``items`` is the 8-K item
+    codes joined with ``,`` (``None`` when the header carries none).
+    """
 
     accession: str
     form: str
     acceptance_ts: datetime
     filing_date: date
-    period: date
+    period: date | None
     items: str | None
+
+
+def _header_tags(text: str) -> dict[str, list[str]]:
+    """Collect the header's ``<TAG>value`` lines per tag, in file order."""
+    tags: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        match = _TAG_RE.fullmatch(line.strip())
+        if match is not None:
+            tags.setdefault(match.group(1), []).append(match.group(2).strip())
+    return tags
+
+
+def _required(tags: Mapping[str, list[str]], tag: str) -> str:
+    """Return the first non-empty value of a required tag or raise ``ValueError``."""
+    for value in tags.get(tag, []):
+        if value:
+            return value
+    raise ValueError(f"SGML header is missing <{tag}>")
+
+
+def _parse_day(tag: str, value: str) -> date:
+    """Parse a ``YYYYMMDD`` tag value as ``date`` or raise ``ValueError``."""
+    if not _DATE_RE.fullmatch(value):
+        raise ValueError(f"malformed <{tag}>: {value!r}")
+    try:
+        return datetime.strptime(value, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"malformed <{tag}>: {value!r}") from exc
+
+
+def _new_york_to_utc(local: datetime) -> datetime:
+    """Convert a naive America/New_York wall time to an aware UTC datetime.
+
+    A wall time that exists exactly once maps directly. A wall time in the
+    repeated hour at the end of DST resolves to the later UTC instant (decision
+    A-22). A wall time in the hour skipped at the start of DST raises
+    ``ValueError`` because it never happened.
+    """
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        aware = local.replace(tzinfo=NEW_YORK, fold=fold)
+        round_trip = aware.astimezone(UTC).astimezone(NEW_YORK).replace(tzinfo=None)
+        if round_trip == local:
+            candidates.append(aware.astimezone(UTC))
+    if not candidates:
+        raise ValueError(
+            f"{local:%Y-%m-%d %H:%M:%S} does not exist in America/New_York "
+            "(skipped hour at the start of DST)"
+        )
+    return max(candidates)
 
 
 def parse_header(text: str) -> HeaderInfo:
     """Parse an SGML filing header.
 
-    ``acceptance_ts`` comes from ``<ACCEPTANCE-DATETIME>`` interpreted in
-    ``America/New_York`` and converted to UTC. Raises ``ValueError`` when a
-    required tag is missing or malformed.
+    ``text`` is the body of a ``.hdr.sgml`` file. Returns a :class:`HeaderInfo`
+    whose ``acceptance_ts`` is the ``<ACCEPTANCE-DATETIME>`` wall time
+    interpreted in ``America/New_York`` and converted to an aware UTC
+    ``datetime``; ambiguous local times resolve to the later UTC instant and
+    skipped local times raise ``ValueError`` (decision A-22). ``period`` is
+    ``None`` when ``<PERIOD>`` is absent or empty. ``items`` joins every
+    ``<ITEMS>`` line with ``,`` in file order and is ``None`` when the header
+    has none.
+
+    Raises ``ValueError`` naming the tag when a required tag
+    (``<ACCEPTANCE-DATETIME>``, ``<ACCESSION-NUMBER>``, ``<TYPE>``,
+    ``<FILING-DATE>``) is missing or malformed, or when ``<PERIOD>`` is present
+    but malformed.
     """
-    raise NotImplementedError
+    tags = _header_tags(text)
+    accession = _required(tags, "ACCESSION-NUMBER")
+    if not _ACCESSION_RE.fullmatch(accession):
+        raise ValueError(f"malformed <ACCESSION-NUMBER>: {accession!r}")
+    form = _required(tags, "TYPE")
+    acceptance = _required(tags, "ACCEPTANCE-DATETIME")
+    match = _ACCEPTANCE_RE.fullmatch(acceptance)
+    if match is None:
+        raise ValueError(f"malformed <ACCEPTANCE-DATETIME>: {acceptance!r}")
+    try:
+        local = datetime(
+            int(match[1]),
+            int(match[2]),
+            int(match[3]),
+            int(match[4]),
+            int(match[5]),
+            int(match[6]),
+        )
+    except ValueError as exc:
+        raise ValueError(f"malformed <ACCEPTANCE-DATETIME>: {acceptance!r}") from exc
+    filing_date = _parse_day("FILING-DATE", _required(tags, "FILING-DATE"))
+    periods = [value for value in tags.get("PERIOD", []) if value]
+    period = _parse_day("PERIOD", periods[0]) if periods else None
+    items = [value for value in tags.get("ITEMS", []) if value]
+    return HeaderInfo(
+        accession=accession,
+        form=form,
+        acceptance_ts=_new_york_to_utc(local),
+        filing_date=filing_date,
+        period=period,
+        items=",".join(items) if items else None,
+    )
 
 
 def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -> pl.DataFrame:
     """Attach acceptance times and return a frame valid under ``FilingsSchema``.
 
-    For a filing whose accession is in ``headers``, set ``acceptance_ts`` from
-    the header with ``acceptance_ts_source='sgml_header'`` and ``ts_imputed=False``.
-    Every other filing falls back to ``filing_date`` 23:59:59 America/New_York
-    with ``acceptance_ts_source='filing_date_eod'`` and ``ts_imputed=True``
-    (decision A-1).
+    ``filings`` is a submissions frame with the ``FilingsSchema`` columns whose
+    ``acceptance_ts``, ``acceptance_ts_source`` and ``ts_imputed`` are still
+    null; ``headers`` maps an accession to its parsed :class:`HeaderInfo`. For a
+    filing whose accession is in ``headers``, ``acceptance_ts`` is the header's
+    aware UTC time, ``acceptance_ts_source`` is ``'sgml_header'`` and
+    ``ts_imputed`` is false. Every other filing falls back to ``filing_date``
+    23:59:59 America/New_York converted to UTC (an upper bound on the true
+    acceptance time, because EDGAR dates an after-hours filing the next day)
+    with ``acceptance_ts_source='filing_date_eod'`` and ``ts_imputed=true``
+    (decision A-1). The result is validated against ``FilingsSchema`` before it
+    is returned; ``acceptance_ts_api`` is passed through untouched.
     """
-    raise NotImplementedError
+    header_ts = pl.col("accession").replace_strict(
+        {accession: info.acceptance_ts for accession, info in headers.items()},
+        default=None,
+        return_dtype=pl.Datetime("us", "UTC"),
+    )
+    has_header = header_ts.is_not_null()
+    fallback_ts = (
+        (
+            pl.col("filing_date").cast(pl.Datetime("us"))
+            + pl.duration(hours=23, minutes=59, seconds=59)
+        )
+        .dt.replace_time_zone("America/New_York", ambiguous="latest", non_existent="raise")
+        .dt.convert_time_zone("UTC")
+    )
+    result = filings.with_columns(
+        pl.when(has_header).then(header_ts).otherwise(fallback_ts).alias("acceptance_ts"),
+        pl.when(has_header)
+        .then(pl.lit("sgml_header"))
+        .otherwise(pl.lit("filing_date_eod"))
+        .alias("acceptance_ts_source"),
+        (~has_header).alias("ts_imputed"),
+    )
+    FilingsSchema.validate(result)
+    return result
+
+
+def required_accessions(
+    filings: pl.DataFrame, fact_accessions: Iterable[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """Return the ``(cik, accession)`` pairs whose SGML headers must be fetched.
+
+    ``filings`` is a submissions frame (``FilingsSchema`` columns; only
+    ``cik``, ``accession`` and ``form`` are read). ``fact_accessions`` is an
+    iterable of ``(cik, accession)`` pairs taken from companyfacts, already
+    restricted to ``us-gaap``/``ifrs-full`` facts. The result is the sorted,
+    de-duplicated union of every given pair -- including accessions that do not
+    appear in ``filings``, which is common for facts filed before the
+    submissions API's coverage -- and every ``8-K``/``8-K/A`` row of
+    ``filings`` (decision A-1). Headers are immutable, so this is the set the
+    fetch stage pulls once and caches forever.
+    """
+    pairs: set[tuple[str, str]] = {(cik, accession) for cik, accession in fact_accessions}
+    pairs.update(
+        (str(row[0]), str(row[1]))
+        for row in filings.select("cik", "accession", "form").iter_rows()
+        if row[2] in _EVENT_FORMS
+    )
+    return sorted(pairs)
