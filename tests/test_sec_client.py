@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import itertools
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import respx
+from tenacity import RetryCallState
 
 from edgarpit.config import ConfigError, Settings
 from edgarpit.rawcache import RawCache
 from edgarpit.sec_client import (
+    MAX_BACKOFF_SECONDS,
+    MAX_RETRY_AFTER_SECONDS,
     OfflineMiss,
     SecAccessDenied,
     SecClient,
     SecClientError,
     SecNotFound,
+    _parse_retry_after,
+    _retry_wait,
     classify,
     company_tickers_url,
     companyfacts_url,
@@ -162,6 +169,78 @@ def test_retry_after_is_honoured_and_success_is_cached(tmp_path: Path) -> None:
     assert json.loads(body) == {"cik": "0001000275"}
 
 
+def _retry_state(attempt: int, error: BaseException) -> RetryCallState:
+    state = RetryCallState(retry_object=None, fn=lambda: None, args=(), kwargs={})
+    state.attempt_number = attempt
+    state.set_exception((type(error), error, error.__traceback__))
+    return state
+
+
+def test_parse_retry_after_accepts_delta_seconds_and_http_dates() -> None:
+    now = datetime(2026, 10, 17, 12, 0, 0, tzinfo=UTC)
+    assert _parse_retry_after("120", now=now) == 120.0
+    assert _parse_retry_after(" 2 ", now=now) == 2.0
+    assert _parse_retry_after("Sat, 17 Oct 2026 12:02:30 GMT", now=now) == 150.0
+    assert _parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", now=now) == 0.0
+    assert _parse_retry_after("Sun Nov  6 08:49:37 1994", now=now) == 0.0
+    assert _parse_retry_after("garbage", now=now) is None
+    assert _parse_retry_after(None, now=now) is None
+
+
+def test_retry_after_http_date_in_the_past_means_no_wait() -> None:
+    clock = FakeClock()
+    client = SecClient(make_settings(), clock=clock.monotonic, sleep=clock.sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(RY_SUBMISSIONS).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "Sun, 06 Nov 1994 08:49:37 GMT"}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        assert client.get_json(RY_SUBMISSIONS) == {"ok": True}
+    assert route.call_count == 2
+    assert clock.sleeps[0] == 0.0
+
+
+def test_retry_after_http_date_in_the_future_is_capped() -> None:
+    clock = FakeClock()
+    client = SecClient(make_settings(), clock=clock.monotonic, sleep=clock.sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(RY_SUBMISSIONS).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "Fri, 01 Jan 2100 00:00:00 GMT"}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        assert client.get_json(RY_SUBMISSIONS) == {"ok": True}
+    assert route.call_count == 2
+    assert clock.sleeps == [MAX_RETRY_AFTER_SECONDS]
+
+
+def test_retry_after_delta_seconds_is_capped() -> None:
+    clock = FakeClock()
+    client = SecClient(make_settings(), clock=clock.monotonic, sleep=clock.sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(RY_SUBMISSIONS).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "9999"}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        assert client.get_json(RY_SUBMISSIONS) == {"ok": True}
+    assert route.call_count == 2
+    assert clock.sleeps == [120.0]
+
+
+def test_backoff_is_capped_at_sixty_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("edgarpit.sec_client.random.uniform", lambda low, high: 1.0)
+    state = _retry_state(10, RuntimeError("transport down"))
+    assert MAX_BACKOFF_SECONDS == 60.0
+    assert _retry_wait(state) == 60.0
+    state.attempt_number = 3
+    assert _retry_wait(state) == 2.0
+
+
 def test_failed_responses_are_not_cached(tmp_path: Path) -> None:
     clock = FakeClock()
     cache = RawCache(tmp_path)
@@ -262,6 +341,36 @@ def test_offline_mode_reads_fixtures_without_building_a_transport() -> None:
 def test_offline_mode_needs_no_user_agent_and_never_retries() -> None:
     client = SecClient(Settings(sec_user_agent="not-an-email"), offline_dir=FIXTURES)
     assert client.get_json(companyfacts_url(RY))["cik"] == 1000275
+
+
+def company_tickers_fixture() -> dict[str, Any]:
+    paths = sorted((FIXTURES / "raw" / "company_tickers" / "_").glob("*.json"))
+    assert len(paths) == 1
+    return json.loads(paths[0].read_text(encoding="utf-8"))
+
+
+def test_company_tickers_is_cached_in_its_global_slot(tmp_path: Path) -> None:
+    clock = FakeClock()
+    cache = RawCache(tmp_path)
+    client = SecClient(make_settings(), cache=cache, clock=clock.monotonic, sleep=clock.sleep)
+    document = company_tickers_fixture()
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(company_tickers_url()).mock(return_value=httpx.Response(200, json=document))
+        assert client.get_json(company_tickers_url()) == document
+    rows = cache.manifest_rows()
+    assert len(rows) == 1
+    assert rows[0]["endpoint"] == "company_tickers"
+    assert rows[0]["cik"] == ""
+    assert rows[0]["path"].startswith("raw/company_tickers/_/")
+    body = cache.latest("company_tickers", "")
+    assert body is not None
+    assert json.loads(body) == document
+
+
+def test_offline_mode_serves_company_tickers() -> None:
+    client = SecClient(Settings(sec_user_agent=None), offline_dir=FIXTURES)
+    document = client.get_json(company_tickers_url())
+    assert {entry["ticker"] for entry in document.values()} >= {"RY", "AAPL", "SHOP"}
 
 
 def test_get_json_rejects_non_object_payloads() -> None:
