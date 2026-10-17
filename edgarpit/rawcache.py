@@ -6,6 +6,7 @@ Layout under ``root``::
     raw/submissions_page/<cik10>/<page-stem>/<fetched_at>.json.zst
     raw/companyfacts/<cik10>/<fetched_at>.json.zst
     raw/headers/<cik10>/<accession>/<fetched_at>.hdr.sgml.zst
+    raw/company_tickers/_/<fetched_at>.json.zst
     raw/manifest.jsonl
 
 ``<fetched_at>`` is UTC ``YYYYMMDDTHHMMSSffffffZ`` (microseconds).  Bodies are
@@ -42,7 +43,12 @@ ENDPOINT_SUFFIX: dict[str, str] = {
     "submissions_page": ".json",
     "companyfacts": ".json",
     "headers": ".hdr.sgml",
+    "company_tickers": ".json",
 }
+
+# Endpoints whose response is not tied to a CIK use ``_`` as the path segment
+# (an empty directory name is not addressable); their manifest ``cik`` is "".
+GLOBAL_CIK = "_"
 
 _STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
 _ENDPOINTS = tuple(ENDPOINT_SUFFIX)
@@ -125,11 +131,16 @@ class RawCache:
         return self.raw_dir / MANIFEST_NAME
 
     def path_for(self, endpoint: str, cik: str, key: str, stamp: str) -> Path:
-        """Return the compressed-cache path for a stamp (always ``.zst``)."""
+        """Return the compressed-cache path for a stamp (always ``.zst``).
+
+        ``cik`` is the zero-padded CIK, or ``""`` for a global document such as
+        ``company_tickers``; the empty value is stored under ``_`` since an
+        empty path segment is not addressable.
+        """
         suffix = ENDPOINT_SUFFIX.get(endpoint)
         if suffix is None:
             raise ValueError(f"unknown cache endpoint {endpoint!r}")
-        parts: list[str] = ["raw", endpoint, cik]
+        parts: list[str] = ["raw", endpoint, cik or GLOBAL_CIK]
         if key:
             parts.append(key)
         parts.append(f"{stamp}{suffix}.zst")
@@ -174,11 +185,16 @@ class RawCache:
         return final
 
     def latest(self, endpoint: str, cik: str, key: str | None = None) -> bytes | None:
-        """Return the body stored under the newest stamp for this key, or ``None``."""
+        """Return the body stored under the newest stamp for this key, or ``None``.
+
+        ``key`` is the page stem or accession for the nested endpoints and
+        ``None`` for the main documents. ``cik`` is ``""`` for global
+        documents such as ``company_tickers``.
+        """
         suffix = ENDPOINT_SUFFIX.get(endpoint)
         if suffix is None:
             raise ValueError(f"unknown cache endpoint {endpoint!r}")
-        directory = self.raw_dir / endpoint / cik
+        directory = self.raw_dir / endpoint / (cik or GLOBAL_CIK)
         if key:
             directory = directory / key
         path = _latest_file(directory, suffix)
@@ -188,7 +204,7 @@ class RawCache:
 
     def keys(self, endpoint: str, cik: str) -> list[str]:
         """Return the sorted page/accession keys stored for a CIK and endpoint."""
-        directory = self.raw_dir / endpoint / cik
+        directory = self.raw_dir / endpoint / (cik or GLOBAL_CIK)
         if not directory.is_dir():
             return []
         return sorted(entry.name for entry in directory.iterdir() if entry.is_dir())
@@ -238,7 +254,8 @@ def _print_report(report: VerifyReport) -> None:
         detail = ", ".join(
             f"{endpoint}={counts[endpoint]}" for endpoint in _ENDPOINTS if endpoint in counts
         )
-        print(f"{cik}: {total} files ({detail})")
+        label = cik if cik else GLOBAL_CIK
+        print(f"{label}: {total} files ({detail})")
     for relative in report.missing:
         print(f"missing: {relative}", file=sys.stderr)
     for relative in report.mismatched:

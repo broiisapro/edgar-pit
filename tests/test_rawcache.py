@@ -121,6 +121,25 @@ def test_keys_and_page_layout(tmp_path: Path) -> None:
         cache.latest("nope", "0000320193")
 
 
+def test_company_tickers_uses_its_global_slot(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b'{"0": {"cik_str": 320193, "ticker": "AAPL"}}'
+    url = "https://www.sec.gov/files/company_tickers.json"
+    path = cache.write("company_tickers", "", "", body, url=url, http_status=200)
+    assert path.parent == tmp_path / "raw" / "company_tickers" / "_"
+    assert path.name.endswith(".json.zst")
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "company_tickers"
+    assert row["cik"] == ""
+    assert row["path"].startswith("raw/company_tickers/_/")
+    assert cache.latest("company_tickers", "") == body
+    assert cache.latest("company_tickers", "_") == body
+    assert cache.latest("company_tickers", "0000320193") is None
+    report = cache.verify()
+    assert report.ok
+    assert report.inventory == {"": {"company_tickers": 1}}
+
+
 def test_latest_reads_uncompressed_fixture_files(tmp_path: Path) -> None:
     cache = RawCache(tmp_path)
     directory = tmp_path / "raw" / "submissions" / "0001000275"
@@ -163,8 +182,9 @@ def test_verify_without_manifest_is_not_ok(tmp_path: Path) -> None:
 def test_verify_fixture_manifest() -> None:
     report = RawCache(FIXTURES).verify()
     assert report.ok, (report.missing[:5], report.mismatched[:5], report.unlisted[:5])
-    assert report.checked == 455
-    assert set(report.inventory) == {"0001000275", "0000320193", "0001594805"}
+    assert report.checked == 456
+    assert set(report.inventory) == {"", "0001000275", "0000320193", "0001594805"}
+    assert report.inventory[""]["company_tickers"] == 1
 
 
 def test_cli_verify_fixtures_and_tampered_cache(tmp_path: Path) -> None:
@@ -178,6 +198,7 @@ def test_cli_verify_fixtures_and_tampered_cache(tmp_path: Path) -> None:
     assert good.returncode == 0, good.stderr
     assert "manifest OK" in good.stdout
     assert "0001000275: 210 files" in good.stdout
+    assert "_: 1 files (company_tickers=1)" in good.stdout
 
     cache = RawCache(tmp_path)
     cache.write(

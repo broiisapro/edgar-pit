@@ -148,11 +148,15 @@ def test_fixture_tree_layout() -> None:
             "submissions_page",
             "companyfacts",
             "headers",
+            "company_tickers",
         }
         assert row["trimmed"] is True
         if row["endpoint"] == "headers":
             assert parts[0:3] == ["raw", "headers", row["cik"]]
             assert ACCESSION_RE.fullmatch(parts[3])
+        elif row["endpoint"] == "company_tickers":
+            assert parts[0:3] == ["raw", "company_tickers", "_"]
+            assert row["cik"] == ""
         else:
             assert parts[2] == row["cik"]
 
@@ -173,9 +177,13 @@ def test_manifest_hashes_match_files() -> None:
 def test_manifest_urls_are_real_sec_urls_for_the_cik() -> None:
     for row in load_manifest():
         cik = row["cik"]
-        assert re.fullmatch(r"\d{10}", cik)
         url = row["url"]
         parts = row["path"].split("/")
+        if row["endpoint"] == "company_tickers":
+            assert cik == ""
+            assert url == "https://www.sec.gov/files/company_tickers.json"
+            continue
+        assert re.fullmatch(r"\d{10}", cik)
         if row["endpoint"] == "submissions":
             assert url == f"https://data.sec.gov/submissions/CIK{cik}.json"
         elif row["endpoint"] == "submissions_page":
@@ -192,6 +200,20 @@ def test_manifest_urls_are_real_sec_urls_for_the_cik() -> None:
                 f"{accession.replace('-', '')}/{accession}.hdr.sgml"
             )
             assert url == expected
+
+
+def test_company_tickers_fixture_covers_the_universe() -> None:
+    universe_path = Path(__file__).resolve().parents[1] / "config" / "universe.csv"
+    with universe_path.open(encoding="utf-8", newline="") as handle:
+        universe = {row["ticker"]: row["cik"] for row in csv.DictReader(handle)}
+    paths = sorted((RAW_DIR / "company_tickers" / "_").glob("*.json"))
+    assert len(paths) == 1
+    document = json.loads(paths[0].read_text(encoding="utf-8"))
+    by_ticker = {entry["ticker"]: f"{entry['cik_str']:010d}" for entry in document.values()}
+    assert len(document) == len(by_ticker), "duplicate tickers in the fixture"
+    assert len(document) == len(universe) + 5, "fixture is not the universe plus five tickers"
+    for ticker, cik in universe.items():
+        assert by_ticker.get(ticker) == cik, ticker
 
 
 def test_every_page_file_from_submissions_is_kept() -> None:

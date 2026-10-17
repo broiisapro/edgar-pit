@@ -1,0 +1,227 @@
+{
+ "0": {
+  "cik_str": 1045810,
+  "ticker": "NVDA",
+  "title": "NVIDIA CORP"
+ },
+ "1": {
+  "cik_str": 320193,
+  "ticker": "AAPL",
+  "title": "Apple Inc."
+ },
+ "2": {
+  "cik_str": 1652044,
+  "ticker": "GOOGL",
+  "title": "Alphabet Inc."
+ },
+ "3": {
+  "cik_str": 789019,
+  "ticker": "MSFT",
+  "title": "MICROSOFT CORP"
+ },
+ "4": {
+  "cik_str": 1018724,
+  "ticker": "AMZN",
+  "title": "AMAZON COM INC"
+ },
+ "5": {
+  "cik_str": 1326801,
+  "ticker": "META",
+  "title": "Meta Platforms, Inc."
+ },
+ "7": {
+  "cik_str": 1318605,
+  "ticker": "TSLA",
+  "title": "Tesla, Inc."
+ },
+ "11": {
+  "cik_str": 104169,
+  "ticker": "WMT",
+  "title": "Walmart Inc."
+ },
+ "12": {
+  "cik_str": 2488,
+  "ticker": "AMD",
+  "title": "ADVANCED MICRO DEVICES INC"
+ },
+ "13": {
+  "cik_str": 19617,
+  "ticker": "JPM",
+  "title": "JPMORGAN CHASE & CO"
+ },
+ "14": {
+  "cik_str": 1403161,
+  "ticker": "V",
+  "title": "VISA INC."
+ },
+ "17": {
+  "cik_str": 200406,
+  "ticker": "JNJ",
+  "title": "JOHNSON & JOHNSON"
+ },
+ "18": {
+  "cik_str": 1141391,
+  "ticker": "MA",
+  "title": "Mastercard Inc"
+ },
+ "20": {
+  "cik_str": 50863,
+  "ticker": "INTC",
+  "title": "INTEL CORP"
+ },
+ "24": {
+  "cik_str": 93410,
+  "ticker": "CVX",
+  "title": "CHEVRON CORP"
+ },
+ "25": {
+  "cik_str": 1341439,
+  "ticker": "ORCL",
+  "title": "ORACLE CORP"
+ },
+ "26": {
+  "cik_str": 21344,
+  "ticker": "KO",
+  "title": "COCA COLA CO"
+ },
+ "27": {
+  "cik_str": 731766,
+  "ticker": "UNH",
+  "title": "UNITEDHEALTH GROUP INC"
+ },
+ "28": {
+  "cik_str": 80424,
+  "ticker": "PG",
+  "title": "PROCTER & GAMBLE Co"
+ },
+ "30": {
+  "cik_str": 70858,
+  "ticker": "BAC",
+  "title": "BANK OF AMERICA CORP /DE/"
+ },
+ "37": {
+  "cik_str": 354950,
+  "ticker": "HD",
+  "title": "HOME DEPOT, INC."
+ },
+ "38": {
+  "cik_str": 1065280,
+  "ticker": "NFLX",
+  "title": "NETFLIX INC"
+ },
+ "45": {
+  "cik_str": 1000275,
+  "ticker": "RY",
+  "title": "ROYAL BANK OF CANADA"
+ },
+ "54": {
+  "cik_str": 72971,
+  "ticker": "WFC",
+  "title": "WELLS FARGO & COMPANY/MN"
+ },
+ "60": {
+  "cik_str": 1594805,
+  "ticker": "SHOP",
+  "title": "SHOPIFY INC."
+ },
+ "64": {
+  "cik_str": 51143,
+  "ticker": "IBM",
+  "title": "INTERNATIONAL BUSINESS MACHINES CORP"
+ },
+ "74": {
+  "cik_str": 947263,
+  "ticker": "TD",
+  "title": "TORONTO DOMINION BANK"
+ },
+ "83": {
+  "cik_str": 77476,
+  "ticker": "PEP",
+  "title": "PEPSICO INC"
+ },
+ "145": {
+  "cik_str": 927971,
+  "ticker": "BMO",
+  "title": "BANK OF MONTREAL /CAN/"
+ },
+ "149": {
+  "cik_str": 9631,
+  "ticker": "BNS",
+  "title": "BANK OF NOVA SCOTIA"
+ },
+ "154": {
+  "cik_str": 1017413,
+  "ticker": "CNQ",
+  "title": "CANADIAN NATURAL RESOURCES Ltd"
+ },
+ "158": {
+  "cik_str": 895728,
+  "ticker": "ENB",
+  "title": "ENBRIDGE INC"
+ },
+ "162": {
+  "cik_str": 1045520,
+  "ticker": "CM",
+  "title": "CANADIAN IMPERIAL BANK OF COMMERCE /CAN/"
+ },
+ "189": {
+  "cik_str": 311337,
+  "ticker": "SU",
+  "title": "SUNCOR ENERGY INC"
+ },
+ "231": {
+  "cik_str": 16875,
+  "ticker": "CP",
+  "title": "CANADIAN PACIFIC KANSAS CITY LTD/CN"
+ },
+ "240": {
+  "cik_str": 16868,
+  "ticker": "CNI",
+  "title": "CANADIAN NATIONAL RAILWAY CO"
+ },
+ "242": {
+  "cik_str": 1086888,
+  "ticker": "MFC",
+  "title": "MANULIFE FINANCIAL CORP"
+ },
+ "283": {
+  "cik_str": 1475260,
+  "ticker": "CVE",
+  "title": "CENOVUS ENERGY INC."
+ },
+ "352": {
+  "cik_str": 1075124,
+  "ticker": "TRI",
+  "title": "THOMSON REUTERS CORP /CAN/"
+ },
+ "372": {
+  "cik_str": 1097362,
+  "ticker": "SLF",
+  "title": "SUN LIFE FINANCIAL INC"
+ },
+ "382": {
+  "cik_str": 1318220,
+  "ticker": "WCN",
+  "title": "Waste Connections, Inc."
+ },
+ "449": {
+  "cik_str": 1725964,
+  "ticker": "NTR",
+  "title": "Nutrien Ltd."
+ },
+ "466": {
+  "cik_str": 886986,
+  "ticker": "TECK",
+  "title": "TECK RESOURCES LTD"
+ },
+ "1249": {
+  "cik_str": 1002638,
+  "ticker": "OTEX",
+  "title": "OPEN TEXT CORP"
+ },
+ "7531": {
+  "cik_str": 1232384,
+  "ticker": "TRP",
+  "title": "TC ENERGY CORP"
+ }
+}
