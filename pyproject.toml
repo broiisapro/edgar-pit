@@ -1,0 +1,62 @@
+[project]
+name = "edgarpit"
+version = "0.1.0"
+description = "Point-in-time fundamentals and corporate events from SEC EDGAR"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.28,<0.29",
+    "tenacity>=9.2,<10",
+    "zstandard>=0.25,<0.26",
+    "polars>=1.44,<2",
+    "pandera[polars]>=0.34,<0.35",
+    "duckdb>=1.5,<2",
+    "dbt-core>=1.12,<1.13",
+    "dbt-duckdb>=1.11,<1.12",
+    "fastapi>=0.143,<1",
+    "uvicorn>=0.54,<1",
+    "streamlit>=1.66,<2",
+    "altair>=6.3,<7",
+    "typer>=0.27,<1",
+    "pyyaml>=6.0.3,<7",
+    "pydantic-settings>=2.16,<3",
+    "pyarrow>=26,<27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "hypothesis>=6.170,<7",
+    "respx>=0.23,<0.24",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<3",
+    "types-PyYAML>=6.0.12",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["edgarpit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["edgarpit"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["edgarpit.*"]
+strict = true
+
+[tool.pytest.ini_options]
+addopts = '-m "not network" --strict-markers'
+testpaths = ["tests"]
+markers = ["network: tests that call live SEC endpoints (deselected by default)"]
