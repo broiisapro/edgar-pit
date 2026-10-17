@@ -1,0 +1,84 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Staging tables loaded by edgarpit (schema raw).
+    schema: raw
+    tables:
+      - name: filings
+        description: One row per filing.
+        columns:
+          - name: cik
+            data_type: VARCHAR(10)
+          - name: accession
+            data_type: VARCHAR
+          - name: form
+            data_type: VARCHAR
+          - name: filing_date
+            data_type: DATE
+          - name: report_date
+            data_type: DATE
+          - name: acceptance_ts
+            data_type: TIMESTAMPTZ
+          - name: acceptance_ts_source
+            data_type: VARCHAR
+          - name: acceptance_ts_api
+            data_type: TIMESTAMPTZ
+          - name: ts_imputed
+            data_type: BOOLEAN
+          - name: primary_document
+            data_type: VARCHAR
+          - name: items
+            data_type: VARCHAR
+          - name: is_amendment
+            data_type: BOOLEAN
+          - name: is_xbrl
+            data_type: BOOLEAN
+          - name: source
+            data_type: VARCHAR
+      - name: facts_raw
+        description: One row per companyfacts entry.
+        columns:
+          - name: cik
+            data_type: VARCHAR(10)
+          - name: taxonomy
+            data_type: VARCHAR
+          - name: concept
+            data_type: VARCHAR
+          - name: unit
+            data_type: VARCHAR
+          - name: value
+            data_type: DOUBLE
+          - name: period_start
+            data_type: DATE
+          - name: period_end
+            data_type: DATE
+          - name: fy
+            data_type: INTEGER
+          - name: fp
+            data_type: VARCHAR
+          - name: form
+            data_type: VARCHAR
+          - name: accession
+            data_type: VARCHAR
+          - name: filed
+            data_type: DATE
+          - name: frame
+            data_type: VARCHAR
+      - name: events_8k
+        description: One row per (8-K or 8-K/A, item).
+        columns:
+          - name: cik
+            data_type: VARCHAR(10)
+          - name: accession
+            data_type: VARCHAR
+          - name: form
+            data_type: VARCHAR
+          - name: acceptance_ts
+            data_type: TIMESTAMPTZ
+          - name: ts_imputed
+            data_type: BOOLEAN
+          - name: item_code
+            data_type: VARCHAR
+          - name: item_label
+            data_type: VARCHAR

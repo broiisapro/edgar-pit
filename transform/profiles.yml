@@ -1,0 +1,13 @@
+edgarpit:
+  target: fixtures
+  outputs:
+    fixtures:
+      type: duckdb
+      path: "{{ env_var('EDGARPIT_DB', '/tmp/ep/edgarpit.duckdb') }}"
+      settings:
+        TimeZone: UTC
+    build:
+      type: duckdb
+      path: "{{ env_var('EDGARPIT_DB', '/tmp/ep/edgarpit.duckdb') }}"
+      settings:
+        TimeZone: UTC
