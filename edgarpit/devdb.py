@@ -4,7 +4,9 @@ Until the ingest pipeline exists (Epic 01), dbt and query development runs
 against ``<out_dir>/edgarpit.duckdb``, filled from staging CSVs in
 ``tests/fixtures/staging`` when they are present and left empty otherwise.
 Every CSV is validated with the Pandera schema of its table before it is
-loaded, and every connection sets the session timezone to UTC (decision A-5).
+loaded, the ``raw.concept_map`` and ``raw.universe`` reference tables are
+always loaded from ``config/``, and every connection sets the session
+timezone to UTC (decision A-5).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import duckdb
 import polars as pl
 from polars.datatypes import DataType, DataTypeClass
 
+from edgarpit.load import REFERENCE_TYPES, load_reference_tables
 from edgarpit.schemas import COLUMNS, DUCKDB_TYPES, SCHEMAS, duckdb_ddl
 
 DEFAULT_STAGING_DIR = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "staging"
@@ -37,12 +40,13 @@ def _read_staging_csv(table: str, path: Path) -> pl.DataFrame:
 
 
 def create_dev_db(out_dir: Path, staging_dir: Path | None = None) -> Path:
-    """Recreate ``<out_dir>/edgarpit.duckdb`` with the three ``raw`` tables.
+    """Recreate ``<out_dir>/edgarpit.duckdb`` with the ``raw`` tables.
 
     Each ``<table>.csv`` found in ``staging_dir`` (default
     ``tests/fixtures/staging``) is validated with its Pandera schema, then
-    loaded; tables without a CSV stay empty. Per-table row counts are printed
-    and the database path is returned.
+    loaded; tables without a CSV stay empty. ``raw.concept_map`` and
+    ``raw.universe`` are always loaded from ``config/``. Per-table row counts
+    are printed and the database path is returned.
     """
     out_dir = Path(out_dir)
     staging = DEFAULT_STAGING_DIR if staging_dir is None else Path(staging_dir)
@@ -69,6 +73,11 @@ def create_dev_db(out_dir: Path, staging_dir: Path | None = None) -> Path:
                 counts[table] = frame.height
             else:
                 counts[table] = 0
+        load_reference_tables(con)
+        for table in REFERENCE_TYPES:
+            row = con.execute(f"SELECT count(*) FROM raw.{table}").fetchone()
+            assert row is not None
+            counts[table] = int(row[0])
     finally:
         con.close()
 

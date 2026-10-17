@@ -82,3 +82,31 @@ sources:
             data_type: VARCHAR
           - name: item_label
             data_type: VARCHAR
+      - name: concept_map
+        description: Canonical field map loaded from config/concept_map.yaml (decision A-20).
+        columns:
+          - name: field
+            data_type: VARCHAR
+          - name: taxonomy
+            data_type: VARCHAR
+          - name: concept
+            data_type: VARCHAR
+          - name: concept_rank
+            data_type: INTEGER
+          - name: kind
+            data_type: VARCHAR
+          - name: unit_family
+            data_type: VARCHAR
+      - name: universe
+        description: Issuer universe loaded from config/universe.csv (decision A-20).
+        columns:
+          - name: ticker
+            data_type: VARCHAR
+          - name: cik
+            data_type: VARCHAR(10)
+          - name: name
+            data_type: VARCHAR
+          - name: country
+            data_type: VARCHAR
+          - name: filer_type
+            data_type: VARCHAR
