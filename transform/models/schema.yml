@@ -103,6 +103,62 @@ models:
       - name: is_restatement
         tests:
           - not_null
+  - name: ratios_pit
+    description: >-
+      One row per (cik, ratio, period_start, period_end, asof_ts); asof_ts is
+      the latest acceptance time among the input versions used, and every input
+      is its latest version accepted at or before asof_ts. Only same-currency
+      inputs produce a row.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [cik, ratio, period_start, period_end, asof_ts]
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: ratio
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["roe", "leverage", "net_margin"]
+      - name: period_end
+        tests:
+          - not_null
+      - name: period_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["FY", "Q"]
+      - name: asof_ts
+        tests:
+          - not_null
+      - name: value
+        tests:
+          - not_null
+      - name: currency
+        tests:
+          - not_null
+      - name: numerator_field
+        tests:
+          - not_null
+      - name: numerator_accession
+        tests:
+          - not_null
+      - name: numerator_acceptance_ts
+        tests:
+          - not_null
+      - name: denominator_field
+        tests:
+          - not_null
+      - name: denominator_accession
+        tests:
+          - not_null
+      - name: denominator_acceptance_ts
+        tests:
+          - not_null
   - name: filings
     description: raw.filings plus the issuer ticker from raw.universe.
     columns:
