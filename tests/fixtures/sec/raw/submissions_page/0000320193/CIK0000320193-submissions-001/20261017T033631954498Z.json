@@ -1,0 +1,50 @@
+{
+ "accessionNumber": [
+  "0001193125-10-012091"
+ ],
+ "filingDate": [
+  "2010-01-25"
+ ],
+ "reportDate": [
+  "2009-09-26"
+ ],
+ "acceptanceDateTime": [
+  "2010-01-26T02:25:58.000Z"
+ ],
+ "act": [
+  "34"
+ ],
+ "form": [
+  "10-K/A"
+ ],
+ "fileNumber": [
+  "000-10030"
+ ],
+ "filmNumber": [
+  "10545024"
+ ],
+ "items": [
+  ""
+ ],
+ "core_type": [
+  "10-K/A"
+ ],
+ "size": [
+  5066790
+ ],
+ "isXBRL": [
+  1
+ ],
+ "isInlineXBRL": [
+  0
+ ],
+ "isXBRLNumeric": [
+  null
+ ],
+ "primaryDocument": [
+  "d10ka.htm"
+ ],
+ "primaryDocDescription": [
+  "AMENDMENT NO. 1 TO FORM 10-K"
+ ]
+}
