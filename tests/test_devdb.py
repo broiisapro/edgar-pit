@@ -58,11 +58,19 @@ def test_empty_staging_leaves_empty_tables(tmp_path: Path) -> None:
     db_path = create_dev_db(tmp_path / "out", staging_dir=tmp_path / "absent")
 
     assert db_path == tmp_path / "out" / "edgarpit.duckdb"
-    assert raw_tables(db_path) == {"filings", "events_8k", "facts_raw"}
+    assert raw_tables(db_path) == {
+        "filings",
+        "events_8k",
+        "facts_raw",
+        "concept_map",
+        "universe",
+    }
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         for table in ("filings", "events_8k", "facts_raw"):
             assert con.execute(f"SELECT count(*) FROM raw.{table}").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM raw.concept_map").fetchone() != (0,)
+        assert con.execute("SELECT count(*) FROM raw.universe").fetchone() == (40,)
     finally:
         con.close()
 
@@ -125,6 +133,25 @@ def test_invalid_staging_csv_is_rejected(tmp_path: Path) -> None:
         create_dev_db(tmp_path / "out", staging_dir=staging)
 
 
+def test_reference_tables_are_loaded_from_config(tmp_path: Path) -> None:
+    db_path = create_dev_db(tmp_path / "out", staging_dir=tmp_path / "absent")
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        ry = con.execute(
+            "SELECT ticker, country, filer_type FROM raw.universe WHERE cik = '0001000275'"
+        ).fetchone()
+        assert ry == ("RY", "CA", "40-F")
+        revenue = con.execute(
+            "SELECT taxonomy, concept, concept_rank FROM raw.concept_map "
+            "WHERE field = 'revenue' ORDER BY taxonomy, concept_rank"
+        ).fetchall()
+        assert ("ifrs-full", "Revenue", 1) in revenue
+        assert ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", 1) in revenue
+    finally:
+        con.close()
+
+
 def test_main_creates_database(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from edgarpit.devdb import main
 
@@ -134,4 +161,6 @@ def test_main_creates_database(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "raw.filings: 2 rows" in out
+    assert "raw.concept_map: " in out
+    assert "raw.universe: 40 rows" in out
     assert (tmp_path / "out" / "edgarpit.duckdb").exists()

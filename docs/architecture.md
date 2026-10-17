@@ -134,6 +134,31 @@ Unique key: `(accession, item_code)`.
 
 `facts_raw` is pure companyfacts; `acceptance_ts` is attached in dbt by joining `raw.filings` on `accession`.
 
+### `raw.concept_map` — one row per (field, taxonomy, concept) (decision A-20)
+
+| column | type | notes |
+|---|---|---|
+| field | VARCHAR | canonical field from `config/concept_map.yaml` |
+| taxonomy | VARCHAR | `us-gaap` \| `ifrs-full` |
+| concept | VARCHAR | |
+| concept_rank | INTEGER | 1-based position in the field's ordered list for that taxonomy |
+| kind | VARCHAR | `duration` \| `instant` |
+| unit_family | VARCHAR | `currency` \| `shares` \| `currency_per_share` |
+
+Loaded by `edgarpit.load.load_reference_tables`; dbt maps concepts only through this table.
+
+### `raw.universe` — one row per issuer (decision A-20)
+
+| column | type | notes |
+|---|---|---|
+| ticker | VARCHAR | |
+| cik | VARCHAR(10) | zero-padded |
+| name | VARCHAR | |
+| country | VARCHAR | |
+| filer_type | VARCHAR | |
+
+Loaded by `edgarpit.load.load_reference_tables` from `config/universe.csv`; dbt attaches tickers only through this table.
+
 ## 7. Column contract — dbt output models (schema `main`)
 
 Frozen in Epic 0. The query layer depends only on these columns.
