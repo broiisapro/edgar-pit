@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -78,16 +79,34 @@ EVENTS_8K_COLUMNS = [
     "ticker",
 ]
 
+RATIOS_PIT_COLUMNS = [
+    "cik",
+    "ratio",
+    "period_start",
+    "period_end",
+    "period_type",
+    "asof_ts",
+    "value",
+    "currency",
+    "numerator_field",
+    "numerator_accession",
+    "numerator_acceptance_ts",
+    "denominator_field",
+    "denominator_accession",
+    "denominator_acceptance_ts",
+]
+
 
 @dataclass(frozen=True)
 class DbtBuild:
-    """A finished dbt run and the database it wrote."""
+    """A finished dbt run, the database it wrote and its artifacts dir."""
 
     db: Path
+    target: Path
     result: dbtRunnerResult
 
 
-def run_dbt(db_path: Path, *args: str) -> dbtRunnerResult:
+def run_dbt(db_path: Path, target_path: Path, *args: str) -> dbtRunnerResult:
     os.environ["EDGARPIT_DB"] = str(db_path)
     runner = dbtRunner()
     return runner.invoke(
@@ -99,6 +118,8 @@ def run_dbt(db_path: Path, *args: str) -> dbtRunnerResult:
             str(TRANSFORM_DIR),
             "--target",
             "fixtures",
+            "--target-path",
+            str(target_path),
             *args,
         ]
     )
@@ -136,6 +157,8 @@ def write_synthetic_staging(directory: Path) -> None:
         "2024,FY,10-K,0000320193-24-000123,2024-11-01,",
         "0000320193,us-gaap,NetIncomeLoss,USD,78000000000.0,2023-10-01,2024-06-29,2024,Q3,"
         "10-K,0000320193-24-000123,2024-11-01,",
+        "0000320193,us-gaap,StockholdersEquity,CAD,78000000000.0,,2024-09-28,2025,FY,10-K,"
+        "0000320193-25-000079,2025-10-31,",
     ]
     with (directory / "facts_raw.csv").open("a", encoding="utf-8") as handle:
         handle.write("\n".join(rows) + "\n")
@@ -144,8 +167,9 @@ def write_synthetic_staging(directory: Path) -> None:
 @pytest.fixture(scope="module")
 def staging_build(tmp_path_factory: pytest.TempPathFactory) -> DbtBuild:
     out_dir = tmp_path_factory.mktemp("staging-db")
+    target = tmp_path_factory.mktemp("staging-target")
     db_path = create_dev_db(out_dir)
-    return DbtBuild(db_path, run_dbt(db_path))
+    return DbtBuild(db_path, target, run_dbt(db_path, target))
 
 
 @pytest.fixture(scope="module")
@@ -153,8 +177,18 @@ def synthetic_build(tmp_path_factory: pytest.TempPathFactory) -> DbtBuild:
     staging_dir = tmp_path_factory.mktemp("synthetic-staging")
     write_synthetic_staging(staging_dir)
     out_dir = tmp_path_factory.mktemp("synthetic-db")
+    target = tmp_path_factory.mktemp("synthetic-target")
     db_path = create_dev_db(out_dir, staging_dir=staging_dir)
-    return DbtBuild(db_path, run_dbt(db_path))
+    return DbtBuild(db_path, target, run_dbt(db_path, target))
+
+
+@pytest.fixture(scope="module")
+def injected_build(tmp_path_factory: pytest.TempPathFactory) -> DbtBuild:
+    out_dir = tmp_path_factory.mktemp("injected-db")
+    target = tmp_path_factory.mktemp("injected-target")
+    db_path = create_dev_db(out_dir)
+    result = run_dbt(db_path, target, "--vars", "{inject_future_ratio: true}")
+    return DbtBuild(db_path, target, result)
 
 
 def test_dbt_build_succeeds_on_the_staging_data(staging_build: DbtBuild) -> None:
@@ -167,6 +201,7 @@ def test_dbt_build_succeeds_on_the_synthetic_data(synthetic_build: DbtBuild) -> 
 
 def test_output_models_match_the_column_contract(staging_build: DbtBuild) -> None:
     assert table_columns(staging_build.db, "fundamentals_pit") == FUNDAMENTALS_PIT_COLUMNS
+    assert table_columns(staging_build.db, "ratios_pit") == RATIOS_PIT_COLUMNS
     assert table_columns(staging_build.db, "filings") == FILINGS_COLUMNS
     assert table_columns(staging_build.db, "events_8k") == EVENTS_8K_COLUMNS
 
@@ -353,4 +388,102 @@ def test_stg_facts_removes_exact_duplicates(synthetic_build: DbtBuild) -> None:
         """,
     )
 
-    assert counts == [(144, 145)]
+    assert counts == [(145, 146)]
+
+
+def test_mixed_currency_inputs_produce_no_ratio_row(synthetic_build: DbtBuild) -> None:
+    rows = query(
+        synthetic_build.db,
+        """
+        select count(*)
+        from main.ratios_pit
+        where cik = ? and ratio in ('roe', 'leverage')
+          and period_end = date '2024-09-28'
+          and asof_ts >= ?
+        """,
+        [AAPL_CIK, datetime(2025, 10, 31, 18, 1, 59, tzinfo=UTC)],
+    )
+
+    assert rows == [(0,)]
+
+
+def test_ry_fy2023_roe_tracks_both_40f_acceptances(staging_build: DbtBuild) -> None:
+    rows = query(
+        staging_build.db,
+        """
+        select asof_ts, value, numerator_accession, denominator_accession,
+               numerator_acceptance_ts, denominator_acceptance_ts, currency,
+               period_type, period_start, period_end
+        from main.ratios_pit
+        where cik = ? and ratio = 'roe'
+          and period_start = date '2022-11-01' and period_end = date '2023-10-31'
+        order by asof_ts
+        """,
+        [RY_CIK],
+    )
+
+    original = [row for row in rows if row[0] == RY_FY2023_ACCEPTED]
+    restated = [row for row in rows if row[0] == RY_FY2023_RESTATED_ACCEPTED]
+    assert len(original) == 1
+    assert len(restated) == 1
+    assert original[0] == (
+        RY_FY2023_ACCEPTED,
+        14_866_000_000.0 / 117_760_000_000.0,
+        RY_FY2023_40F,
+        RY_FY2023_40F,
+        RY_FY2023_ACCEPTED,
+        RY_FY2023_ACCEPTED,
+        "CAD",
+        "FY",
+        date(2022, 11, 1),
+        date(2023, 10, 31),
+    )
+    assert restated[0][0] == RY_FY2023_RESTATED_ACCEPTED
+    assert restated[0][1] == pytest.approx(14_612_000_000.0 / 115_147_000_000.0)
+    assert restated[0][2] == restated[0][3] == RY_FY2023_RESTATED_40F
+    assert restated[0][4] == restated[0][5] == RY_FY2023_RESTATED_ACCEPTED
+
+
+def test_ratio_rows_satisfy_the_as_of_invariant(staging_build: DbtBuild) -> None:
+    violations = query(
+        staging_build.db,
+        """
+        select count(*)
+        from main.ratios_pit
+        where numerator_acceptance_ts > asof_ts
+           or denominator_acceptance_ts > asof_ts
+           or asof_ts <> greatest(numerator_acceptance_ts, denominator_acceptance_ts)
+           or currency is null
+        """,
+    )
+    periods = query(
+        staging_build.db,
+        """
+        select count(*)
+        from main.ratios_pit
+        where (ratio = 'leverage' and period_start is not null)
+           or (ratio in ('roe', 'net_margin') and period_start is null)
+        """,
+    )
+
+    assert violations == [(0,)]
+    assert periods == [(0,)]
+
+
+def test_injected_future_ratio_fails_the_future_input_test(injected_build: DbtBuild) -> None:
+    assert injected_build.result.success is False
+    run_results = json.loads((injected_build.target / "run_results.json").read_text())
+    failed = {
+        result["unique_id"] for result in run_results["results"] if result["status"] == "fail"
+    }
+
+    assert failed == {"test.edgarpit.assert_ratio_inputs_not_from_future"}
+    future_rows = query(
+        injected_build.db,
+        """
+        select count(*)
+        from main.ratios_pit
+        where numerator_acceptance_ts > asof_ts
+        """,
+    )
+    assert future_rows == [(1,)]
