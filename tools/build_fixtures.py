@@ -45,10 +45,24 @@ the repository ``.env``).  It refuses to run without a valid "Name email"
 agent.  Re-running reproduces the tree; only ``fetched_at`` names and fields
 change.  Only the standard library is used so the script runs before the
 project environment exists.
+
+``--staging`` rebuilds ``tests/fixtures/staging/{filings,facts_raw,events_8k}.csv``
+and ``tests/fixtures/expected_asof.json`` from the stored fixture tree (no
+network, no User-Agent) for the selection in ``STAGING_FIELDS`` and
+``STAGING_PERIODS``: FY2022-FY2024 annual facts for the seven fields, two
+quarterly periods per issuer, every version present in the fixtures, one
+deliberately unmapped concept per issuer, the matching filings rows, and the
+exploded items of the ten most recent Apple 8-Ks.  Within each
+``(cik, field, period, taxonomy)`` group the lowest-ranked mapped concept
+present in the fixtures is used.  Timestamps come from the SGML headers
+(America/New_York -> UTC) and headers match ``edgarpit.schemas.COLUMNS``.
+Run it with ``uv run python tools/build_fixtures.py --staging``.
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -63,10 +77,13 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec"
 RAW_DIR = FIXTURE_ROOT / "raw"
+STAGING_DIR = REPO_ROOT / "tests" / "fixtures" / "staging"
+EXPECTED_ASOF_PATH = REPO_ROOT / "tests" / "fixtures" / "expected_asof.json"
 
 ISSUERS: tuple[tuple[str, str], ...] = (
     ("0001000275", "Royal Bank of Canada"),
@@ -99,66 +116,127 @@ FORCED_ACCESSIONS: dict[str, frozenset[str]] = {
     "0000320193": frozenset({"0001193125-10-012091"}),
 }
 
-# One concept list per taxonomy.  ``KEEP_CONCEPTS`` covers every canonical
-# field of the concept map (both taxonomies, ordered fallbacks included) plus
-# deliberately unmapped concepts used by QA reports.
+# Staging selection (``--staging``): canonical fields and the fiscal periods
+# the staging CSVs cover.  Duration facts must match both boundaries; instant
+# facts match the period end (their period_start is null).
+STAGING_FIELDS: tuple[str, ...] = (
+    "revenue",
+    "net_income",
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
+    "cash",
+    "eps_diluted",
+)
+
+STAGING_PERIODS: dict[str, dict[str, tuple[str, str]]] = {
+    "0001000275": {
+        "FY2022": ("2021-11-01", "2022-10-31"),
+        "FY2023": ("2022-11-01", "2023-10-31"),
+        "FY2024": ("2023-11-01", "2024-10-31"),
+        "Q1-2024": ("2023-11-01", "2024-01-31"),
+        "Q2-2024": ("2024-02-01", "2024-04-30"),
+    },
+    "0000320193": {
+        "FY2022": ("2021-09-26", "2022-09-24"),
+        "FY2023": ("2022-09-25", "2023-09-30"),
+        "FY2024": ("2023-10-01", "2024-09-28"),
+        "Q1-2024": ("2023-10-01", "2023-12-30"),
+        "Q2-2024": ("2023-12-31", "2024-03-30"),
+    },
+    "0001594805": {
+        "FY2022": ("2022-01-01", "2022-12-31"),
+        "FY2023": ("2023-01-01", "2023-12-31"),
+        "FY2024": ("2024-01-01", "2024-12-31"),
+        "Q1-2024": ("2024-01-01", "2024-03-31"),
+        "Q2-2024": ("2024-04-01", "2024-06-30"),
+    },
+}
+
+# One deliberately unmapped concept per issuer, kept in the fixtures and in
+# the staging facts so QA and the concept-extension path have real input.
+UNMAPPED_SELECTION: dict[str, tuple[str, str]] = {
+    "0001000275": ("ifrs-full", "CashFlowsFromUsedInInvestingActivities"),
+    "0000320193": ("us-gaap", "IncomeTaxExpenseBenefit"),
+    "0001594805": ("us-gaap", "IncomeTaxExpenseBenefit"),
+}
+
+APPLE_CIK = "0000320193"
+APPLE_8K_COUNT = 10
+EXPECTED_ASOF: dict[str, Any] = {
+    "cik": "0001000275",
+    "field": "revenue",
+    "asof": "2024-01-15T00:00:00Z",
+    "period": "FY",
+    "accession": "0001193125-23-285639",
+}
+
+# One concept list per taxonomy.  ``KEEP_CONCEPTS`` covers every concept of
+# every canonical field in ``config/concept_map.yaml`` (both taxonomies,
+# ordered fallbacks included) plus deliberately unmapped concepts used by QA
+# reports and the staging selection.  Keep this aligned with the map: the map
+# is frozen by decision S-8, so additions here follow map additions.
 KEEP_CONCEPTS: dict[str, frozenset[str]] = {
     "us-gaap": frozenset(
         {
             # revenue
             "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "RevenueFromContractWithCustomerIncludingAssessedTax",
             "Revenues",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
             "SalesRevenueNet",
-            "SalesRevenueGoodsNet",
+            # gross profit / operating income
+            "GrossProfit",
+            "OperatingIncomeLoss",
             # net income
             "NetIncomeLoss",
             "ProfitLoss",
-            "NetIncomeLossAvailableToCommonStockholdersBasic",
-            # total assets / liabilities / equity
-            "Assets",
-            "Liabilities",
-            "StockholdersEquity",
-            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            # income before tax
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+            # earnings per share
+            "EarningsPerShareBasic",
+            "IncomeLossFromContinuingOperationsPerBasicShare",
+            "EarningsPerShareDiluted",
+            "IncomeLossFromContinuingOperationsPerDilutedShare",
+            # research and development
+            "ResearchAndDevelopmentExpense",
             # cash flow
             "NetCashProvidedByUsedInOperatingActivities",
             "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
             "PaymentsToAcquirePropertyPlantAndEquipment",
             "PaymentsToAcquireProductiveAssets",
-            # cash
+            # balance sheet
+            "Assets",
+            "AssetsCurrent",
             "CashAndCashEquivalentsAtCarryingValue",
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-            # shares
+            "InventoryNet",
+            "AccountsReceivableNetCurrent",
+            "ReceivablesNetCurrent",
+            "AccountsAndOtherReceivablesNetCurrent",
+            "Liabilities",
+            "LiabilitiesCurrent",
+            "LongTermDebt",
+            "LongTermDebtNoncurrent",
+            "LongTermDebtAndCapitalLeaseObligations",
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
             "CommonStockSharesOutstanding",
+            # deliberately unmapped extras
+            "SalesRevenueGoodsNet",
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
             "CommonStockSharesIssued",
             "WeightedAverageNumberOfDilutedSharesOutstanding",
             "WeightedAverageNumberOfSharesOutstandingBasic",
-            # earnings per share
-            "EarningsPerShareDiluted",
-            "EarningsPerShareBasic",
-            # operating income / gross profit
-            "OperatingIncomeLoss",
-            "GrossProfit",
-            # current assets / liabilities
-            "AssetsCurrent",
-            "LiabilitiesCurrent",
-            # debt
-            "LongTermDebtNoncurrent",
-            "LongTermDebt",
             "LongTermDebtCurrent",
-            # further canonical fields
             "InterestExpense",
             "InterestExpenseNonoperating",
             "PaymentsOfDividendsCommonStock",
             "PaymentsOfDividends",
             "PaymentsForRepurchaseOfCommonStock",
-            "ResearchAndDevelopmentExpense",
-            # deliberately unmapped
             "SellingGeneralAndAdministrativeExpense",
             "AdvertisingExpense",
             "IncomeTaxExpenseBenefit",
-            "InventoryNet",
-            "AccountsReceivableNetCurrent",
             "AccountsPayableCurrent",
             "CostOfGoodsAndServicesSold",
         }
@@ -168,45 +246,46 @@ KEEP_CONCEPTS: dict[str, frozenset[str]] = {
             # revenue
             "Revenue",
             "RevenueFromContractsWithCustomers",
+            # gross profit / operating income
+            "GrossProfit",
+            "ProfitLossFromOperatingActivities",
             # net income
             "ProfitLoss",
             "ProfitLossAttributableToOwnersOfParent",
-            "ProfitLossFromContinuingOperations",
-            # total assets / liabilities / equity
-            "Assets",
-            "Liabilities",
-            "Equity",
-            "EquityAndLiabilities",
-            "EquityAttributableToOwnersOfParent",
+            # income before tax
+            "ProfitLossBeforeTax",
+            # earnings per share
+            "BasicEarningsLossPerShare",
+            "DilutedEarningsLossPerShare",
+            # research and development
+            "ResearchAndDevelopmentExpense",
             # cash flow
             "CashFlowsFromUsedInOperatingActivities",
             "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
-            # cash
-            "CashAndCashEquivalents",
-            # shares
-            "NumberOfSharesOutstanding",
-            "NumberOfSharesIssued",
-            # earnings per share
-            "DilutedEarningsLossPerShare",
-            "DilutedEarningsLossPerShareFromContinuingOperations",
-            "BasicEarningsLossPerShare",
-            "BasicEarningsLossPerShareFromContinuingOperations",
-            # operating income / gross profit
-            "ProfitLossFromOperatingActivities",
-            "GrossProfit",
-            # current assets / liabilities
+            # balance sheet
+            "Assets",
             "CurrentAssets",
+            "CashAndCashEquivalents",
+            "Inventories",
+            "TradeAndOtherReceivables",
+            "Liabilities",
             "CurrentLiabilities",
-            # debt
             "LongtermBorrowings",
+            "Borrowings",
+            "Equity",
+            "EquityAttributableToOwnersOfParent",
+            "NumberOfSharesOutstanding",
+            # deliberately unmapped extras
+            "ProfitLossFromContinuingOperations",
+            "EquityAndLiabilities",
+            "NumberOfSharesIssued",
+            "DilutedEarningsLossPerShareFromContinuingOperations",
+            "BasicEarningsLossPerShareFromContinuingOperations",
             "NoncurrentPortionOfLongtermBorrowings",
             "CurrentPortionOfLongtermBorrowings",
-            # further canonical fields
             "FinanceCosts",
             "DividendsPaidClassifiedAsFinancingActivities",
             "PaymentsForRepurchaseOfEquity",
-            "ResearchAndDevelopmentExpense",
-            # deliberately unmapped
             "CostOfSales",
             "AdministrativeExpense",
             "InterestRevenueCalculatedUsingEffectiveInterestMethod",
@@ -605,7 +684,367 @@ def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
     return summary
 
 
-def main() -> int:
+def iso_utc(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def header_acceptance(cik: str, accession: str) -> datetime:
+    """Parse a stored SGML header's acceptance time (New York) as UTC."""
+    paths = sorted((RAW_DIR / "headers" / cik / accession).glob("*.hdr.sgml"))
+    if len(paths) != 1:
+        raise FixtureError(f"expected one header for {cik}/{accession}, found {len(paths)}")
+    match = _ACCEPTANCE_RE.search(paths[0].read_text(encoding="utf-8", errors="replace"))
+    if match is None:
+        raise FixtureError(f"header {cik}/{accession} has no ACCEPTANCE-DATETIME")
+    stamp = datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+    return stamp.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
+
+
+def read_submissions_index() -> dict[str, dict[str, tuple[dict[str, Any], str]]]:
+    """Map each CIK and accession to its submissions row and source document."""
+    index: dict[str, dict[str, tuple[dict[str, Any], str]]] = {}
+    for cik, _ in ISSUERS:
+        entries: dict[str, tuple[dict[str, Any], str]] = {}
+        for path in sorted((RAW_DIR / "submissions" / cik).glob("*.json")):
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for accession, row in submissions_rows(document).items():
+                entries[accession] = (row, "recent")
+        for path in sorted((RAW_DIR / "submissions_page" / cik).glob("*/*.json")):
+            source = f"{path.parent.name}.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for accession, row in submissions_rows(document).items():
+                entries.setdefault(accession, (row, source))
+        index[cik] = entries
+    return index
+
+
+def read_companyfacts(cik: str) -> dict[str, Any]:
+    paths = sorted((RAW_DIR / "companyfacts" / cik).glob("*.json"))
+    if len(paths) != 1:
+        raise FixtureError(f"expected one companyfacts file for {cik}, found {len(paths)}")
+    return json.loads(paths[0].read_text(encoding="utf-8"))
+
+
+def companyfact_rows(cik: str) -> list[dict[str, Any]]:
+    """Flatten a fixture companyfacts document into ``facts_raw``-shaped rows."""
+    document = read_companyfacts(cik)
+    rows: list[dict[str, Any]] = []
+    for taxonomy, concepts in document["facts"].items():
+        for concept, entry in concepts.items():
+            for unit, facts in entry["units"].items():
+                for fact in facts:
+                    rows.append(
+                        {
+                            "cik": cik,
+                            "taxonomy": taxonomy,
+                            "concept": concept,
+                            "unit": unit,
+                            "value": float(fact["val"]),
+                            "period_start": fact.get("start"),
+                            "period_end": fact["end"],
+                            "fy": fact.get("fy"),
+                            "fp": fact.get("fp"),
+                            "form": fact["form"],
+                            "accession": fact["accn"],
+                            "filed": fact["filed"],
+                            "frame": fact.get("frame"),
+                        }
+                    )
+    return rows
+
+
+def _fact_matches_period(fact: dict[str, Any], period: tuple[str, str]) -> bool:
+    start, end = period
+    if fact["period_start"] is None:
+        return fact["period_end"] == end
+    return fact["period_start"] == start and fact["period_end"] == end
+
+
+def select_staging_facts() -> list[dict[str, Any]]:
+    """Select the staging facts for the canonical fields and periods.
+
+    Within a ``(cik, field, period, taxonomy)`` group the rows of the
+    lowest-ranked concept present in the fixtures are kept.  A period whose
+    values never change keeps only the earliest version (companyfacts repeats
+    it in later filings as a comparative); a period with more than one value
+    keeps every version, so the RY FY2023 revenue restatement arrives with
+    both 56,129,000,000 and 51,464,000,000.  One deliberately unmapped
+    concept per issuer is added for the same periods.
+    """
+    from edgarpit.concepts import load_concept_map
+
+    concept_map = load_concept_map()
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    unmapped: list[dict[str, Any]] = []
+    for cik, _ in ISSUERS:
+        taxonomy_want, concept_want = UNMAPPED_SELECTION[cik]
+        for fact in companyfact_rows(cik):
+            periods = STAGING_PERIODS[cik].values()
+            if fact["taxonomy"] == taxonomy_want and fact["concept"] == concept_want:
+                if any(_fact_matches_period(fact, period) for period in periods):
+                    unmapped.append(fact)
+                continue
+            mapped = concept_map.lookup(fact["taxonomy"], fact["concept"])
+            if mapped is None or mapped[0] not in STAGING_FIELDS:
+                continue
+            field = mapped[0]
+            for label, period in STAGING_PERIODS[cik].items():
+                if _fact_matches_period(fact, period):
+                    grouped.setdefault((cik, field, label, fact["taxonomy"]), []).append(fact)
+    selected: list[dict[str, Any]] = []
+    for (_cik, _field, _label, taxonomy), rows in grouped.items():
+        ranks = {concept_map.lookup(taxonomy, row["concept"])[1] for row in rows}
+        best = min(ranks)
+        selected.extend(
+            row for row in rows if concept_map.lookup(taxonomy, row["concept"])[1] == best
+        )
+    return drop_repeat_comparatives(dedupe_facts(selected + unmapped))
+
+
+def dedupe_facts(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop exact duplicate companyfacts entries (decision A-7)."""
+    seen: set[tuple[Any, ...]] = set()
+    kept: list[dict[str, Any]] = []
+    for fact in sorted(facts, key=fact_sort_key):
+        key = (
+            fact["cik"],
+            fact["taxonomy"],
+            fact["concept"],
+            fact["unit"],
+            fact["value"],
+            fact["period_start"],
+            fact["period_end"],
+            fact["accession"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(fact)
+    return kept
+
+
+def drop_repeat_comparatives(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one row per unchanged period; every version of a changed one.
+
+    Companyfacts repeats a period's numbers in every later filing that uses
+    them as a comparative.  A period whose values never change contributes
+    only its earliest row; once a period has more than one value all of its
+    versions stay, so a restated value keeps its full history.
+    """
+    groups: dict[tuple[str, str, str, str, str | None, str], list[dict[str, Any]]] = {}
+    for fact in sorted(facts, key=fact_sort_key):
+        key = (
+            fact["cik"],
+            fact["taxonomy"],
+            fact["concept"],
+            fact["unit"],
+            fact["period_start"],
+            fact["period_end"],
+        )
+        groups.setdefault(key, []).append(fact)
+    kept: list[dict[str, Any]] = []
+    for rows in groups.values():
+        if len({row["value"] for row in rows}) > 1:
+            kept.extend(rows)
+        else:
+            kept.append(min(rows, key=lambda row: (row["filed"], row["accession"])))
+    return sorted(kept, key=fact_sort_key)
+
+
+def fact_sort_key(fact: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        fact["cik"],
+        fact["taxonomy"],
+        fact["concept"],
+        fact["period_start"] or "",
+        fact["period_end"],
+        fact["accession"],
+        fact["value"],
+    )
+
+
+def select_staging_events(
+    index: dict[str, dict[str, tuple[dict[str, Any], str]]],
+) -> list[dict[str, Any]]:
+    """Explode the items of the most recent Apple 8-Ks (labels are ``unknown``)."""
+    apple = [
+        (accession, row)
+        for accession, (row, _source) in index[APPLE_CIK].items()
+        if row["form"] in EVENT_FORMS
+    ]
+    apple.sort(key=lambda pair: (pair[1]["filingDate"], pair[0]), reverse=True)
+    events: list[dict[str, Any]] = []
+    chosen = 0
+    for accession, row in apple:
+        items = (row.get("items") or "").split(",")
+        codes = [code.strip() for code in items if code.strip()]
+        codes = list(dict.fromkeys(codes))
+        if not codes:
+            continue
+        acceptance = iso_utc(header_acceptance(APPLE_CIK, accession))
+        for code in codes:
+            events.append(
+                {
+                    "cik": APPLE_CIK,
+                    "accession": accession,
+                    "form": row["form"],
+                    "acceptance_ts": acceptance,
+                    "ts_imputed": "false",
+                    "item_code": code,
+                    "item_label": "unknown",
+                }
+            )
+        chosen += 1
+        if chosen == APPLE_8K_COUNT:
+            break
+    if chosen < APPLE_8K_COUNT:
+        raise FixtureError(f"only {chosen} Apple 8-Ks with items in the fixtures")
+    events.sort(key=lambda event: (event["cik"], event["accession"], event["item_code"]))
+    return events
+
+
+def select_staging_filings(
+    index: dict[str, dict[str, tuple[dict[str, Any], str]]],
+    facts: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the filings rows for every accession the staging tables reference."""
+    accessions_by_cik: dict[str, set[str]] = {}
+    for fact in facts:
+        accessions_by_cik.setdefault(fact["cik"], set()).add(fact["accession"])
+    for event in events:
+        accessions_by_cik.setdefault(event["cik"], set()).add(event["accession"])
+    filings: list[dict[str, Any]] = []
+    for cik in sorted(accessions_by_cik):
+        for accession in sorted(accessions_by_cik[cik]):
+            entry = index[cik].get(accession)
+            if entry is None:
+                raise FixtureError(f"no submissions row for {cik}/{accession}")
+            row, source = entry
+            acceptance_api = row.get("acceptanceDateTime") or None
+            filings.append(
+                {
+                    "cik": cik,
+                    "accession": accession,
+                    "form": row["form"],
+                    "filing_date": row["filingDate"],
+                    "report_date": row.get("reportDate") or None,
+                    "acceptance_ts": iso_utc(header_acceptance(cik, accession)),
+                    "acceptance_ts_source": "sgml_header",
+                    "acceptance_ts_api": str(acceptance_api) if acceptance_api else None,
+                    "ts_imputed": "false",
+                    "primary_document": row.get("primaryDocument") or None,
+                    "items": row.get("items") or None,
+                    "is_amendment": str(row["form"].endswith("/A")).lower(),
+                    "is_xbrl": str(bool(row.get("isXBRL") or row.get("isInlineXBRL"))).lower(),
+                    "source": source,
+                }
+            )
+    return filings
+
+
+def write_staging_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow(
+                ["" if row.get(column) is None else str(row[column]) for column in columns]
+            )
+
+
+def derive_expected_asof(
+    facts: list[dict[str, Any]], filings: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Build expected_asof.json from the selected staging rows, never by hand."""
+    from edgarpit.concepts import load_concept_map
+
+    concept_map = load_concept_map()
+    cik = EXPECTED_ASOF["cik"]
+    accession = EXPECTED_ASOF["accession"]
+    candidates = [
+        fact
+        for fact in facts
+        if fact["cik"] == cik
+        and fact["accession"] == accession
+        and fact["period_end"] == "2023-10-31"
+        and (concept_map.lookup(fact["taxonomy"], fact["concept"]) or ("", 0))[0] == "revenue"
+    ]
+    if len(candidates) != 1:
+        raise FixtureError(
+            f"expected exactly one revenue row for {cik}/{accession}, found {len(candidates)}"
+        )
+    fact = candidates[0]
+    filing = next((row for row in filings if row["accession"] == accession), None)
+    if filing is None:
+        raise FixtureError(f"no staging filings row for {accession}")
+    value: float | int = fact["value"]
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    unit = fact["unit"]
+    return {
+        "cik": cik,
+        "field": "revenue",
+        "asof": EXPECTED_ASOF["asof"],
+        "period": EXPECTED_ASOF["period"],
+        "value": value,
+        "unit": unit,
+        "currency": unit if re.fullmatch(r"[A-Z]{3}", unit) else None,
+        "period_start": fact["period_start"],
+        "period_end": fact["period_end"],
+        "accession": accession,
+        "acceptance_ts": filing["acceptance_ts"],
+    }
+
+
+def build_staging() -> dict[str, int]:
+    """Write the staging CSVs and ``expected_asof.json`` from the fixture tree."""
+    try:
+        from edgarpit.schemas import COLUMNS
+    except ImportError as error:  # pragma: no cover - environment guidance
+        raise FixtureError(
+            "--staging needs the project environment: "
+            "run `uv run python tools/build_fixtures.py --staging`"
+        ) from error
+    index = read_submissions_index()
+    facts = select_staging_facts()
+    events = select_staging_events(index)
+    filings = select_staging_filings(index, facts, events)
+    write_staging_csv(STAGING_DIR / "filings.csv", COLUMNS["filings"], filings)
+    write_staging_csv(STAGING_DIR / "facts_raw.csv", COLUMNS["facts_raw"], facts)
+    write_staging_csv(STAGING_DIR / "events_8k.csv", COLUMNS["events_8k"], events)
+    expected = derive_expected_asof(facts, filings)
+    EXPECTED_ASOF_PATH.write_text(
+        json.dumps(expected, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+    )
+    return {
+        "filings": len(filings),
+        "facts_raw": len(facts),
+        "events_8k": len(events),
+        "total": len(filings) + len(facts) + len(events),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Download and trim the SEC fixtures, or rebuild the staging CSVs."
+    )
+    parser.add_argument(
+        "--staging",
+        action="store_true",
+        help="write tests/fixtures/staging/*.csv and expected_asof.json from the fixture tree",
+    )
+    args = parser.parse_args(argv)
+    if args.staging:
+        try:
+            counts = build_staging()
+        except FixtureError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(counts, indent=2))
+        print(f"staging written to {STAGING_DIR}")
+        return 0
     try:
         agent = validate_user_agent(find_user_agent())
     except FixtureError as error:
