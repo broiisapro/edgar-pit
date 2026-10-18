@@ -55,13 +55,13 @@
  "formerNames": [
   {
    "name": "ROYAL BANK OF CANADA",
-   "from": "2011-08-09T00:00:00.000Z",
-   "to": "2026-10-16T00:00:00.000Z"
+   "from": "2011-08-09T04:00:00.000Z",
+   "to": "2026-10-16T04:00:00.000Z"
   },
   {
    "name": "ROYAL BANK OF CANADA \\",
-   "from": "1996-09-04T00:00:00.000Z",
-   "to": "2012-04-05T00:00:00.000Z"
+   "from": "1996-09-04T04:00:00.000Z",
+   "to": "2012-04-05T04:00:00.000Z"
   }
  ],
  "filings": {
@@ -438,9 +438,9 @@
   "files": [
    {
     "name": "CIK0001000275-submissions-001.json",
-    "filingCount": 2024,
+    "filingCount": 2037,
     "filingFrom": "2025-04-29",
-    "filingTo": "2025-10-14"
+    "filingTo": "2025-10-15"
    },
    {
     "name": "CIK0001000275-submissions-002.json",

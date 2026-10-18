@@ -3,8 +3,8 @@
 
 The fixtures are real SEC responses for three issuers, trimmed by removing
 array rows only: no value and no key inside a kept entry is ever edited.
-Concepts outside ``KEEP_CONCEPTS`` and units that lose every row are dropped
-entirely, which is the only structural removal besides rows.
+Concepts outside :func:`keep_concepts` and units that lose every row are
+dropped entirely, which is the only structural removal besides rows.
 
 - Royal Bank of Canada, CIK 0001000275 (40-F/IFRS, CAD; reference restatement)
 - Apple Inc., CIK 0000320193 (US GAAP, 10-K/A, many 8-Ks)
@@ -32,10 +32,10 @@ Trim rules:
   when it trims to zero rows, so pagination stays exercised.  A row is also
   kept when its accession carries a kept companyfacts fact, so Epic 01 can
   join every kept fact to a filing.
-- companyfacts keeps every ``dei`` concept plus the concepts in
-  ``KEEP_CONCEPTS`` (all concepts of the canonical fields for both taxonomies
-  and a few deliberately unmapped ones), with fact rows whose ``end`` is
-  >= 2018-01-01.
+- companyfacts keeps every ``dei`` concept plus :func:`keep_concepts`: every
+  concept of every canonical field in ``config/concept_map.yaml`` (both
+  taxonomies) and a few deliberately unmapped ones, with fact rows whose
+  ``end`` is >= 2018-01-01.
 - One SGML header is fetched and stored for every accession referenced by a
   kept filing row or a kept fact (the URL needs only cik + accession, so it
   exists even for accessions missing from submissions).
@@ -44,8 +44,9 @@ The tool talks to SEC's documented endpoints only, at <= 4 requests/second,
 with a declared ``User-Agent`` read from ``SEC_USER_AGENT`` (environment or
 the repository ``.env``).  It refuses to run without a valid "Name email"
 agent.  Re-running reproduces the tree; only ``fetched_at`` names and fields
-change.  Only the standard library is used so the script runs before the
-project environment exists.
+change.  The HTTP path uses only the standard library; the trim step reads
+``config/concept_map.yaml`` through :mod:`edgarpit.concepts`, so full builds
+run with ``uv run python tools/build_fixtures.py``.
 
 ``--staging`` rebuilds ``tests/fixtures/staging/{filings,facts_raw,events_8k}.csv``
 and ``tests/fixtures/expected_asof.json`` from the stored fixture tree (no
@@ -83,6 +84,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -184,58 +186,11 @@ EXPECTED_ASOF: dict[str, Any] = {
     "accession": "0001193125-23-285639",
 }
 
-# One concept list per taxonomy.  ``KEEP_CONCEPTS`` covers every concept of
-# every canonical field in ``config/concept_map.yaml`` (both taxonomies,
-# ordered fallbacks included) plus deliberately unmapped concepts used by QA
-# reports and the staging selection.  Keep this aligned with the map: the map
-# is frozen by decision S-8, so additions here follow map additions.
-KEEP_CONCEPTS: dict[str, frozenset[str]] = {
+# Deliberately unmapped concepts kept beyond the concept map, so QA reports
+# and the concept-extension path have real unmapped input in the fixtures.
+EXTRA_CONCEPTS: dict[str, frozenset[str]] = {
     "us-gaap": frozenset(
         {
-            # revenue
-            "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "Revenues",
-            "RevenueFromContractWithCustomerIncludingAssessedTax",
-            "SalesRevenueNet",
-            # gross profit / operating income
-            "GrossProfit",
-            "OperatingIncomeLoss",
-            # net income
-            "NetIncomeLoss",
-            "ProfitLoss",
-            # income before tax
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
-            # earnings per share
-            "EarningsPerShareBasic",
-            "IncomeLossFromContinuingOperationsPerBasicShare",
-            "EarningsPerShareDiluted",
-            "IncomeLossFromContinuingOperationsPerDilutedShare",
-            # research and development
-            "ResearchAndDevelopmentExpense",
-            # cash flow
-            "NetCashProvidedByUsedInOperatingActivities",
-            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-            "PaymentsToAcquirePropertyPlantAndEquipment",
-            "PaymentsToAcquireProductiveAssets",
-            # balance sheet
-            "Assets",
-            "AssetsCurrent",
-            "CashAndCashEquivalentsAtCarryingValue",
-            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-            "InventoryNet",
-            "AccountsReceivableNetCurrent",
-            "ReceivablesNetCurrent",
-            "AccountsAndOtherReceivablesNetCurrent",
-            "Liabilities",
-            "LiabilitiesCurrent",
-            "LongTermDebt",
-            "LongTermDebtNoncurrent",
-            "LongTermDebtAndCapitalLeaseObligations",
-            "StockholdersEquity",
-            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-            "CommonStockSharesOutstanding",
-            # deliberately unmapped extras
             "SalesRevenueGoodsNet",
             "NetIncomeLossAvailableToCommonStockholdersBasic",
             "CommonStockSharesIssued",
@@ -256,39 +211,6 @@ KEEP_CONCEPTS: dict[str, frozenset[str]] = {
     ),
     "ifrs-full": frozenset(
         {
-            # revenue
-            "Revenue",
-            "RevenueFromContractsWithCustomers",
-            # gross profit / operating income
-            "GrossProfit",
-            "ProfitLossFromOperatingActivities",
-            # net income
-            "ProfitLoss",
-            "ProfitLossAttributableToOwnersOfParent",
-            # income before tax
-            "ProfitLossBeforeTax",
-            # earnings per share
-            "BasicEarningsLossPerShare",
-            "DilutedEarningsLossPerShare",
-            # research and development
-            "ResearchAndDevelopmentExpense",
-            # cash flow
-            "CashFlowsFromUsedInOperatingActivities",
-            "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
-            # balance sheet
-            "Assets",
-            "CurrentAssets",
-            "CashAndCashEquivalents",
-            "Inventories",
-            "TradeAndOtherReceivables",
-            "Liabilities",
-            "CurrentLiabilities",
-            "LongtermBorrowings",
-            "Borrowings",
-            "Equity",
-            "EquityAttributableToOwnersOfParent",
-            "NumberOfSharesOutstanding",
-            # deliberately unmapped extras
             "ProfitLossFromContinuingOperations",
             "EquityAndLiabilities",
             "NumberOfSharesIssued",
@@ -307,6 +229,30 @@ KEEP_CONCEPTS: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+
+@lru_cache(maxsize=1)
+def keep_concepts() -> dict[str, frozenset[str]]:
+    """Return the concepts to keep per taxonomy.
+
+    Every concept of every canonical field in ``config/concept_map.yaml``
+    (both taxonomies, ordered fallbacks included) plus
+    :data:`EXTRA_CONCEPTS`. The mapped set is derived through
+    :meth:`edgarpit.concepts.ConceptMap.specs`, so a concept added to the map
+    is kept in the fixtures automatically; the map is the only hand-kept
+    source of truth.
+    """
+    from edgarpit.concepts import load_concept_map
+
+    mapped: dict[str, set[str]] = {"us-gaap": set(), "ifrs-full": set()}
+    for spec in load_concept_map().specs():
+        mapped["us-gaap"].update(spec.us_gaap)
+        mapped["ifrs-full"].update(spec.ifrs_full)
+    return {
+        taxonomy: frozenset(mapped[taxonomy] | EXTRA_CONCEPTS.get(taxonomy, frozenset()))
+        for taxonomy in mapped
+    }
+
 
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _ACCEPTANCE_RE = re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})")
@@ -473,16 +419,17 @@ def trim_submissions_page(page: dict[str, Any], extra_accessions: frozenset[str]
 
 
 def trim_companyfacts(document: dict[str, Any]) -> dict[str, Any]:
-    """Keep dei plus ``KEEP_CONCEPTS``; keep fact rows with ``end`` >= cutoff."""
+    """Keep dei plus :func:`keep_concepts`; keep fact rows with ``end`` >= cutoff."""
     facts = document.get("facts")
     if not isinstance(facts, dict):
         raise FixtureError("companyfacts document has no facts block")
+    wanted = keep_concepts()
     kept_facts: dict[str, Any] = {}
     for taxonomy, concepts in facts.items():
         if taxonomy == "dei":
             keep: frozenset[str] | None = None
-        elif taxonomy in KEEP_CONCEPTS:
-            keep = KEEP_CONCEPTS[taxonomy]
+        elif taxonomy in wanted:
+            keep = wanted[taxonomy]
         else:
             continue
         kept_concepts: dict[str, Any] = {}
