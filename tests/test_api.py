@@ -74,6 +74,7 @@ FUNDAMENTALS = [
         version=2,
         first_value=56_129_000_000.0,
         is_restatement=True,
+        restatement_kind="revision",
     ),
     pit_tables.FundamentalRow(
         cik=RY_CIK,
@@ -169,6 +170,7 @@ def test_asof_returns_the_version_known_at_the_time(client: TestClient) -> None:
             "version": 1,
             "is_restatement": False,
             "ts_imputed": False,
+            "restatement_kind": "none",
         }
     ]
 
@@ -189,6 +191,7 @@ def test_asof_restatement_boundary(client: TestClient) -> None:
     assert (at[0]["value"], at[0]["version"]) == (51_464_000_000.0, 2)
     assert at[0]["acceptance_ts"] == "2024-12-04T16:30:00Z"
     assert after[0]["is_restatement"] is True
+    assert after[0]["restatement_kind"] == "revision"
 
 
 def test_asof_period_filter_and_n(client: TestClient) -> None:

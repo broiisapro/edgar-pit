@@ -37,7 +37,8 @@ CREATE TABLE main.fundamentals_pit (
     version INTEGER,
     first_value DOUBLE,
     is_restatement BOOLEAN,
-    pct_change_vs_first DOUBLE
+    pct_change_vs_first DOUBLE,
+    restatement_kind VARCHAR
 )
 """
 
@@ -54,7 +55,7 @@ CREATE TABLE main.events_8k (
 )
 """
 
-_FUNDAMENTAL_INSERT = "INSERT INTO main.fundamentals_pit VALUES (" + ", ".join(["?"] * 20) + ")"
+_FUNDAMENTAL_INSERT = "INSERT INTO main.fundamentals_pit VALUES (" + ", ".join(["?"] * 21) + ")"
 _EVENT_INSERT = "INSERT INTO main.events_8k VALUES (" + ", ".join(["?"] * 8) + ")"
 
 
@@ -65,7 +66,9 @@ class FundamentalRow:
     ``acceptance_ts`` is the filing's acceptance time (UTC), ``version`` the
     1-based version of the period ordered by ``(acceptance_ts, accession)`` and
     ``first_value`` the value of version 1 (``None`` when not set by a test).
-    ``ticker`` and ``currency`` may be ``None`` for shares/pure units.
+    ``ticker`` and ``currency`` may be ``None`` for shares/pure units;
+    ``restatement_kind`` is the contract's last column (``none``,
+    ``split_adjustment`` or ``revision``) and is ``none`` unless a test sets it.
     """
 
     cik: str
@@ -88,6 +91,7 @@ class FundamentalRow:
     first_value: float | None = None
     is_restatement: bool = False
     pct_change_vs_first: float | None = None
+    restatement_kind: str = "none"
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,7 @@ def build_pit_db(
             row.first_value,
             row.is_restatement,
             row.pct_change_vs_first,
+            row.restatement_kind,
         )
         for row in fundamentals
     ]

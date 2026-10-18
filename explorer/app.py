@@ -22,9 +22,15 @@ import streamlit as st
 from edgarpit import query
 from edgarpit.config import Settings
 
-STATUS_ORDER = ["version 1", "restatement", "later version", "not yet accepted"]
-STATUS_COLORS = ["#1f77b4", "#d62728", "#ff7f0e", "#9e9e9e"]
-STATUS_SHAPES = ["circle", "diamond", "square", "cross"]
+STATUS_ORDER = [
+    "version 1",
+    "restatement",
+    "split adjustment",
+    "later version",
+    "not yet accepted",
+]
+STATUS_COLORS = ["#1f77b4", "#d62728", "#9467bd", "#ff7f0e", "#9e9e9e"]
+STATUS_SHAPES = ["circle", "diamond", "triangle-up", "square", "cross"]
 
 VERSION_COLUMNS = [
     "period_end",
@@ -34,6 +40,7 @@ VERSION_COLUMNS = [
     "accepted",
     "known_at_asof",
     "status",
+    "restatement_kind",
     "accession",
 ]
 
@@ -50,10 +57,19 @@ def filing_url(cik: str, accession: str) -> str:
     )
 
 
-def _status(version: int, is_restatement: bool, known: bool) -> str:
+def _status(version: int, restatement_kind: str, known: bool) -> str:
+    """Return the display status of one version.
+
+    Only a ``revision`` is called a restatement; a ``split_adjustment`` gets
+    its own status so stock splits are not shown as misleading restatements
+    (decision A-25). Versions accepted after the as-of time are ``not yet
+    accepted``.
+    """
     if not known:
         return "not yet accepted"
-    if is_restatement:
+    if restatement_kind == "split_adjustment":
+        return "split adjustment"
+    if restatement_kind == "revision":
         return "restatement"
     if version == 1:
         return "version 1"
@@ -69,7 +85,9 @@ def versions_frame(rows: list[query.AsOfResult], asof: datetime) -> pl.DataFrame
 
     ``asof`` is the UTC instant of the "as of" control; each row gets a
     ``known_at_asof`` flag (``acceptance_ts <= asof``) and a ``status`` used by
-    the chart and the table. One row per filing version, in query order.
+    the chart and the table. Only ``revision`` versions are marked as
+    restatements; ``split_adjustment`` versions carry their own status (decision
+    A-25). One row per filing version, in query order.
     """
     return pl.DataFrame(
         {
@@ -83,8 +101,10 @@ def versions_frame(rows: list[query.AsOfResult], asof: datetime) -> pl.DataFrame
             "accepted": [_iso_z(row.acceptance_ts) for row in rows],
             "known_at_asof": [row.acceptance_ts <= asof for row in rows],
             "is_restatement": [row.is_restatement for row in rows],
+            "restatement_kind": [row.restatement_kind for row in rows],
             "status": [
-                _status(row.version, row.is_restatement, row.acceptance_ts <= asof) for row in rows
+                _status(row.version, row.restatement_kind, row.acceptance_ts <= asof)
+                for row in rows
             ],
         }
     )
@@ -110,10 +130,11 @@ def events_frame(rows: list[query.EventResult]) -> pl.DataFrame:
 def timeline_chart(frame: pl.DataFrame) -> alt.Chart:
     """Return the Altair timeline: one point per version at its ``period_end``.
 
-    Colour and shape encode ``status`` (version 1, restatement, later version,
-    not yet accepted), so restatements and versions not yet accepted at the
-    "as of" time are visually distinct with a legend; the tooltip carries the
-    value, unit, accession and acceptance time.
+    Colour and shape encode ``status`` (version 1, restatement, split
+    adjustment, later version, not yet accepted), so revisions, stock splits
+    and versions not yet accepted at the "as of" time are visually distinct
+    with a legend; the tooltip carries the value, unit, accession and
+    acceptance time.
     """
     units = frame["unit"].unique().to_list()
     y_title = f"value ({units[0]})" if len(units) == 1 else "value"
@@ -178,7 +199,11 @@ def main() -> None:
     cik = labels[issuer]
 
     available_fields = query.fields(cik)
-    field = st.sidebar.selectbox("Field", options=available_fields) if available_fields else None
+    field = (
+        st.sidebar.selectbox("Field", options=available_fields, key="field")
+        if available_fields
+        else None
+    )
     period_choice = st.sidebar.radio("Period", options=["FY", "Q"], horizontal=True, key="period")
     quarterly = period_choice == "Q"
     period: Literal["FY", "Q"] = "Q" if quarterly else "FY"

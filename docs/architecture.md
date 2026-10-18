@@ -186,6 +186,7 @@ Frozen in Epic 0. The query layer depends only on these columns.
 | first_value | DOUBLE | value of version 1 |
 | is_restatement | BOOLEAN | decision A-7 |
 | pct_change_vs_first | DOUBLE NULL | |
+| restatement_kind | VARCHAR | `none` \| `split_adjustment` \| `revision` (decision A-25); `split_adjustment` only for share-based unit families whose change is a near-integer split factor |
 
 Concept selection: for each (cik, field, period, accession) keep the lowest `concept_rank` present in that accession.
 
@@ -211,7 +212,7 @@ Invariant (dbt test `assert_ratio_inputs_not_from_future`): `numerator_acceptanc
 
 ## 8. Query semantics
 
-- `asof(identifier, field, asof_ts, period="FY", n=1, *, db=None) -> list[AsOfResult]`: candidates are rows with `acceptance_ts <= asof_ts` and `period_type = period`; per period keep the max `(acceptance_ts, version)`; order by `period_end` desc; first `n`. `AsOfResult` fields: cik, ticker, field, value, unit, currency, period_start, period_end, period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed.
+- `asof(identifier, field, asof_ts, period="FY", n=1, *, db=None) -> list[AsOfResult]`: candidates are rows with `acceptance_ts <= asof_ts` and `period_type = period`; per period keep the max `(acceptance_ts, version)`; order by `period_end` desc; first `n`. `AsOfResult` fields: cik, ticker, field, value, unit, currency, period_start, period_end, period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, restatement_kind (decision A-25; the explorer marks only `revision` as a restatement and gives `split_adjustment` its own status).
 - `history(identifier, field, period=None)` → every version, ordered by period_end, version.
 - `events(identifier, item=None, start=None, end=None)` → rows of `events_8k` by acceptance_ts.
 - `asof_ts` strings must carry a timezone (`Z` or offset); naive inputs are rejected.

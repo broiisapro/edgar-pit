@@ -23,7 +23,8 @@ _PERIOD_TYPES = ("FY", "Q")
 
 _ASOF_COLUMNS = (
     "cik, ticker, field, value, unit, currency, period_start, period_end, "
-    "period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed"
+    "period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, "
+    "restatement_kind"
 )
 
 _EVENT_COLUMNS = "cik, ticker, accession, form, acceptance_ts, ts_imputed, item_code, item_label"
@@ -41,6 +42,9 @@ class AsOfResult:
     ``shares``/``pure``), ``acceptance_ts`` is timezone-aware UTC, ``period_end``
     is the end of the fiscal period and ``version`` counts the filing versions
     of that period ordered by ``(acceptance_ts, accession)``.
+    ``restatement_kind`` is ``none``, ``split_adjustment`` (a share-based
+    value re-reported for a stock split) or ``revision`` (every other
+    restatement; decision A-25).
     """
 
     cik: str
@@ -58,6 +62,7 @@ class AsOfResult:
     version: int
     is_restatement: bool
     ts_imputed: bool
+    restatement_kind: str
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,7 @@ def _asof_result(row: tuple[Any, ...]) -> AsOfResult:
         version=row[12],
         is_restatement=row[13],
         ts_imputed=row[14],
+        restatement_kind=row[15],
     )
 
 

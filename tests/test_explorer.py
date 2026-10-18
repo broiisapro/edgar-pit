@@ -81,6 +81,40 @@ FUNDAMENTALS = [
         version=2,
         first_value=56_129_000_000.0,
         is_restatement=True,
+        restatement_kind="revision",
+    ),
+    # Apple's FY2019 diluted EPS as reported, then re-reported for the 2020
+    # 4-for-1 stock split (decision A-25): a version, not a restatement.
+    pit_tables.FundamentalRow(
+        cik=AAPL_CIK,
+        ticker="AAPL",
+        field="eps_diluted",
+        value=11.89,
+        period_start=date(2018, 9, 30),
+        period_end=date(2019, 9, 28),
+        accession="0000320193-19-000119",
+        acceptance_ts=datetime(2019, 10, 31, 20, 5, 0, tzinfo=UTC),
+        unit="USD/shares",
+        currency="USD",
+        source_concept="EarningsPerShareDiluted",
+        first_value=11.89,
+    ),
+    pit_tables.FundamentalRow(
+        cik=AAPL_CIK,
+        ticker="AAPL",
+        field="eps_diluted",
+        value=2.97,
+        period_start=date(2018, 9, 30),
+        period_end=date(2019, 9, 28),
+        accession="0000320193-20-000096",
+        acceptance_ts=datetime(2020, 10, 30, 20, 5, 0, tzinfo=UTC),
+        unit="USD/shares",
+        currency="USD",
+        source_concept="EarningsPerShareDiluted",
+        version=2,
+        first_value=11.89,
+        is_restatement=True,
+        restatement_kind="split_adjustment",
     ),
 ]
 
@@ -133,6 +167,7 @@ def events_table(at: AppTest) -> pd.DataFrame:
 def test_app_renders_the_chart_and_the_events_table(app_test: AppTest) -> None:
     assert not app_test.exception
 
+    app_test.sidebar.selectbox(key="field").set_value("revenue")
     app_test.date_input(key="asof").set_value(date(2025, 1, 1))
     app_test.run()
     assert not app_test.exception
@@ -188,6 +223,22 @@ def test_asof_input_changes_which_versions_are_known(app_test: AppTest) -> None:
     assert app_test.metric[0].value == "3 of 3"
 
     assert before["known_at_asof"].tolist() != after["known_at_asof"].tolist()
+
+
+def test_split_adjustments_are_not_shown_as_restatements(app_test: AppTest) -> None:
+    """A-25: only a revision is a restatement; a split gets its own status."""
+    app_test.sidebar.selectbox(key="field").set_value("eps_diluted")
+    app_test.run()
+    assert not app_test.exception
+
+    versions = versions_table(app_test)
+    assert versions["status"].tolist() == ["version 1", "split adjustment"]
+    assert versions["restatement_kind"].tolist() == ["none", "split_adjustment"]
+
+    spec = json.loads(app_test.get("vega_lite_chart")[0].spec)
+    domain = spec["encoding"]["color"]["scale"]["domain"]
+    assert "restatement" in domain
+    assert "split adjustment" in domain
 
 
 def test_missing_database_shows_a_clear_message(

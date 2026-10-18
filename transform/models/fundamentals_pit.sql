@@ -72,38 +72,81 @@ with_first as (
         ) as first_value
     from versioned
 
+),
+
+ratioed as (
+
+    select
+        *,
+        abs(value - first_value) > 0.005 * abs(first_value) as is_restatement,
+        value / first_value as value_ratio,
+        first_value / value as inverse_ratio
+    from with_first
+
+),
+
+classified as (
+
+    -- A restatement is a split adjustment when its share-based unit family
+    -- moved by a near-integer factor (forward or reverse); every other
+    -- restatement is a revision (decision A-25). Division by zero yields
+    -- inf/nan, which never matches the factor list, but the `none` branch and
+    -- the unit-family branch keep those rows on `revision` anyway.
+    select
+        *,
+        case
+            when not is_restatement then 'none'
+            when unit_family in ('shares', 'currency_per_share')
+                and (
+                    (
+                        round(value_ratio)
+                            in (2, 3, 4, 5, 6, 7, 8, 10, 15, 20, 25, 30, 40, 50, 100)
+                        and abs(value_ratio - round(value_ratio)) <= 0.005 * round(value_ratio)
+                    )
+                    or (
+                        round(inverse_ratio)
+                            in (2, 3, 4, 5, 6, 7, 8, 10, 15, 20, 25, 30, 40, 50, 100)
+                        and abs(inverse_ratio - round(inverse_ratio))
+                            <= 0.005 * round(inverse_ratio)
+                    )
+                )
+                then 'split_adjustment'
+            else 'revision'
+        end as restatement_kind
+    from ratioed
+
 )
 
 select
-    with_first.cik,
+    classified.cik,
     universe.ticker,
-    with_first.field,
-    with_first.period_start,
-    with_first.period_end,
-    with_first.period_type,
-    with_first.accession,
-    with_first.form,
-    with_first.acceptance_ts,
-    with_first.ts_imputed,
-    with_first.value,
-    with_first.unit,
+    classified.field,
+    classified.period_start,
+    classified.period_end,
+    classified.period_type,
+    classified.accession,
+    classified.form,
+    classified.acceptance_ts,
+    classified.ts_imputed,
+    classified.value,
+    classified.unit,
     case
-        when regexp_matches(with_first.unit, '^[A-Z]{3}$') then with_first.unit
-        when regexp_matches(with_first.unit, '^[A-Z]{3}/shares$')
-            then split_part(with_first.unit, '/', 1)
+        when regexp_matches(classified.unit, '^[A-Z]{3}$') then classified.unit
+        when regexp_matches(classified.unit, '^[A-Z]{3}/shares$')
+            then split_part(classified.unit, '/', 1)
         else null
     end as currency,
-    with_first.source_taxonomy,
-    with_first.source_concept,
-    with_first.concept_rank,
-    with_first.version,
-    with_first.first_value,
-    abs(with_first.value - with_first.first_value) > 0.005 * abs(with_first.first_value)
-        as is_restatement,
+    classified.source_taxonomy,
+    classified.source_concept,
+    classified.concept_rank,
+    classified.version,
+    classified.first_value,
+    classified.is_restatement,
     case
-        when with_first.first_value = 0 then null
-        else (with_first.value - with_first.first_value) / with_first.first_value
-    end as pct_change_vs_first
-from with_first
+        when classified.first_value = 0 then null
+        else (classified.value - classified.first_value) / classified.first_value
+    end as pct_change_vs_first,
+    classified.restatement_kind
+from classified
 left join {{ source('raw', 'universe') }} as universe
-    on universe.cik = with_first.cik
+    on universe.cik = classified.cik
