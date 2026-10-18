@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -63,6 +66,44 @@ ACCEPTANCE_RE = re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})")
 ACCESSION_RE = re.compile(r"\d{10}-\d{2}-\d{6}")
 
 SIZE_BUDGET_BYTES = 20 * 1024 * 1024
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_fixture_builder() -> ModuleType:
+    """Import ``tools/build_fixtures.py`` by path (it is not a package)."""
+    path = REPO_ROOT / "tools" / "build_fixtures.py"
+    spec = importlib.util.spec_from_file_location("fixture_builder", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_kept_concepts_cover_every_concept_in_the_map() -> None:
+    keep = load_fixture_builder().keep_concepts()
+    for spec in load_concept_map().specs():
+        assert set(spec.us_gaap) <= keep["us-gaap"], spec.field
+        assert set(spec.ifrs_full) <= keep["ifrs-full"], spec.field
+    assert "RevenuesNetOfInterestExpense" in keep["us-gaap"]
+
+
+def test_fixture_companyfacts_keep_only_mapped_or_extra_concepts() -> None:
+    keep = load_fixture_builder().keep_concepts()
+    concept_map = load_concept_map()
+    checked = 0
+    for cik in CIKS:
+        for taxonomy, concepts in load_companyfacts(cik)["facts"].items():
+            if taxonomy == "dei":
+                continue
+            assert taxonomy in keep, f"{cik}: unexpected taxonomy {taxonomy}"
+            for concept in concepts:
+                assert (
+                    concept_map.lookup(taxonomy, concept) is not None or concept in keep[taxonomy]
+                ), f"{cik}: {taxonomy}:{concept} is neither mapped nor a kept extra"
+                checked += 1
+    assert checked > 50
 
 
 def load_manifest() -> list[dict[str, Any]]:
