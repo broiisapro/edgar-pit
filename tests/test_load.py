@@ -30,8 +30,6 @@ FIXTURE_RAW = Path(__file__).parent / "fixtures" / "sec"
 UNIVERSE_CSV = REPO_ROOT / "config" / "universe.csv"
 
 RY_CIK = "0001000275"
-APPLE_CIK = "0000320193"
-SHOP_CIK = "0001594805"
 RY_FY2023_40F = "0001193125-23-285639"
 RY_FY2023_ACCEPTANCE = datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
 

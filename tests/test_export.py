@@ -143,6 +143,13 @@ def connect(db: Path) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(db), read_only=True)
 
 
+def write_build_info(path: Path, minimum: str, maximum: str) -> Path:
+    path.write_text(
+        json.dumps({"sec_fetch_range": {"min": minimum, "max": maximum}}), encoding="utf-8"
+    )
+    return path
+
+
 def test_export_writes_every_table_and_manifest(tmp_path: Path) -> None:
     db = build_export_db(tmp_path / "edgarpit.duckdb")
     raw_manifest = tmp_path / "raw" / "manifest.jsonl"
@@ -269,13 +276,6 @@ def test_sec_fetch_range_is_null_without_a_raw_manifest(tmp_path: Path) -> None:
     assert manifest.sec_fetch_range is None
     payload = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert payload["sec_fetch_range"] is None
-
-
-def write_build_info(path: Path, minimum: str, maximum: str) -> Path:
-    path.write_text(
-        json.dumps({"sec_fetch_range": {"min": minimum, "max": maximum}}), encoding="utf-8"
-    )
-    return path
 
 
 def test_export_reads_the_fetch_range_from_build_info(tmp_path: Path) -> None:
