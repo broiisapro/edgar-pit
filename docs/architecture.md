@@ -230,4 +230,4 @@ REST (FastAPI): `GET /asof`, `GET /history`, `GET /events` with the same paramet
 
 ## 11. CI
 
-GitHub Actions, workflow `ci.yml`, jobs `lint`, `types`, `tests`, `dbt`; self-hosted macOS ARM64 runners while private, GitHub-hosted after the public release. Temp paths under `$RUNNER_TEMP`.
+GitHub Actions, workflow `ci.yml`, jobs `lint`, `types`, `tests`, `dbt` (required checks on `main`). While the repo is private, CI runs on one self-hosted runner, `edgar-pit-docker-1`: a `linux/arm64` container (Ubuntu 24.04) limited to 1 CPU core and 4 GB, labels `self-hosted, Linux, ARM64, edgar-pit` (decision C-4). The four jobs share the one core, so they run one at a time and queue; each job carries a `timeout-minutes` cap. `astral-sh/setup-uv` installs uv, uv installs Python from `.python-version`, and uv's cache and managed Python installs live in the runner's home volume, so later runs are fast. Temp paths are under `$RUNNER_TEMP`, never a fixed shared path (decision A-14). Tests marked `network` are deselected. GitHub-hosted runners after the public release.
