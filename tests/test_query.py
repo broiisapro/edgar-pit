@@ -70,6 +70,7 @@ RY_FUNDAMENTALS = [
         first_value=56_129_000_000.0,
         is_restatement=True,
         pct_change_vs_first=51_464_000_000.0 / 56_129_000_000.0 - 1.0,
+        restatement_kind="revision",
     ),
     pit_tables.FundamentalRow(
         cik=RY_CIK,
@@ -162,6 +163,7 @@ def test_asof_returns_the_latest_version_known_at_the_time(
         version=1,
         is_restatement=False,
         ts_imputed=False,
+        restatement_kind="none",
     )
 
 
@@ -176,6 +178,7 @@ def test_asof_boundary_acceptance_time_is_inclusive(
     assert restated.accession == "0001193125-24-270294"
     assert restated.version == 2
     assert restated.is_restatement is True
+    assert restated.restatement_kind == "revision"
 
 
 def test_asof_returns_the_restatement_after_it_was_accepted(
@@ -363,6 +366,7 @@ def test_history_returns_every_version_in_order(con: duckdb.DuckDBPyConnection) 
         51_464_000_000.0,
         15_000_000_000.0,
     ]
+    assert [row.restatement_kind for row in rows] == ["none", "none", "revision", "none"]
     assert rows[-1].period_type == "Q"
 
 

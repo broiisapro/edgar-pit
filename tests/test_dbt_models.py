@@ -48,6 +48,7 @@ FUNDAMENTALS_PIT_COLUMNS = [
     "first_value",
     "is_restatement",
     "pct_change_vs_first",
+    "restatement_kind",
 ]
 
 FILINGS_COLUMNS = [
@@ -159,6 +160,24 @@ def write_synthetic_staging(directory: Path) -> None:
         "10-K,0000320193-24-000123,2024-11-01,",
         "0000320193,us-gaap,StockholdersEquity,CAD,78000000000.0,,2024-09-28,2025,FY,10-K,"
         "0000320193-25-000079,2025-10-31,",
+        # Apple's FY2019 diluted EPS as reported and as re-reported for the
+        # 2020 4-for-1 stock split (decision A-25).
+        "0000320193,us-gaap,EarningsPerShareDiluted,USD/shares,11.89,2018-09-30,"
+        "2019-09-28,2019,FY,10-K,0000320193-19-000119,2019-10-31,",
+        "0000320193,us-gaap,EarningsPerShareDiluted,USD/shares,2.97,2018-09-30,"
+        "2019-09-28,2019,FY,10-K,0000320193-20-000096,2020-10-30,",
+        # A 0.4 % change on a per-share field stays under the 0.5 %
+        # restatement threshold (decision A-7).
+        "0000320193,us-gaap,EarningsPerShareDiluted,USD/shares,3.28,2020-09-27,"
+        "2021-09-25,2021,FY,10-K,0000320193-21-000105,2021-10-29,",
+        "0000320193,us-gaap,EarningsPerShareDiluted,USD/shares,3.293,2020-09-27,"
+        "2021-09-25,2021,FY,10-K,0000320193-22-000108,2022-10-28,",
+        # A 4.2x change on a currency field is a revision even though the
+        # factor is near-integer: splits only apply to share-based units.
+        "0000320193,us-gaap,Revenues,USD,50000000000.0,2020-09-27,"
+        "2021-09-25,2021,FY,10-K,0000320193-21-000105,2021-10-29,",
+        "0000320193,us-gaap,Revenues,USD,210000000000.0,2020-09-27,"
+        "2021-09-25,2021,FY,10-K,0000320193-22-000108,2022-10-28,",
     ]
     with (directory / "facts_raw.csv").open("a", encoding="utf-8") as handle:
         handle.write("\n".join(rows) + "\n")
@@ -212,7 +231,7 @@ def test_ry_fy2023_revenue_versions_and_restatement(staging_build: DbtBuild) -> 
         """
         select version, value, is_restatement, pct_change_vs_first, accession,
                acceptance_ts, period_type, currency, ticker, source_taxonomy,
-               source_concept, concept_rank, form
+               source_concept, concept_rank, form, restatement_kind
         from main.fundamentals_pit
         where cik = ? and field = 'revenue'
           and period_start = date '2022-11-01' and period_end = date '2023-10-31'
@@ -237,6 +256,7 @@ def test_ry_fy2023_revenue_versions_and_restatement(staging_build: DbtBuild) -> 
         "Revenue",
         1,
         "40-F",
+        "none",
     )
     assert second[0] == 2
     assert second[1] == 51_464_000_000.0
@@ -244,13 +264,16 @@ def test_ry_fy2023_revenue_versions_and_restatement(staging_build: DbtBuild) -> 
     assert second[3] == pytest.approx(51_464_000_000.0 / 56_129_000_000.0 - 1.0)
     assert second[4] == RY_FY2023_RESTATED_40F
     assert second[5] == RY_FY2023_RESTATED_ACCEPTED
+    # The revenue restatement is a revision, not a split (decision A-25).
+    assert second[13] == "revision"
 
 
 def test_shop_fy2022_revenue_repeat_is_not_a_restatement(staging_build: DbtBuild) -> None:
     rows = query(
         staging_build.db,
         """
-        select version, value, is_restatement, pct_change_vs_first, accession, period_type
+        select version, value, is_restatement, pct_change_vs_first, accession, period_type,
+               restatement_kind
         from main.fundamentals_pit
         where cik = ? and field = 'revenue'
           and period_start = date '2022-01-01' and period_end = date '2022-12-31'
@@ -265,6 +288,84 @@ def test_shop_fy2022_revenue_repeat_is_not_a_restatement(staging_build: DbtBuild
     assert rows[1][3] == pytest.approx(136_000.0 / 5_599_864_000.0)
     assert rows[1][4] == "0001594805-24-000007"
     assert {row[5] for row in rows} == {"FY"}
+    assert [row[6] for row in rows] == ["none", "none"]
+
+
+def test_apple_fy2019_eps_split_adjustment(synthetic_build: DbtBuild) -> None:
+    """A-25: Apple's FY2019 diluted EPS re-reported for the 4-for-1 split."""
+    rows = query(
+        synthetic_build.db,
+        """
+        select version, value, is_restatement, restatement_kind
+        from main.fundamentals_pit
+        where cik = ? and field = 'eps_diluted'
+          and period_start = date '2018-09-30' and period_end = date '2019-09-28'
+        order by version
+        """,
+        [AAPL_CIK],
+    )
+
+    assert rows == [
+        (1, 11.89, False, "none"),
+        (2, 2.97, True, "split_adjustment"),
+    ]
+
+
+def test_a_small_per_share_change_is_neither_a_restatement_nor_a_split(
+    synthetic_build: DbtBuild,
+) -> None:
+    """A 0.4 % change on a per-share field stays under the A-7 threshold."""
+    rows = query(
+        synthetic_build.db,
+        """
+        select version, value, is_restatement, restatement_kind
+        from main.fundamentals_pit
+        where cik = ? and field = 'eps_diluted'
+          and period_start = date '2020-09-27' and period_end = date '2021-09-25'
+        order by version
+        """,
+        [AAPL_CIK],
+    )
+
+    assert [row[0] for row in rows] == [1, 2]
+    assert rows[1][1] == 3.293
+    assert [row[2] for row in rows] == [False, False]
+    assert [row[3] for row in rows] == ["none", "none"]
+
+
+def test_a_large_currency_change_is_a_revision_not_a_split(synthetic_build: DbtBuild) -> None:
+    """A 4.2x move on a currency field is a revision: splits need share units."""
+    rows = query(
+        synthetic_build.db,
+        """
+        select version, value, is_restatement, restatement_kind
+        from main.fundamentals_pit
+        where cik = ? and field = 'revenue'
+          and period_start = date '2020-09-27' and period_end = date '2021-09-25'
+        order by version
+        """,
+        [AAPL_CIK],
+    )
+
+    assert rows == [
+        (1, 50_000_000_000.0, False, "none"),
+        (2, 210_000_000_000.0, True, "revision"),
+    ]
+
+
+def test_restatement_kind_is_none_iff_not_a_restatement(staging_build: DbtBuild) -> None:
+    """The custom dbt test's invariant, checked on the fixture data too."""
+    mismatches = query(
+        staging_build.db,
+        """
+        select count(*)
+        from main.fundamentals_pit
+        where (restatement_kind = 'none' and is_restatement)
+           or (restatement_kind <> 'none' and not is_restatement)
+        """,
+    )
+
+    assert mismatches == [(0,)]
 
 
 def test_instant_period_type_is_fy_only_at_a_fiscal_year_end(staging_build: DbtBuild) -> None:
@@ -388,7 +489,7 @@ def test_stg_facts_removes_exact_duplicates(synthetic_build: DbtBuild) -> None:
         """,
     )
 
-    assert counts == [(145, 146)]
+    assert counts == [(151, 152)]
 
 
 def test_mixed_currency_inputs_produce_no_ratio_row(synthetic_build: DbtBuild) -> None:

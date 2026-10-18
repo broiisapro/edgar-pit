@@ -65,7 +65,8 @@ def create_asof_db(path: Path) -> Path:
                 cik VARCHAR, ticker VARCHAR, field VARCHAR, value DOUBLE, unit VARCHAR,
                 currency VARCHAR, period_start DATE, period_end DATE, period_type VARCHAR,
                 accession VARCHAR, form VARCHAR, acceptance_ts TIMESTAMPTZ,
-                version INTEGER, is_restatement BOOLEAN, ts_imputed BOOLEAN
+                version INTEGER, is_restatement BOOLEAN, ts_imputed BOOLEAN,
+                restatement_kind VARCHAR
             )
             """
         )
@@ -73,7 +74,7 @@ def create_asof_db(path: Path) -> Path:
         con.execute("CREATE TABLE main.events_8k (cik VARCHAR, ticker VARCHAR)")
         con.execute(
             "INSERT INTO main.fundamentals_pit VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 expected["cik"],
                 "RY",
@@ -90,6 +91,7 @@ def create_asof_db(path: Path) -> Path:
                 1,
                 False,
                 False,
+                "none",
             ],
         )
     finally:

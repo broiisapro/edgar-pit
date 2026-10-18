@@ -75,6 +75,7 @@ RY_ROWS = [
         version=2,
         first_value=RY_ORIGINAL_VALUE,
         is_restatement=True,
+        restatement_kind="revision",
     ),
 ]
 
@@ -115,6 +116,7 @@ def test_restatement_accepted_after_asof_is_not_returned() -> None:
             (RY_ORIGINAL_VALUE, "0001193125-23-285639", 1)
         ]
         assert before[0].is_restatement is False
+        assert before[0].restatement_kind == "none"
 
         one_second_after = query.asof(
             RY_CIK, "revenue", RY_RESTATED_ACCEPTED + timedelta(seconds=1), db=con
@@ -123,6 +125,7 @@ def test_restatement_accepted_after_asof_is_not_returned() -> None:
             (RY_RESTATED_VALUE, "0001193125-24-270294", 2)
         ]
         assert one_second_after[0].is_restatement is True
+        assert one_second_after[0].restatement_kind == "revision"
 
         at_the_boundary = query.asof(RY_CIK, "revenue", RY_RESTATED_ACCEPTED, db=con)
         assert [(row.value, row.version) for row in at_the_boundary] == [(RY_RESTATED_VALUE, 2)]

@@ -32,7 +32,8 @@ class AsOfResponse(BaseModel):
     """A ``fundamentals_pit`` value as it was known at a point in time.
 
     ``acceptance_ts`` is ISO-8601 UTC with a ``Z`` suffix; ``value`` is in
-    ``unit`` (an ISO currency code, ``shares`` or ``pure``).
+    ``unit`` (an ISO currency code, ``shares`` or ``pure``) and
+    ``restatement_kind`` is ``none``, ``split_adjustment`` or ``revision``.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -52,6 +53,7 @@ class AsOfResponse(BaseModel):
     version: int
     is_restatement: bool
     ts_imputed: bool
+    restatement_kind: str
 
 
 class EventResponse(BaseModel):

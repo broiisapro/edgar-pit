@@ -70,6 +70,7 @@ EXPECTED_DATACLASS_FIELDS = {
         "version",
         "is_restatement",
         "ts_imputed",
+        "restatement_kind",
     ),
     query.EventResult: (
         "cik",

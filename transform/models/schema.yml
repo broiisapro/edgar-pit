@@ -103,6 +103,12 @@ models:
       - name: is_restatement
         tests:
           - not_null
+      - name: restatement_kind
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["none", "split_adjustment", "revision"]
   - name: ratios_pit
     description: >-
       One row per (cik, ratio, period_start, period_end, asof_ts); asof_ts is
