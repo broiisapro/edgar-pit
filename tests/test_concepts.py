@@ -122,6 +122,44 @@ def test_fields_keep_file_order() -> None:
     assert load_concept_map().fields[:3] == ["revenue", "gross_profit", "operating_income"]
 
 
+def test_specs_returns_every_field_in_file_order() -> None:
+    concept_map = load_concept_map()
+    specs = concept_map.specs()
+
+    assert [spec.field for spec in specs] == concept_map.fields
+    assert len(specs) >= 20
+    assert all(isinstance(spec, ConceptSpec) for spec in specs)
+    revenue = specs[0]
+    assert revenue.field == "revenue"
+    assert revenue.kind == "duration"
+    assert revenue.unit_family == "currency"
+    assert revenue.us_gaap[0] == "Revenues"
+    assert revenue.us_gaap.index("RevenuesNetOfInterestExpense") == 1
+    assert revenue.ifrs_full[0] == "Revenue"
+
+
+def test_specs_order_matches_a_tiny_map(tmp_path: Path) -> None:
+    path = write_map(
+        tmp_path,
+        """
+fields:
+  a:
+    kind: instant
+    unit_family: shares
+    us-gaap: [CommonStockSharesOutstanding]
+    ifrs-full: [NumberOfSharesOutstanding]
+  b:
+    kind: duration
+    unit_family: currency
+    us-gaap: [Revenues]
+    ifrs-full: [Revenue]
+""",
+    )
+    concept_map = load_concept_map(path)
+    assert [spec.field for spec in concept_map.specs()] == ["a", "b"]
+    assert concept_map.specs()[0].unit_family == "shares"
+
+
 def test_duplicate_concept_across_fields_is_rejected(tmp_path: Path) -> None:
     path = write_map(
         tmp_path,

@@ -69,6 +69,16 @@ class ConceptMap:
         """Canonical field names in the order they appear in the file."""
         return list(self._by_field)
 
+    def specs(self) -> list[ConceptSpec]:
+        """The field definitions in the order they appear in the file.
+
+        Each :class:`ConceptSpec` carries the field name, ``kind``,
+        ``unit_family`` and both ordered concept lists, so callers that need
+        more than :meth:`lookup` (the fixture builder, the reference-table
+        loader) do not have to reach into the map's internals.
+        """
+        return list(self._by_field.values())
+
     def lookup(self, taxonomy: str, concept: str) -> tuple[str, int] | None:
         """Map ``(taxonomy, concept)`` to ``(field, rank)`` or ``None``.
 
