@@ -14,7 +14,7 @@ import yaml
 from pandera.errors import SchemaError
 
 from edgarpit import __version__
-from edgarpit.concepts import DEFAULT_CONCEPT_MAP_PATH, load_concept_map
+from edgarpit.concepts import DEFAULT_CONCEPT_MAP_PATH, ConceptSpec, load_concept_map
 from edgarpit.load import (
     BUILD_INFO_NAME,
     REFERENCE_TYPES,
@@ -190,6 +190,38 @@ def expected_concept_rows() -> list[tuple[str, str, str, int, str, str]]:
                     (field, taxonomy, concept, rank, definition["kind"], definition["unit_family"])
                 )
     return rows
+
+
+def test_reference_tables_read_the_public_specs_iterator(tmp_path: Path) -> None:
+    """The loader consumes ``ConceptMap.specs()``, not the private mapping.
+
+    A map-shaped object that offers only :meth:`specs` still loads, so the
+    loader cannot be reaching into ``_by_field`` behind the public API.
+    """
+
+    class SpecsOnly:
+        def specs(self) -> list[ConceptSpec]:
+            return [
+                ConceptSpec(
+                    field="revenue",
+                    kind="duration",
+                    unit_family="currency",
+                    us_gaap=["Revenues"],
+                    ifrs_full=["Revenue"],
+                )
+            ]
+
+    con = connect(tmp_path)
+    try:
+        load_reference_tables(con, concept_map=SpecsOnly())
+        assert con.execute(
+            "SELECT field, taxonomy, concept, concept_rank, kind, unit_family FROM raw.concept_map"
+        ).fetchall() == [
+            ("revenue", "us-gaap", "Revenues", 1, "duration", "currency"),
+            ("revenue", "ifrs-full", "Revenue", 1, "duration", "currency"),
+        ]
+    finally:
+        con.close()
 
 
 def test_reference_tables_match_the_yaml_and_csv(tmp_path: Path) -> None:
