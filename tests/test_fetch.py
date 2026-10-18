@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from edgarpit.config import Settings
-from edgarpit.fetch import fetch_universe
+from edgarpit.fetch import FetchError, _fact_accessions, fetch_universe
 from edgarpit.rawcache import RawCache
 from edgarpit.sec_client import SecClient, classify
 from edgarpit.universe import Issuer, load_universe
@@ -129,6 +130,12 @@ def test_full_fetch_stores_the_required_fixture_content(tmp_path: Path) -> None:
 
     assert report.ok
     assert report.errors == []
+    assert report.issuers_ok == 3
+    assert report.issuers_failed == 0
+    assert report.headers_404 == []
+    assert report.headers_fetched == sum(
+        len(expected_required(issuer.cik or "")) for issuer in issuers
+    )
     assert [issuer.cik for issuer in report.issuers] == [RY_CIK, APPLE_CIK, SHOP_CIK]
     assert report.requests == data_route.call_count + sum(
         len(expected_required(issuer.cik or "")) for issuer in issuers
@@ -230,6 +237,8 @@ def test_a_header_404_is_recorded_and_tolerated(tmp_path: Path) -> None:
     assert report.errors == []
     row = report.issuers[0]
     assert row.headers_not_found == 1
+    assert row.headers_404 == [missing]
+    assert report.headers_not_found == 1
     assert row.headers_fetched == len(required) - 1
     assert not (tmp_path / "raw" / "headers" / APPLE_CIK / missing).exists()
 
@@ -298,3 +307,80 @@ def test_a_missing_cik_fails_only_that_issuer(tmp_path: Path) -> None:
     assert report.issuers[0].requests == 0
     assert report.issuers[1].errors == []
     assert report.issuers[1].headers_fetched == len(expected_required(SHOP_CIK))
+    assert (report.issuers_ok, report.issuers_failed) == (1, 1)
+
+
+def fact_entry(accn: str, **overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "start": "2022-11-01",
+        "end": "2023-10-31",
+        "val": 1,
+        "accn": accn,
+        "fy": 2023,
+        "fp": "FY",
+        "form": "40-F",
+        "filed": "2023-11-30",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_fact_accessions_use_the_staging_flattener() -> None:
+    """The shared flattener decides what drives a header fetch, not a private walk.
+
+    ``dei`` facts are excluded and entries the loader cannot stage (no
+    ``form``/``filed``) are skipped, so the fetch and the build agree on the
+    required accessions.
+    """
+    document = {
+        "cik": 1000275,
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            fact_entry("0001000275-23-000001"),
+                            fact_entry("0001000275-23-000002", form=None),
+                        ]
+                    }
+                }
+            },
+            "ifrs-full": {"Revenue": {"units": {"CAD": [fact_entry("0001000275-23-000003")]}}},
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {"shares": [fact_entry("0001000275-23-000004")]}
+                }
+            },
+        },
+    }
+
+    assert _fact_accessions(RY_CIK, document) == [
+        (RY_CIK, "0001000275-23-000001"),
+        (RY_CIK, "0001000275-23-000003"),
+    ]
+
+
+def test_fact_accessions_reject_a_document_without_facts() -> None:
+    with pytest.raises(FetchError, match="no 'facts' object"):
+        _fact_accessions(RY_CIK, {"cik": 1000275})
+
+
+def test_a_malformed_companyfacts_fails_only_that_issuer(tmp_path: Path) -> None:
+    issuers = fixture_issuers(("AAPL",))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api/xbrl/companyfacts/CIK{APPLE_CIK}.json":
+            return httpx.Response(200, json={"cik": 320193})
+        return fixture_response(request)
+
+    clock = FakeClock()
+    client = build_client(tmp_path, clock)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route(url__regex=r"https://(data|www)\.sec\.gov/.*").mock(side_effect=handler)
+        report = fetch_universe(issuers, tmp_path, client=client)
+
+    assert not report.ok
+    row = report.issuers[0]
+    assert row.errors and "no 'facts' object" in row.errors[0]
+    assert row.headers_fetched == 0
+    assert row.companyfacts == 1

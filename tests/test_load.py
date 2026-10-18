@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,20 @@ import pytest
 import yaml
 from pandera.errors import SchemaError
 
+from edgarpit import __version__
 from edgarpit.concepts import DEFAULT_CONCEPT_MAP_PATH, load_concept_map
-from edgarpit.load import REFERENCE_TYPES, load_reference_tables, load_tables
+from edgarpit.load import (
+    BUILD_INFO_NAME,
+    REFERENCE_TYPES,
+    build_from_raw,
+    load_reference_tables,
+    load_tables,
+)
 from edgarpit.schemas import COLUMNS, DUCKDB_TYPES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGING_DIR = Path(__file__).parent / "fixtures" / "staging"
+FIXTURE_RAW = Path(__file__).parent / "fixtures" / "sec"
 UNIVERSE_CSV = REPO_ROOT / "config" / "universe.csv"
 
 RY_CIK = "0001000275"
@@ -295,3 +304,36 @@ def test_reference_table_shapes_are_frozen() -> None:
         "country": "VARCHAR",
         "filer_type": "VARCHAR",
     }
+
+
+def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -> None:
+    out = tmp_path / "build"
+    db = build_from_raw(FIXTURE_RAW, out)
+
+    assert db == out / "edgarpit.duckdb"
+    info = json.loads((out / BUILD_INFO_NAME).read_text(encoding="utf-8"))
+    assert info["package_version"] == __version__
+    assert info["raw_cache"] == str(FIXTURE_RAW.resolve())
+
+    manifest_text = (FIXTURE_RAW / "raw" / "manifest.jsonl").read_text(encoding="utf-8")
+    manifest = [json.loads(line) for line in manifest_text.splitlines() if line.strip()]
+    stamps = [row["fetched_at"] for row in manifest]
+    assert info["sec_fetch_range"] == {"min": min(stamps), "max": max(stamps)}
+
+    expected_ciks = {row["cik"] for row in manifest if row.get("cik")}
+    assert set(info["documents"]) == expected_ciks
+    assert info["documents"][RY_CIK]["submissions"] == 1
+    assert info["documents"][RY_CIK]["companyfacts"] == 1
+    assert info["documents"][RY_CIK]["headers"] > 0
+
+    assert info["tables"]["raw.filings"] > 0
+    assert info["tables"]["raw.facts_raw"] > 0
+    assert info["tables"]["raw.universe"] == 40
+    assert info["tables"]["main.fundamentals_pit"] > 0
+    assert info["tables"]["main.ratios_pit"] > 0
+    assert info["dbt"].startswith("PASS=")
+    assert "ERROR=0" in info["dbt"]
+    assert {"raw.filings", "raw.events_8k", "raw.facts_raw"} <= set(info["tables"])
+    assert {"main.fundamentals_pit", "main.ratios_pit", "main.events_8k", "main.filings"} <= set(
+        info["tables"]
+    )

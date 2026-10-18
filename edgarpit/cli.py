@@ -30,7 +30,7 @@ import typer
 from edgarpit.config import ConfigError, Settings
 from edgarpit.export import export_release
 from edgarpit.fetch import FetchReport, fetch_universe
-from edgarpit.load import build_from_raw
+from edgarpit.load import BUILD_INFO_NAME, build_from_raw
 from edgarpit.qa import QaReport, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
@@ -200,11 +200,20 @@ def _print_fetch(report: FetchReport, out: Path) -> None:
     for line in report.errors:
         typer.echo(f"error: {line}", err=True)
     typer.echo(
-        f"fetched {len(report.issuers)} issuers in {report.elapsed_seconds:.1f}s: "
-        f"{report.requests} requests, "
-        f"{sum(row.headers_fetched for row in report.issuers)} headers fetched, "
-        f"{sum(row.headers_cached for row in report.issuers)} already cached, "
-        f"{sum(row.headers_not_found for row in report.issuers)} not found"
+        f"{'issuer':<8} {'cik':<10} {'status':<6} {'requests':>8} "
+        f"{'headers':>7} {'cached':>6} {'404':>4}"
+    )
+    for row in report.issuers:
+        typer.echo(
+            f"{row.ticker:<8} {row.cik or '-':<10} "
+            f"{'failed' if row.errors else 'ok':<6} {row.requests:>8} "
+            f"{row.headers_fetched:>7} {row.headers_cached:>6} {row.headers_not_found:>4}"
+        )
+    typer.echo(
+        f"summary: {report.issuers_ok} issuers ok, {report.issuers_failed} failed; "
+        f"{report.requests} requests; {report.elapsed_seconds:.1f}s; "
+        f"headers {report.headers_fetched} fetched, {report.headers_cached} cached, "
+        f"{report.headers_not_found} not found"
     )
     typer.echo(f"raw cache: {out}")
 
@@ -422,21 +431,27 @@ def export(
 ) -> None:
     """Write one Parquet file per released table plus ``manifest.json``.
 
-    With ``--data`` the release manifest also records the SEC fetch date range
-    (min/max ``fetched_at``) from ``<data>/raw/manifest.jsonl``.
+    The release manifest records the SEC fetch date range from ``--data``
+    (min/max ``fetched_at`` of ``<data>/raw/manifest.jsonl``) when given;
+    otherwise from the ``build-info.json`` next to the database, when one
+    exists. Without either the range stays null.
     """
     raw_manifest: Path | None = None
+    build_info: Path | None = None
     if data is not None:
         candidate = Path(data) / "raw" / MANIFEST_NAME
         if not candidate.is_file():
             _fail(f"no raw manifest under {data}; expected {candidate}")
         raw_manifest = candidate
+    else:
+        candidate = Path(db).parent / BUILD_INFO_NAME
+        build_info = candidate if candidate.is_file() else None
     try:
         con = duckdb.connect(str(db), read_only=True)
     except Exception as error:  # the CLI boundary turns a connect failure into exit 1
         _fail(f"{type(error).__name__}: {error}")
     try:
-        manifest = export_release(con, out, raw_manifest=raw_manifest)
+        manifest = export_release(con, out, raw_manifest=raw_manifest, build_info=build_info)
     except Exception as error:  # a missing table or failed write is a data failure
         _fail(f"{type(error).__name__}: {error}")
     finally:

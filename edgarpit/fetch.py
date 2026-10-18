@@ -6,10 +6,10 @@ injected :class:`~edgarpit.sec_client.SecClient`, so the whole run shares a
 single rate limiter. It then fetches the SGML headers of every accession that
 matters: every ``us-gaap``/``ifrs-full`` fact accession and every 8-K/8-K/A
 filing, computed with :func:`edgarpit.ingest.headers.required_accessions` over
-the frozen :func:`edgarpit.ingest.submissions.parse_submissions` frame. Until
-:func:`edgarpit.ingest.companyfacts.parse_companyfacts` (issue #20) lands,
-:func:`_fact_accessions` reads the companyfacts document's ``accn`` values
-directly; that is the only non-frozen parsing in this module.
+the frozen :func:`edgarpit.ingest.submissions.parse_submissions` frame.
+:func:`_fact_accessions` flattens the companyfacts document with
+:func:`edgarpit.ingest.companyfacts.parse_companyfacts`, the same function the
+build uses, so the fetcher and the loader agree on what matters.
 
 Headers are immutable, so a stored header is never re-fetched. Submissions,
 pages and companyfacts are re-fetched when ``refresh`` is true, each under a
@@ -35,6 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import polars as pl
+
+from edgarpit.ingest.companyfacts import parse_companyfacts
 from edgarpit.ingest.headers import required_accessions
 from edgarpit.ingest.submissions import parse_submissions
 from edgarpit.rawcache import RawCache
@@ -63,10 +66,11 @@ class IssuerFetchReport:
     Counts are per run: ``submissions``, ``pages`` and ``companyfacts`` are the
     documents fetched this run (a warm cache and ``refresh=False`` make them 0),
     ``headers_fetched`` are new immutable headers stored, ``headers_cached``
-    headers already present (never re-fetched), ``headers_not_found`` header
-    URLs that answered 404, and ``requests`` the logical GETs issued to SEC
-    (retries are not counted separately). ``errors`` holds the final failures
-    after retries; an issuer with errors is fatal only for that issuer.
+    headers already present (never re-fetched), ``headers_404`` the accessions
+    whose header URL answered 404, and ``requests`` the logical GETs issued to
+    SEC (retries are not counted separately). ``errors`` holds the final
+    failures after retries; an issuer with errors is fatal only for that
+    issuer.
     """
 
     cik: str
@@ -76,9 +80,14 @@ class IssuerFetchReport:
     companyfacts: int = 0
     headers_fetched: int = 0
     headers_cached: int = 0
-    headers_not_found: int = 0
+    headers_404: list[str] = field(default_factory=list)
     requests: int = 0
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def headers_not_found(self) -> int:
+        """Number of header URLs that answered 404."""
+        return len(self.headers_404)
 
     @property
     def documents(self) -> int:
@@ -97,6 +106,36 @@ class FetchReport:
     def requests(self) -> int:
         """Total logical GETs issued across every issuer."""
         return sum(issuer.requests for issuer in self.issuers)
+
+    @property
+    def issuers_ok(self) -> int:
+        """Number of issuers that ended without a final error."""
+        return sum(1 for issuer in self.issuers if not issuer.errors)
+
+    @property
+    def issuers_failed(self) -> int:
+        """Number of issuers that ended with at least one final error."""
+        return sum(1 for issuer in self.issuers if issuer.errors)
+
+    @property
+    def headers_fetched(self) -> int:
+        """Headers newly stored across every issuer."""
+        return sum(issuer.headers_fetched for issuer in self.issuers)
+
+    @property
+    def headers_cached(self) -> int:
+        """Headers already present in the cache across every issuer."""
+        return sum(issuer.headers_cached for issuer in self.issuers)
+
+    @property
+    def headers_not_found(self) -> int:
+        """Header URLs that answered 404 across every issuer."""
+        return sum(issuer.headers_not_found for issuer in self.issuers)
+
+    @property
+    def headers_404(self) -> list[str]:
+        """Accessions whose header URLs answered 404 across every issuer."""
+        return [accession for issuer in self.issuers for accession in issuer.headers_404]
 
     @property
     def errors(self) -> list[str]:
@@ -162,30 +201,26 @@ def _document(
 def _fact_accessions(cik: str, document: Mapping[str, Any]) -> list[tuple[str, str]]:
     """Every ``(cik, accession)`` referenced by a ``us-gaap``/``ifrs-full`` fact.
 
-    Stands in for :func:`edgarpit.ingest.companyfacts.parse_companyfacts`
-    (issue #20) until that lands; the shape mirrors the companyfacts JSON
-    exactly (one ``accn`` per fact row, ``dei`` facts excluded per decision
-    A-1).
+    ``document`` is the parsed companyfacts JSON for ``cik``. The document is
+    flattened with :func:`edgarpit.ingest.companyfacts.parse_companyfacts`, the
+    same function the staging load uses, then restricted to the ``us-gaap`` and
+    ``ifrs-full`` taxonomies; ``dei`` facts do not drive header fetches. The
+    pairs carry the submitted CIK, not the document's, because that is the CIK
+    the header URL needs. Returns sorted, de-duplicated pairs. Raises
+    :class:`FetchError` when the document is not a valid companyfacts object.
     """
-    facts = document.get("facts")
-    if not isinstance(facts, Mapping):
-        raise FetchError(f"companyfacts for CIK {cik} has no facts block")
-    pairs: set[tuple[str, str]] = set()
-    for taxonomy in ("us-gaap", "ifrs-full"):
-        concepts = facts.get(taxonomy)
-        if not isinstance(concepts, Mapping):
-            continue
-        for entry in concepts.values():
-            units = entry.get("units") if isinstance(entry, Mapping) else None
-            if not isinstance(units, Mapping):
-                continue
-            for rows in units.values():
-                if not isinstance(rows, list):
-                    continue
-                for row in rows:
-                    if isinstance(row, Mapping) and isinstance(row.get("accn"), str):
-                        pairs.add((cik, row["accn"]))
-    return sorted(pairs)
+    try:
+        facts = parse_companyfacts(document)
+    except ValueError as error:
+        raise FetchError(f"companyfacts for CIK {cik}: {error}") from error
+    accessions = (
+        facts.filter(pl.col("taxonomy").is_in(("us-gaap", "ifrs-full")))
+        .get_column("accession")
+        .unique()
+        .sort()
+        .to_list()
+    )
+    return [(cik, accession) for accession in accessions]
 
 
 def _fetch_headers(
@@ -196,9 +231,9 @@ def _fetch_headers(
 ) -> None:
     """Fetch every required header that is not already in the cache.
 
-    A 404 is counted and skipped; any other final :class:`SecClientError`
-    stops this issuer (its remaining headers stay for the next run) and is
-    recorded in ``report.errors``.
+    A 404 is appended to ``report.headers_404`` and skipped; any other final
+    :class:`SecClientError` stops this issuer (its remaining headers stay for
+    the next run) and is recorded in ``report.errors``.
     """
     for cik, accession in pairs:
         if cache.latest("headers", cik, accession) is not None:
@@ -207,7 +242,7 @@ def _fetch_headers(
         try:
             client.get_text(header_url(cik, accession))
         except SecNotFound:
-            report.headers_not_found += 1
+            report.headers_404.append(accession)
             report.requests += 1
             LOGGER.warning("[%s] header not found: %s", cik, accession)
             continue

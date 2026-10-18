@@ -9,8 +9,9 @@
   files carry no build timestamps or random ids, so exporting the same database
   twice produces byte-identical files;
 - the build timestamp, the database file name and the SEC fetch date range
-  (min/max ``fetched_at`` of a raw ``manifest.jsonl`` when one is given) live
-  in ``manifest.json`` only;
+  (min/max ``fetched_at``) live in ``manifest.json`` only; the range comes from
+  a raw ``manifest.jsonl`` when one is given, else from the ``build-info.json``
+  the builder writes next to the database, else it is ``None``;
 - each manifest file entry carries the row count, the SHA-256 of the written
   file and the schema (column names and types).
 
@@ -167,11 +168,40 @@ def _fetch_range(raw_manifest: Path | None) -> FetchRange | None:
     return FetchRange(min=min(stamps), max=max(stamps))
 
 
+def _build_info_fetch_range(build_info: Path) -> FetchRange | None:
+    """Read ``sec_fetch_range`` from a ``build-info.json`` written by the builder.
+
+    Returns ``None`` when the document carries no range (a cache with an empty
+    manifest). Raises :class:`FileNotFoundError` when the file cannot be read
+    and :class:`ValueError` when it is not an object with a string ``min`` and
+    ``max`` under ``sec_fetch_range``.
+    """
+    path = Path(build_info)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise FileNotFoundError(f"cannot read build info {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed build info {path}: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"malformed build info {path}: expected a JSON object")
+    value = document.get("sec_fetch_range")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"malformed build info {path}: sec_fetch_range is not an object")
+    minimum, maximum = value.get("min"), value.get("max")
+    if not isinstance(minimum, str) or not isinstance(maximum, str):
+        raise ValueError(f"malformed build info {path}: sec_fetch_range needs min and max")
+    return FetchRange(min=minimum, max=maximum)
+
+
 def export_release(
     con: duckdb.DuckDBPyConnection,
     out_dir: Path | str,
     *,
     raw_manifest: Path | None = None,
+    build_info: Path | None = None,
 ) -> Manifest:
     """Write the Parquet release and ``manifest.json`` under ``out_dir``.
 
@@ -179,17 +209,24 @@ def export_release(
     deterministic row order and fixed writer settings; re-exporting the same
     database overwrites the files byte-for-byte identically. ``manifest.json``
     carries the build timestamp, the database file name, the SEC fetch date
-    range from ``raw_manifest`` (a raw cache ``manifest.jsonl``; ``None`` when
-    omitted, and ``None`` inside the manifest when the file has no rows) and a
-    per-file row count, SHA-256 and schema. Timestamps in the manifest are UTC
-    ISO-8601 with a ``Z`` suffix. Raises :class:`duckdb.Error` for a missing
-    table, :class:`FileNotFoundError`/:class:`ValueError` for a bad raw
-    manifest.
+    range and a per-file row count, SHA-256 and schema. The fetch range comes
+    from ``raw_manifest`` (a raw cache ``manifest.jsonl``) when given, else
+    from ``build_info`` (the ``build-info.json`` of a built database), else it
+    is ``None``; a raw manifest with no rows and a build info without a range
+    also yield ``None``. Timestamps in the manifest are UTC ISO-8601 with a
+    ``Z`` suffix. Raises :class:`duckdb.Error` for a missing table,
+    :class:`FileNotFoundError`/:class:`ValueError` for a bad raw manifest or
+    build info.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     con.execute("SET TimeZone='UTC'")
-    fetch_range = _fetch_range(raw_manifest)
+    if raw_manifest is not None:
+        fetch_range = _fetch_range(raw_manifest)
+    elif build_info is not None:
+        fetch_range = _build_info_fetch_range(build_info)
+    else:
+        fetch_range = None
     entries: list[FileEntry] = []
     for table in EXPORTS:
         target = out / f"{table.name}.parquet"
