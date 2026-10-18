@@ -62,4 +62,7 @@ strict = true
 [tool.pytest.ini_options]
 addopts = '-m "not network" --strict-markers'
 testpaths = ["tests"]
-markers = ["network: tests that call live SEC endpoints (deselected by default)"]
+markers = [
+    "network: tests that call live SEC endpoints (deselected by default)",
+    "e2e: end-to-end tests that drive the CLI over the fixture cache",
+]
