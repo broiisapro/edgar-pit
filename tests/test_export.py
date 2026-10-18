@@ -271,6 +271,76 @@ def test_sec_fetch_range_is_null_without_a_raw_manifest(tmp_path: Path) -> None:
     assert payload["sec_fetch_range"] is None
 
 
+def write_build_info(path: Path, minimum: str, maximum: str) -> Path:
+    path.write_text(
+        json.dumps({"sec_fetch_range": {"min": minimum, "max": maximum}}), encoding="utf-8"
+    )
+    return path
+
+
+def test_export_reads_the_fetch_range_from_build_info(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    info = write_build_info(
+        tmp_path / "build-info.json", "20261017T040215210934Z", "20261017T040326728091Z"
+    )
+    con = connect(db)
+    try:
+        manifest = export_release(con, tmp_path / "release", build_info=info)
+    finally:
+        con.close()
+    assert manifest.sec_fetch_range is not None
+    assert manifest.sec_fetch_range.min == "20261017T040215210934Z"
+    assert manifest.sec_fetch_range.max == "20261017T040326728091Z"
+
+
+def test_export_raw_manifest_overrides_build_info(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    info = write_build_info(
+        tmp_path / "build-info.json", "20260101T000000000000Z", "20260101T000000000000Z"
+    )
+    raw_manifest = tmp_path / "manifest.jsonl"
+    raw_manifest.write_text(
+        json.dumps({"fetched_at": "20261017T040215210934Z"}) + "\n", encoding="utf-8"
+    )
+    con = connect(db)
+    try:
+        manifest = export_release(
+            con, tmp_path / "release", raw_manifest=raw_manifest, build_info=info
+        )
+    finally:
+        con.close()
+    assert manifest.sec_fetch_range is not None
+    assert manifest.sec_fetch_range.min == "20261017T040215210934Z"
+
+
+def test_build_info_without_a_range_yields_none(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    info = tmp_path / "build-info.json"
+    info.write_text(json.dumps({"sec_fetch_range": None}), encoding="utf-8")
+    con = connect(db)
+    try:
+        manifest = export_release(con, tmp_path / "release", build_info=info)
+    finally:
+        con.close()
+    assert manifest.sec_fetch_range is None
+
+
+def test_bad_build_info_is_rejected(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    info = tmp_path / "build-info.json"
+    info.write_text(json.dumps({"sec_fetch_range": {"min": "x"}}), encoding="utf-8")
+    con = connect(db)
+    try:
+        try:
+            export_release(con, tmp_path / "release", build_info=info)
+        except ValueError as error:
+            assert "sec_fetch_range" in str(error)
+        else:  # pragma: no cover - the check must fire
+            raise AssertionError("malformed build info was accepted")
+    finally:
+        con.close()
+
+
 def test_bad_raw_manifest_is_rejected(tmp_path: Path) -> None:
     db = build_export_db(tmp_path / "edgarpit.duckdb")
     bad = tmp_path / "manifest.jsonl"
@@ -296,6 +366,62 @@ def test_cli_export_writes_the_release(tmp_path: Path) -> None:
     for table in EXPORTS:
         assert (out / f"{table.name}.parquet").is_file()
         assert f"{table.name}.parquet" in result.stdout
+    payload = json.loads((out / "manifest.json").read_text())
+    assert payload["sec_fetch_range"] is None
+
+
+def test_cli_export_reads_build_info_next_to_the_database(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    write_build_info(
+        tmp_path / "build-info.json", "20261017T040215210934Z", "20261017T040326728091Z"
+    )
+    result = RUNNER.invoke(app, ["export", "--db", str(db), "--out", str(tmp_path / "release")])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "release" / "manifest.json").read_text())
+    assert payload["sec_fetch_range"] == {
+        "min": "20261017T040215210934Z",
+        "max": "20261017T040326728091Z",
+    }
+
+
+def test_cli_export_data_overrides_build_info(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    write_build_info(
+        tmp_path / "build-info.json", "20260101T000000000000Z", "20260101T000000000000Z"
+    )
+    raw = tmp_path / "data" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "manifest.jsonl").write_text(
+        json.dumps({"fetched_at": "20261017T040215210934Z"}) + "\n", encoding="utf-8"
+    )
+    result = RUNNER.invoke(
+        app,
+        [
+            "export",
+            "--db",
+            str(db),
+            "--out",
+            str(tmp_path / "release"),
+            "--data",
+            str(tmp_path / "data"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "release" / "manifest.json").read_text())
+    assert payload["sec_fetch_range"] == {
+        "min": "20261017T040215210934Z",
+        "max": "20261017T040215210934Z",
+    }
+
+
+def test_cli_export_with_a_malformed_build_info_exits_1(tmp_path: Path) -> None:
+    db = build_export_db(tmp_path / "edgarpit.duckdb")
+    (tmp_path / "build-info.json").write_text(
+        json.dumps({"sec_fetch_range": {"min": "x"}}), encoding="utf-8"
+    )
+    result = RUNNER.invoke(app, ["export", "--db", str(db), "--out", str(tmp_path / "release")])
+    assert result.exit_code == 1
+    assert "build info" in result.stderr
 
 
 def test_cli_export_with_data_records_the_fetch_range(tmp_path: Path) -> None:

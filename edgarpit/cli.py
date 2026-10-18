@@ -30,7 +30,7 @@ import typer
 from edgarpit.config import ConfigError, Settings
 from edgarpit.export import export_release
 from edgarpit.fetch import FetchReport, fetch_universe
-from edgarpit.load import build_from_raw
+from edgarpit.load import BUILD_INFO_NAME, build_from_raw
 from edgarpit.qa import QaReport, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
@@ -431,21 +431,27 @@ def export(
 ) -> None:
     """Write one Parquet file per released table plus ``manifest.json``.
 
-    With ``--data`` the release manifest also records the SEC fetch date range
-    (min/max ``fetched_at``) from ``<data>/raw/manifest.jsonl``.
+    The release manifest records the SEC fetch date range from ``--data``
+    (min/max ``fetched_at`` of ``<data>/raw/manifest.jsonl``) when given;
+    otherwise from the ``build-info.json`` next to the database, when one
+    exists. Without either the range stays null.
     """
     raw_manifest: Path | None = None
+    build_info: Path | None = None
     if data is not None:
         candidate = Path(data) / "raw" / MANIFEST_NAME
         if not candidate.is_file():
             _fail(f"no raw manifest under {data}; expected {candidate}")
         raw_manifest = candidate
+    else:
+        candidate = Path(db).parent / BUILD_INFO_NAME
+        build_info = candidate if candidate.is_file() else None
     try:
         con = duckdb.connect(str(db), read_only=True)
     except Exception as error:  # the CLI boundary turns a connect failure into exit 1
         _fail(f"{type(error).__name__}: {error}")
     try:
-        manifest = export_release(con, out, raw_manifest=raw_manifest)
+        manifest = export_release(con, out, raw_manifest=raw_manifest, build_info=build_info)
     except Exception as error:  # a missing table or failed write is a data failure
         _fail(f"{type(error).__name__}: {error}")
     finally:
