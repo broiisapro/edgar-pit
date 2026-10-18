@@ -252,12 +252,13 @@ def _cross_issuer_rank(frame: pl.DataFrame) -> pl.DataFrame:
 
     A row whose CIK matches the accession's own ten-digit prefix (the filer in
     the common case) is ``_borrowed=False`` and ranks before a row another
-    issuer listed; ties fall back to the smallest CIK. The sort is total, so
-    the choice is deterministic.
+    issuer listed; ties fall back to the smallest CIK and then to the caller's
+    order, which is deterministic (issuers ascend and each issuer's rows keep
+    their submissions order).
     """
     return frame.with_columns(
         (pl.col("accession").str.slice(0, 10) != pl.col("cik")).alias("_borrowed")
-    ).sort("accession", "_borrowed", "cik")
+    ).sort("accession", "_borrowed", "cik", maintain_order=True)
 
 
 def _deduplicate_filings(
