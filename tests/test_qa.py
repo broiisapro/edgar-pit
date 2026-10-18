@@ -15,7 +15,14 @@ import duckdb
 from typer.testing import CliRunner
 
 from edgarpit.cli import app
-from edgarpit.qa import KeyViolation, MultiCurrency, run_qa
+from edgarpit.qa import (
+    FilingCount,
+    KeyViolation,
+    LegacyEventCount,
+    MultiCurrency,
+    RatioGap,
+    run_qa,
+)
 
 RUNNER = CliRunner()
 RY_CIK = "0001000275"
@@ -522,6 +529,15 @@ def test_run_qa_populates_every_section(tmp_path: Path) -> None:
     assert conflict.accession == APPLE_10Q
     assert conflict.values == [1.0, 2.0]
 
+    assert report.legacy_events == []
+    assert report.filings_by_source == [FilingCount(source="recent", count=3)]
+    assert report.filings_by_acceptance_source == [
+        FilingCount(source="filing_date_eod", count=1),
+        FilingCount(source="sgml_header", count=2),
+    ]
+    assert report.ratio_gap_counts == {"missing input": 2}
+    assert [gap.reason for gap in report.ratio_gaps] == ["missing input", "missing input"]
+
     assert report.key_violations == []
     assert report.ok
 
@@ -548,14 +564,244 @@ def test_cli_qa_prints_sections_and_exits_0(tmp_path: Path) -> None:
         "Restatements",
         "Imputed timestamps",
         "Header-vs-API disagreements over 60 s: 1",
+        "Legacy 8-K events (accepted before 2004-08-23; item codes are unreliable)",
+        "Filings by source",
+        "Filings by acceptance_ts_source",
         "Unmapped concepts",
         "Unit anomalies",
+        "Ratio gaps (input present, no ratios_pit row)",
         "Conflicting values within one accession",
         "Key uniqueness: OK",
     ):
         assert section in result.stdout, section
+    assert "  recent: 3" in result.stdout
+    assert "  sgml_header: 2" in result.stdout
+    assert "  missing input: 2" in result.stdout
     assert "0001193125-24-270294" in result.stdout
     assert "0001000275 revenue" in result.stdout
+
+
+def insert_rows(db: Path, table: str, rows: list[tuple[object, ...]]) -> None:
+    """Append rows to a built database table, for a section-only test."""
+    if not rows:  # pragma: no cover - callers always pass rows
+        raise ValueError("insert_rows needs at least one row")
+    placeholders = ", ".join("?" * len(rows[0]))
+    con = duckdb.connect(str(db))
+    try:
+        con.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
+    finally:
+        con.close()
+
+
+def fund(
+    field: str,
+    period_start: date | None,
+    period_end: date,
+    period_type: str,
+    accession: str,
+    acceptance_ts: datetime,
+    value: float,
+    unit: str = "USD",
+) -> tuple[object, ...]:
+    """A RY ``fundamentals_pit`` row with the contract columns and a version 1."""
+    return (
+        RY_CIK,
+        "RY",
+        field,
+        period_start,
+        period_end,
+        period_type,
+        accession,
+        "10-K",
+        acceptance_ts,
+        False,
+        value,
+        unit,
+        unit,
+        "us-gaap",
+        "Revenues",
+        1,
+        1,
+        value,
+        False,
+        None,
+    )
+
+
+def test_legacy_events_use_the_new_york_boundary(tmp_path: Path) -> None:
+    db = build_qa_db(tmp_path / "edgarpit.duckdb")
+    insert_rows(
+        db,
+        "main.events_8k",
+        [
+            # 2004-08-22 20:00 New York: before the cutoff, although the UTC date
+            # is already the 23rd.
+            (
+                APPLE_CIK,
+                "AAPL",
+                "0000320193-04-000001",
+                "8-K",
+                utc(2004, 8, 23),
+                False,
+                "5",
+                "Other Events",
+            ),
+            # 2004-08-23 00:00 New York: the first minute of the new item codes.
+            (
+                APPLE_CIK,
+                "AAPL",
+                "0000320193-04-000002",
+                "8-K",
+                utc(2004, 8, 23, 4),
+                False,
+                "2.02",
+                "Results of Operations",
+            ),
+        ],
+    )
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        report = run_qa(con)
+    finally:
+        con.close()
+    assert report.legacy_events == [LegacyEventCount(cik=APPLE_CIK, ticker="AAPL", count=1)]
+
+
+def test_filings_are_counted_by_source_and_acceptance_source(tmp_path: Path) -> None:
+    db = build_qa_db(tmp_path / "edgarpit.duckdb")
+    rows: list[tuple[object, ...]] = [
+        (
+            APPLE_CIK,
+            "0000320193-03-000001",
+            "8-K",
+            date(2003, 5, 1),
+            None,
+            utc(2003, 5, 1, 20),
+            "sgml_header",
+            None,
+            False,
+            "a8k.htm",
+            "5",
+            False,
+            True,
+            "0000320193-submissions-001.json",
+        ),
+        (
+            APPLE_CIK,
+            "0000320193-23-000001",
+            "8-K",
+            date(2023, 12, 1),
+            None,
+            utc(2023, 12, 1, 21),
+            "sgml_header",
+            None,
+            False,
+            "b8k.htm",
+            "2.02",
+            False,
+            True,
+            "header",
+        ),
+    ]
+    insert_rows(db, "raw.filings", rows)
+    insert_rows(db, "main.filings", [(*row, "AAPL") for row in rows])
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        report = run_qa(con)
+    finally:
+        con.close()
+    assert report.filings_by_source == [
+        FilingCount(source="0000320193-submissions-001.json", count=1),
+        FilingCount(source="header", count=1),
+        FilingCount(source="recent", count=3),
+    ]
+    assert report.filings_by_acceptance_source == [
+        FilingCount(source="filing_date_eod", count=1),
+        FilingCount(source="sgml_header", count=4),
+    ]
+
+
+def test_ratio_gaps_classify_every_reason(tmp_path: Path) -> None:
+    db = build_qa_db(tmp_path / "edgarpit.duckdb")
+    insert_rows(
+        db,
+        "main.fundamentals_pit",
+        [
+            # net_margin FY2020: USD numerator against a CAD denominator.
+            fund(
+                "net_income",
+                date(2019, 11, 1),
+                date(2020, 10, 31),
+                "FY",
+                "0001000275-20-000001",
+                utc(2020, 12, 1, 12),
+                100.0,
+            ),
+            fund(
+                "revenue",
+                date(2019, 11, 1),
+                date(2020, 10, 31),
+                "FY",
+                "0001000275-20-000002",
+                utc(2020, 12, 1, 13),
+                900.0,
+                unit="CAD",
+            ),
+            # roe FY2021: matching currency, zero equity.
+            fund(
+                "net_income",
+                date(2020, 11, 1),
+                date(2021, 10, 31),
+                "FY",
+                "0001000275-21-000001",
+                utc(2021, 12, 1, 12),
+                50.0,
+            ),
+            fund(
+                "total_equity",
+                None,
+                date(2021, 10, 31),
+                "FY",
+                "0001000275-21-000002",
+                utc(2021, 12, 1, 13),
+                0.0,
+            ),
+            # A six-month revenue period is OTHER: the model never considers it.
+            fund(
+                "revenue",
+                date(2023, 11, 1),
+                date(2024, 4, 30),
+                "OTHER",
+                "0001000275-24-000001",
+                utc(2024, 5, 1, 12),
+                10.0,
+                unit="CAD",
+            ),
+        ],
+    )
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        report = run_qa(con)
+    finally:
+        con.close()
+    assert report.ratio_gap_counts == {
+        "mixed currency": 1,
+        "zero denominator": 1,
+        "OTHER period": 1,
+        "missing input": 5,
+    }
+    assert report.ratio_gaps[0] == RatioGap(
+        cik=RY_CIK,
+        ratio="net_margin",
+        period_start=date(2019, 11, 1),
+        period_end=date(2020, 10, 31),
+        period_type="FY",
+        reason="mixed currency",
+    )
+    assert report.ratio_gaps[1].reason == "zero denominator"
+    assert report.ratio_gaps[1].ratio == "roe"
+    assert report.ratio_gaps[2].reason == "OTHER period"
+    assert {gap.reason for gap in report.ratio_gaps} == set(report.ratio_gap_counts)
 
 
 def test_cli_qa_duplicated_key_exits_1(tmp_path: Path) -> None:
