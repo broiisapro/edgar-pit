@@ -336,7 +336,8 @@ def _print_qa(report: QaReport) -> None:
     typer.echo("Restatements")
     for restatement_count in report.restatement_counts:
         typer.echo(
-            f"  {restatement_count.cik} {restatement_count.field}: {restatement_count.count}"
+            f"  {restatement_count.cik} {restatement_count.field} "
+            f"[{restatement_count.kind}]: {restatement_count.count}"
         )
     for restatement in report.top_restatements:
         change = (

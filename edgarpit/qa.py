@@ -7,8 +7,9 @@ returns a :class:`QaReport`:
 
 - coverage per issuer: the canonical fields x fiscal years populated by FY rows
   and every universe issuer with no rows at all;
-- restatement counts per issuer and field plus the largest restatements with
-  both values and both acceptance times (the boundary-check audit list);
+- restatement counts per issuer, field and ``restatement_kind`` plus the largest
+  revisions with both values and both acceptance times (the boundary-check
+  audit list, which excludes split adjustments);
 - imputed acceptance timestamps by source and header-vs-API disagreements over
   60 s (count and worst ten);
 - 8-K events accepted before the 2004 item-code change, counted per issuer (the
@@ -95,10 +96,11 @@ class UniverseIssuer:
 
 @dataclass(frozen=True)
 class RestatementCount:
-    """How many restated versions an issuer has for one field."""
+    """How many restated versions an issuer has for one field and kind."""
 
     cik: str
     field: str
+    kind: str
     count: int
 
 
@@ -283,15 +285,22 @@ def _coverage(con: duckdb.DuckDBPyConnection) -> tuple[list[IssuerCoverage], int
 def _restatements(
     con: duckdb.DuckDBPyConnection,
 ) -> tuple[list[RestatementCount], list[Restatement]]:
+    """Restated versions by kind, and the largest ``revision`` rows.
+
+    Split adjustments move share-based values by a near-integer factor and are
+    not accounting revisions, so the boundary-check list carries only
+    ``revision`` rows; the counts keep every kind so a spike in split
+    adjustments stays visible.
+    """
     counts = [
-        RestatementCount(cik=row[0], field=row[1], count=int(row[2]))
+        RestatementCount(cik=row[0], field=row[1], kind=row[2], count=int(row[3]))
         for row in con.execute(
             """
-            SELECT cik, field, count(*)
+            SELECT cik, field, restatement_kind, count(*)
             FROM main.fundamentals_pit
             WHERE is_restatement
-            GROUP BY cik, field
-            ORDER BY count(*) DESC, cik, field
+            GROUP BY cik, field, restatement_kind
+            ORDER BY count(*) DESC, cik, field, restatement_kind
             """
         ).fetchall()
     ]
@@ -323,7 +332,7 @@ def _restatements(
              AND r.field = f.field
              AND r.period_start IS NOT DISTINCT FROM f.period_start
              AND r.period_end = f.period_end
-            WHERE r.is_restatement
+            WHERE r.is_restatement AND r.restatement_kind = 'revision'
             ORDER BY abs(r.pct_change_vs_first) DESC NULLS LAST, r.cik, r.field, r.period_end
             LIMIT {_ANOMALY_LIMIT}
             """

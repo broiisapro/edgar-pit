@@ -21,6 +21,7 @@ from edgarpit.qa import (
     LegacyEventCount,
     MultiCurrency,
     RatioGap,
+    RestatementCount,
     run_qa,
 )
 
@@ -31,6 +32,7 @@ EMPTY_CIK = "0000000001"
 RY_40F = "0001193125-23-285639"
 RY_RESTATED_40F = "0001193125-24-270294"
 APPLE_10Q = "0000320193-23-000106"
+APPLE_10K = "0000320193-23-000098"
 APPLE_8K = "0000320193-24-000006"
 
 _MAIN_FUNDAMENTALS_DDL = """
@@ -41,7 +43,7 @@ CREATE TABLE main.fundamentals_pit (
     value DOUBLE, unit VARCHAR, currency VARCHAR,
     source_taxonomy VARCHAR, source_concept VARCHAR, concept_rank INTEGER,
     version INTEGER, first_value DOUBLE, is_restatement BOOLEAN,
-    pct_change_vs_first DOUBLE
+    pct_change_vs_first DOUBLE, restatement_kind VARCHAR
 )
 """
 
@@ -125,6 +127,7 @@ FUNDAMENTALS_ROWS = [
         100.0,
         False,
         None,
+        "none",
     ),
     (
         RY_CIK,
@@ -147,6 +150,7 @@ FUNDAMENTALS_ROWS = [
         56129000000.0,
         False,
         None,
+        "none",
     ),
     (
         RY_CIK,
@@ -169,6 +173,7 @@ FUNDAMENTALS_ROWS = [
         56129000000.0,
         True,
         (51464000000.0 - 56129000000.0) / 56129000000.0,
+        "revision",
     ),
     (
         RY_CIK,
@@ -191,6 +196,7 @@ FUNDAMENTALS_ROWS = [
         1000000.0,
         False,
         None,
+        "none",
     ),
     (
         APPLE_CIK,
@@ -213,6 +219,7 @@ FUNDAMENTALS_ROWS = [
         383285000000.0,
         False,
         None,
+        "none",
     ),
     (
         APPLE_CIK,
@@ -235,6 +242,30 @@ FUNDAMENTALS_ROWS = [
         6.13,
         False,
         None,
+        "none",
+    ),
+    (
+        APPLE_CIK,
+        "AAPL",
+        "eps_diluted",
+        date(2022, 9, 25),
+        date(2023, 9, 30),
+        "FY",
+        APPLE_10K,
+        "10-K",
+        utc(2023, 11, 3, 3, 59, 59),
+        True,
+        1.5325,
+        "shares",
+        None,
+        "us-gaap",
+        "EarningsPerShareDiluted",
+        1,
+        2,
+        6.13,
+        True,
+        (1.5325 - 6.13) / 6.13,
+        "split_adjustment",
     ),
 ]
 
@@ -346,7 +377,7 @@ def build_qa_db(path: Path, *, duplicate_event: bool = False) -> Path:
         )
         con.executemany(
             "INSERT INTO main.fundamentals_pit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            " ?, ?, ?, ?, ?, ?, ?)",
+            " ?, ?, ?, ?, ?, ?, ?, ?)",
             FUNDAMENTALS_ROWS,
         )
         con.execute(
@@ -477,12 +508,10 @@ def test_run_qa_populates_every_section(tmp_path: Path) -> None:
     assert [issuer.cik for issuer in report.issuers_without_rows] == [EMPTY_CIK]
     assert report.issuers_without_rows[0].ticker == "EMPTY"
 
-    assert len(report.restatement_counts) == 1
-    assert (report.restatement_counts[0].cik, report.restatement_counts[0].field) == (
-        RY_CIK,
-        "revenue",
-    )
-    assert report.restatement_counts[0].count == 1
+    assert report.restatement_counts == [
+        RestatementCount(cik=APPLE_CIK, field="eps_diluted", kind="split_adjustment", count=1),
+        RestatementCount(cik=RY_CIK, field="revenue", kind="revision", count=1),
+    ]
     assert len(report.top_restatements) == 1
     restated = report.top_restatements[0]
     assert restated.first_value == 56129000000.0
@@ -577,6 +606,8 @@ def test_cli_qa_prints_sections_and_exits_0(tmp_path: Path) -> None:
     assert "  recent: 3" in result.stdout
     assert "  sgml_header: 2" in result.stdout
     assert "  missing input: 2" in result.stdout
+    assert "0001000275 revenue [revision]: 1" in result.stdout
+    assert "0000320193 eps_diluted [split_adjustment]: 1" in result.stdout
     assert "0001193125-24-270294" in result.stdout
     assert "0001000275 revenue" in result.stdout
 
@@ -625,6 +656,7 @@ def fund(
         value,
         False,
         None,
+        "none",
     )
 
 
