@@ -11,7 +11,7 @@ returns a :class:`QaReport`:
   revisions with both values and both acceptance times (the boundary-check
   audit list, which excludes split adjustments);
 - imputed acceptance timestamps by source and header-vs-API disagreements over
-  60 s (count and worst ten);
+  60 s for header-sourced rows (count and worst ten);
 - header-required filings (a ``us-gaap``/``ifrs-full`` fact carrier or a
   ``8-K``/``8-K/A``) whose acceptance time had to be imputed, counted per
   issuer: the cached headers that carry no ``<ACCEPTANCE-DATETIME>`` (decision
@@ -365,6 +365,13 @@ def _restatements(
 def _timestamps(
     con: duckdb.DuckDBPyConnection,
 ) -> tuple[dict[str, int], int, list[AcceptanceDisagreement]]:
+    """Imputed counts and header-vs-API disagreements.
+
+    The disagreement count and the worst list compare only header-sourced
+    acceptances: an imputed ``acceptance_ts`` is the conservative A-23 upper
+    bound (``filing_date`` end of day or ``acceptance_ts_api + 6 h``), so it
+    differs from the API by construction and would swamp the diagnostic.
+    """
     imputed = {
         row[0]: int(row[1])
         for row in con.execute(
@@ -384,6 +391,7 @@ def _timestamps(
             SELECT count(*)
             FROM raw.filings
             WHERE acceptance_ts_api IS NOT NULL AND acceptance_ts IS NOT NULL
+              AND acceptance_ts_source = 'sgml_header'
               AND abs(epoch(acceptance_ts) - epoch(acceptance_ts_api)) > 60
             """,
         )
@@ -402,6 +410,7 @@ def _timestamps(
                    abs(epoch(acceptance_ts) - epoch(acceptance_ts_api)) AS seconds
             FROM raw.filings
             WHERE acceptance_ts_api IS NOT NULL AND acceptance_ts IS NOT NULL
+              AND acceptance_ts_source = 'sgml_header'
               AND abs(epoch(acceptance_ts) - epoch(acceptance_ts_api)) > 60
             ORDER BY seconds DESC, accession
             LIMIT {_ANOMALY_LIMIT}
