@@ -24,7 +24,7 @@ import yaml
 
 from edgarpit.ingest.headers import HeaderInfo, apply_acceptance, parse_header
 from edgarpit.rawcache import RawCache
-from edgarpit.schemas import Events8kSchema
+from edgarpit.schemas import Events8kSchema, FilingsSchema
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +296,49 @@ def explode_8k_items(filings: pl.DataFrame, item_labels: Mapping[str, str]) -> p
     return events
 
 
+def _header_only_filings(
+    cik: str, headers: Mapping[str, HeaderInfo], known: set[str]
+) -> pl.DataFrame:
+    """Build filings rows from cached headers whose accession has no API row.
+
+    ``cik`` is the issuer's ten-character CIK, ``headers`` maps an accession
+    with a cached SGML header to its parsed :class:`HeaderInfo` and ``known``
+    the accessions already carried by the submissions frame. Returns one
+    ``FilingsSchema`` row per header accession outside ``known``, ordered by
+    accession, with every field taken from the header: ``form``,
+    ``filing_date``, ``report_date`` from ``<PERIOD>`` (null when absent),
+    ``acceptance_ts`` with ``acceptance_ts_source='sgml_header'`` and
+    ``ts_imputed=false``, ``acceptance_ts_api`` null because no API value
+    exists, ``items`` from ``<ITEMS>``, ``is_amendment`` from the form,
+    ``is_xbrl=false``, ``primary_document`` null and ``source='header'``
+    (decision A-24). The frame is validated under ``FilingsSchema`` before it
+    is returned.
+    """
+    rows = [
+        {
+            "cik": cik,
+            "accession": accession,
+            "form": finder.form,
+            "filing_date": finder.filing_date,
+            "report_date": finder.period,
+            "acceptance_ts": finder.acceptance_ts,
+            "acceptance_ts_source": "sgml_header",
+            "acceptance_ts_api": None,
+            "ts_imputed": False,
+            "primary_document": None,
+            "items": finder.items,
+            "is_amendment": finder.form.endswith("/A"),
+            "is_xbrl": False,
+            "source": "header",
+        }
+        for accession, finder in sorted(headers.items())
+        if accession not in known
+    ]
+    frame = pl.DataFrame(rows, schema=_FILINGS_DTYPES)
+    FilingsSchema.validate(frame)
+    return frame
+
+
 def ingest_filings(
     raw: RawCache, cik: str, item_labels: Mapping[str, str]
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -307,8 +350,12 @@ def ingest_filings(
     :func:`edgarpit.ingest.submissions.load_item_labels`. Reads the latest
     submissions document, every page file it lists (in listed order) and every
     cached SGML header for the issuer, then attaches the authoritative
-    acceptance times from the headers (decision A-1). Returns ``(filings,
-    events_8k)``, valid under :class:`edgarpit.schemas.FilingsSchema` and
+    acceptance times from the headers (decision A-1). A cached header whose
+    accession is absent from the submissions document still becomes a filings
+    row built from the header, so every fetched header is used (decision A-24);
+    such a row and its facts are never imputed from ``filed``. Returns
+    ``(filings, events_8k)``, valid under
+    :class:`edgarpit.schemas.FilingsSchema` and
     :class:`edgarpit.schemas.Events8kSchema`. Raises ``ValueError`` when the
     issuer has no cached submissions document, or when a page listed by the
     document is not in the cache.
@@ -336,6 +383,11 @@ def ingest_filings(
             continue
         headers[accession] = parse_header(body.decode("utf-8"))
 
-    filings = apply_acceptance(parse_submissions(main, pages), headers)
+    submissions = parse_submissions(main, pages)
+    filings = apply_acceptance(submissions, headers)
+    known = set(submissions["accession"].to_list())
+    header_only = _header_only_filings(cik, headers, known)
+    if header_only.height:
+        filings = pl.concat([filings, header_only])
     events = explode_8k_items(filings, item_labels)
     return filings, events

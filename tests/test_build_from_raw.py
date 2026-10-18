@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -20,6 +22,8 @@ RY_FY2023_40F = "0001193125-23-285639"
 RY_FY2023_RESTATED_40F = "0001193125-24-270294"
 RY_FY2023_ACCEPTED = datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
 RY_FY2023_RESTATED_ACCEPTED = datetime(2024, 12, 4, 11, 26, 17, tzinfo=UTC)
+
+HEADER_ONLY_PAGE = "CIK0001000275-submissions-005"
 
 TABLES = (
     "raw.filings",
@@ -98,6 +102,60 @@ def test_ry_fy2023_revenue_versions_have_header_acceptance_times(built: Path) ->
         (1, 56_129_000_000.0, RY_FY2023_40F, RY_FY2023_ACCEPTED, False, "FY"),
         (2, 51_464_000_000.0, RY_FY2023_RESTATED_40F, RY_FY2023_RESTATED_ACCEPTED, False, "FY"),
     ]
+
+
+def remove_accession(path: Path, accession: str) -> None:
+    """Delete one filing's row from every parallel array of a submissions document."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    filings = document.get("filings")
+    arrays: dict[str, Any] = (
+        filings["recent"] if isinstance(filings, dict) and "recent" in filings else document
+    )
+    accessions = arrays["accessionNumber"]
+    count = len(accessions)
+    index = accessions.index(accession)
+    for values in arrays.values():
+        if isinstance(values, list) and len(values) == count:
+            del values[index]
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def test_header_only_accession_facts_are_not_imputed(tmp_path: Path) -> None:
+    """A-24: facts of a header-only accession keep the header's acceptance time.
+
+    A temp copy of RY's fixture cache has the FY2023 40-F row removed from its
+    submissions page, so the accession survives only as a cached SGML header.
+    Its facts must reach ``fundamentals_pit`` with ``ts_imputed=false`` and the
+    header's acceptance time, not with the ``filed`` fallback (which A-24's
+    ``raw.filings`` row prevents).
+    """
+    raw_dir = tmp_path / "cache"
+    for endpoint in ("submissions", "submissions_page", "companyfacts", "headers"):
+        shutil.copytree(
+            FIXTURE_RAW / "raw" / endpoint / RY_CIK, raw_dir / "raw" / endpoint / RY_CIK
+        )
+    page = next((raw_dir / "raw" / "submissions_page" / RY_CIK / HEADER_ONLY_PAGE).glob("*.json"))
+    remove_accession(page, RY_FY2023_40F)
+
+    db_path = build_from_raw(raw_dir, tmp_path / "out")
+    con = connect(db_path)
+    try:
+        filing = con.execute(
+            "select source, acceptance_ts_source, acceptance_ts_api, ts_imputed "
+            "from raw.filings where accession = ?",
+            [RY_FY2023_40F],
+        ).fetchone()
+        facts = con.execute(
+            "select distinct acceptance_ts, ts_imputed from main.fundamentals_pit "
+            "where accession = ?",
+            [RY_FY2023_40F],
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert filing == ("header", "sgml_header", None, False)
+    assert facts
+    assert facts == [(RY_FY2023_ACCEPTED, False)]
 
 
 def test_expected_asof_is_reproduced(built: Path) -> None:
