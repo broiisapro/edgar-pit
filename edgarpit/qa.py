@@ -7,13 +7,21 @@ returns a :class:`QaReport`:
 
 - coverage per issuer: the canonical fields x fiscal years populated by FY rows
   and every universe issuer with no rows at all;
-- restatement counts per issuer and field plus the largest restatements with
-  both values and both acceptance times (the boundary-check audit list);
+- restatement counts per issuer, field and ``restatement_kind`` plus the largest
+  revisions with both values and both acceptance times (the boundary-check
+  audit list, which excludes split adjustments);
 - imputed acceptance timestamps by source and header-vs-API disagreements over
   60 s (count and worst ten);
+- 8-K events accepted before the 2004 item-code change, counted per issuer (the
+  pre-2004 item codes are not reliable metadata);
+- filings by ``source`` (``recent``, page file names, ``header``) and by
+  ``acceptance_ts_source``;
 - unmapped ``us-gaap``/``ifrs-full`` concepts by frequency;
 - unit anomalies: more than one currency per issuer and field, and observed
   unit families outside the families ``raw.concept_map`` declares;
+- ratio gaps: periods with at least one input in ``fundamentals_pit`` but no
+  ``ratios_pit`` row, counted by reason (mixed currency, zero denominator,
+  ``OTHER`` period, missing input) with the first ten examples;
 - conflicting values within one accession (decision A-7);
 - key uniqueness of every contract table (and ``raw.filings``); any violation
   makes :attr:`QaReport.ok` false. The report is read-only: nothing is written.
@@ -41,6 +49,20 @@ KEY_CHECKS: tuple[tuple[str, str], ...] = (
 )
 
 _ANOMALY_LIMIT = 10
+
+# New York date the 8-K item codes were expanded; earlier codes are unreliable.
+LEGACY_ITEMS_BEFORE = "2004-08-23"
+
+# Why a period with an input produced no ``ratios_pit`` row; ``no candidate``
+# means both inputs are present with one non-null currency and a non-zero
+# denominator, so the dbt model should have produced a row.
+RATIO_GAP_REASONS: tuple[str, ...] = (
+    "mixed currency",
+    "zero denominator",
+    "OTHER period",
+    "missing input",
+    "no candidate",
+)
 
 
 def _scalar(con: duckdb.DuckDBPyConnection, sql: str) -> Any:
@@ -74,10 +96,11 @@ class UniverseIssuer:
 
 @dataclass(frozen=True)
 class RestatementCount:
-    """How many restated versions an issuer has for one field."""
+    """How many restated versions an issuer has for one field and kind."""
 
     cik: str
     field: str
+    kind: str
     count: int
 
 
@@ -106,6 +129,35 @@ class AcceptanceDisagreement:
     acceptance_ts: datetime
     acceptance_ts_api: datetime
     seconds: float
+
+
+@dataclass(frozen=True)
+class LegacyEventCount:
+    """8-K events one issuer accepted before the 2004 item-code change."""
+
+    cik: str
+    ticker: str | None
+    count: int
+
+
+@dataclass(frozen=True)
+class FilingCount:
+    """How many ``raw.filings`` rows carry one value of a column."""
+
+    source: str
+    count: int
+
+
+@dataclass(frozen=True)
+class RatioGap:
+    """A period with an input but no ``ratios_pit`` row, and the reason why."""
+
+    cik: str
+    ratio: str
+    period_start: date | None
+    period_end: date
+    period_type: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -172,9 +224,14 @@ class QaReport:
     imputed_by_source: dict[str, int] = field(default_factory=dict)
     disagreement_count: int = 0
     disagreements: list[AcceptanceDisagreement] = field(default_factory=list)
+    legacy_events: list[LegacyEventCount] = field(default_factory=list)
+    filings_by_source: list[FilingCount] = field(default_factory=list)
+    filings_by_acceptance_source: list[FilingCount] = field(default_factory=list)
     unmapped_concepts: list[UnmappedConcept] = field(default_factory=list)
     multi_currency: list[MultiCurrency] = field(default_factory=list)
     unexpected_units: list[UnexpectedUnit] = field(default_factory=list)
+    ratio_gap_counts: dict[str, int] = field(default_factory=dict)
+    ratio_gaps: list[RatioGap] = field(default_factory=list)
     conflicting_values: list[ConflictingValue] = field(default_factory=list)
     key_violations: list[KeyViolation] = field(default_factory=list)
 
@@ -228,15 +285,22 @@ def _coverage(con: duckdb.DuckDBPyConnection) -> tuple[list[IssuerCoverage], int
 def _restatements(
     con: duckdb.DuckDBPyConnection,
 ) -> tuple[list[RestatementCount], list[Restatement]]:
+    """Restated versions by kind, and the largest ``revision`` rows.
+
+    Split adjustments move share-based values by a near-integer factor and are
+    not accounting revisions, so the boundary-check list carries only
+    ``revision`` rows; the counts keep every kind so a spike in split
+    adjustments stays visible.
+    """
     counts = [
-        RestatementCount(cik=row[0], field=row[1], count=int(row[2]))
+        RestatementCount(cik=row[0], field=row[1], kind=row[2], count=int(row[3]))
         for row in con.execute(
             """
-            SELECT cik, field, count(*)
+            SELECT cik, field, restatement_kind, count(*)
             FROM main.fundamentals_pit
             WHERE is_restatement
-            GROUP BY cik, field
-            ORDER BY count(*) DESC, cik, field
+            GROUP BY cik, field, restatement_kind
+            ORDER BY count(*) DESC, cik, field, restatement_kind
             """
         ).fetchall()
     ]
@@ -268,7 +332,7 @@ def _restatements(
              AND r.field = f.field
              AND r.period_start IS NOT DISTINCT FROM f.period_start
              AND r.period_end = f.period_end
-            WHERE r.is_restatement
+            WHERE r.is_restatement AND r.restatement_kind = 'revision'
             ORDER BY abs(r.pct_change_vs_first) DESC NULLS LAST, r.cik, r.field, r.period_end
             LIMIT {_ANOMALY_LIMIT}
             """
@@ -324,6 +388,182 @@ def _timestamps(
         ).fetchall()
     ]
     return imputed, disagreement_count, worst
+
+
+def _legacy_events(con: duckdb.DuckDBPyConnection) -> list[LegacyEventCount]:
+    """8-K events accepted in New York before 2004-08-23, per issuer.
+
+    The item codes on those filings predate the item expansion, so their
+    ``item_code``/``item_label`` metadata is not reliable; the count marks
+    coverage that audits should not read as events.
+    """
+    return [
+        LegacyEventCount(cik=row[0], ticker=row[1], count=int(row[2]))
+        for row in con.execute(
+            f"""
+            SELECT cik, any_value(ticker), count(*)
+            FROM main.events_8k
+            WHERE timezone('America/New_York', acceptance_ts)
+                  < TIMESTAMP '{LEGACY_ITEMS_BEFORE}'
+            GROUP BY cik
+            ORDER BY cik
+            """
+        ).fetchall()
+    ]
+
+
+def _filings_by(con: duckdb.DuckDBPyConnection, column: str) -> list[FilingCount]:
+    """``raw.filings`` row counts per value of ``column``, ordered by value.
+
+    ``column`` is a trusted contract column name (``source`` or
+    ``acceptance_ts_source``), never user input.
+    """
+    return [
+        FilingCount(source=row[0], count=int(row[1]))
+        for row in con.execute(
+            f"SELECT {column}, count(*) FROM raw.filings GROUP BY {column} ORDER BY {column}"
+        ).fetchall()
+    ]
+
+
+def _ratio_gaps(con: duckdb.DuckDBPyConnection) -> tuple[dict[str, int], list[RatioGap]]:
+    """Periods with an input but no ``ratios_pit`` row, by reason and example.
+
+    The period set is the latest version of each ratio input in
+    ``fundamentals_pit``, paired across the two fields with the model's period
+    rules (equal ``period_type`` and period end; a duration numerator may pair
+    with an instant denominator). A period counts as a gap when ``ratios_pit``
+    holds no row for it. The reason follows the model's filters in order:
+    ``OTHER`` periods are never considered, a missing or unpaired input is
+    ``missing input``, a non-matching currency is ``mixed currency`` and a zero
+    denominator is ``zero denominator``. Returns the counts per reason and the
+    first :data:`_ANOMALY_LIMIT` gaps ordered by reason, issuer and period.
+    """
+    rows = con.execute(
+        """
+        WITH ratio_fields(ratio, numerator_field, denominator_field) AS (
+            VALUES
+                ('roe', 'net_income', 'total_equity'),
+                ('leverage', 'total_liabilities', 'total_equity'),
+                ('net_margin', 'net_income', 'revenue')
+        ),
+        latest AS (
+            SELECT * EXCLUDE (row_num)
+            FROM (
+                SELECT
+                    facts.cik,
+                    facts.field,
+                    facts.period_start,
+                    facts.period_end,
+                    facts.period_type,
+                    facts.value,
+                    facts.currency,
+                    row_number() OVER (
+                        PARTITION BY
+                            facts.cik, facts.field, facts.period_start,
+                            facts.period_end, facts.period_type
+                        ORDER BY facts.acceptance_ts DESC, facts.version DESC
+                    ) AS row_num
+                FROM main.fundamentals_pit AS facts
+                WHERE facts.field IN (
+                    SELECT numerator_field FROM ratio_fields
+                    UNION
+                    SELECT denominator_field FROM ratio_fields
+                )
+            )
+            WHERE row_num = 1
+        ),
+        numerator_periods AS (
+            SELECT ratio_fields.ratio, numerator.*
+            FROM ratio_fields
+            JOIN latest AS numerator ON numerator.field = ratio_fields.numerator_field
+        ),
+        denominator_periods AS (
+            SELECT ratio_fields.ratio, denominator.*
+            FROM ratio_fields
+            JOIN latest AS denominator ON denominator.field = ratio_fields.denominator_field
+        ),
+        periods AS (
+            SELECT
+                coalesce(numerator.ratio, denominator.ratio) AS ratio,
+                coalesce(numerator.cik, denominator.cik) AS cik,
+                coalesce(numerator.period_start, denominator.period_start) AS period_start,
+                coalesce(numerator.period_end, denominator.period_end) AS period_end,
+                coalesce(numerator.period_type, denominator.period_type) AS period_type,
+                numerator.period_start AS numerator_start,
+                denominator.period_start AS denominator_start,
+                numerator.value AS numerator_value,
+                numerator.currency AS numerator_currency,
+                denominator.value AS denominator_value,
+                denominator.currency AS denominator_currency
+            FROM numerator_periods AS numerator
+            FULL OUTER JOIN denominator_periods AS denominator
+                ON denominator.ratio = numerator.ratio
+                AND denominator.cik = numerator.cik
+                AND denominator.period_end = numerator.period_end
+                AND denominator.period_type = numerator.period_type
+                AND (
+                    (numerator.period_start IS NULL AND denominator.period_start IS NULL)
+                    OR (numerator.period_start IS NOT NULL AND denominator.period_start IS NULL)
+                    OR (
+                        numerator.period_start IS NOT NULL
+                        AND denominator.period_start = numerator.period_start
+                    )
+                )
+        ),
+        gaps AS (
+            SELECT
+                periods.*,
+                CASE
+                    WHEN periods.period_type = 'OTHER' THEN 'OTHER period'
+                    WHEN periods.numerator_value IS NULL
+                        OR periods.denominator_value IS NULL
+                        OR (
+                            periods.numerator_start IS NULL
+                            AND periods.denominator_start IS NOT NULL
+                        )
+                        THEN 'missing input'
+                    WHEN periods.numerator_currency IS NULL
+                        OR periods.denominator_currency IS NULL
+                        OR periods.numerator_currency <> periods.denominator_currency
+                        THEN 'mixed currency'
+                    WHEN periods.denominator_value = 0 THEN 'zero denominator'
+                    ELSE 'no candidate'
+                END AS reason
+            FROM periods
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM main.ratios_pit AS ratios
+                WHERE ratios.cik = periods.cik
+                  AND ratios.ratio = periods.ratio
+                  AND ratios.period_end = periods.period_end
+                  AND ratios.period_type = periods.period_type
+                  AND ratios.period_start IS NOT DISTINCT FROM periods.period_start
+            )
+        )
+        SELECT cik, ratio, period_start, period_end, period_type, reason
+        FROM gaps
+        ORDER BY reason, cik, ratio, period_end
+        """
+    ).fetchall()
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row[5]] = counts.get(row[5], 0) + 1
+    ordered = sorted(
+        rows, key=lambda row: (RATIO_GAP_REASONS.index(row[5]), row[0], row[1], row[3])
+    )
+    gaps = [
+        RatioGap(
+            cik=row[0],
+            ratio=row[1],
+            period_start=row[2],
+            period_end=row[3],
+            period_type=row[4],
+            reason=row[5],
+        )
+        for row in ordered[:_ANOMALY_LIMIT]
+    ]
+    return {reason: counts[reason] for reason in RATIO_GAP_REASONS if reason in counts}, gaps
 
 
 def _unmapped(con: duckdb.DuckDBPyConnection) -> list[UnmappedConcept]:
@@ -452,6 +692,7 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
     restatement_counts, top_restatements = _restatements(con)
     imputed, disagreement_count, disagreements = _timestamps(con)
     multi_currency, unexpected_units = _unit_anomalies(con)
+    ratio_gap_counts, ratio_gaps = _ratio_gaps(con)
     return QaReport(
         canonical_fields=canonical_fields,
         universe_issuers=universe_issuers,
@@ -462,9 +703,14 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
         imputed_by_source=imputed,
         disagreement_count=disagreement_count,
         disagreements=disagreements,
+        legacy_events=_legacy_events(con),
+        filings_by_source=_filings_by(con, "source"),
+        filings_by_acceptance_source=_filings_by(con, "acceptance_ts_source"),
         unmapped_concepts=_unmapped(con),
         multi_currency=multi_currency,
         unexpected_units=unexpected_units,
+        ratio_gap_counts=ratio_gap_counts,
+        ratio_gaps=ratio_gaps,
         conflicting_values=_conflicts(con),
         key_violations=_key_violations(con),
     )

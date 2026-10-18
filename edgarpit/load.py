@@ -136,16 +136,14 @@ def _concept_map_frame(concept_map: ConceptMap) -> pl.DataFrame:
     """Flatten a validated concept map into the reference-table rows.
 
     One row per ``(field, taxonomy, concept)`` in field order, ``us-gaap``
-    before ``ifrs-full`` and rank 1 first. ``ConceptMap`` exposes no public
-    iterator over its ordered ``ConceptSpec`` objects, so the map's protected
-    ``_by_field`` mapping is read directly; a public accessor would remove
-    that coupling.
+    before ``ifrs-full`` and rank 1 first, over
+    :meth:`edgarpit.concepts.ConceptMap.specs`.
     """
     rows: list[tuple[str, str, str, int, str, str]] = []
-    for field, spec in concept_map._by_field.items():
+    for spec in concept_map.specs():
         for taxonomy, concepts in (("us-gaap", spec.us_gaap), ("ifrs-full", spec.ifrs_full)):
             for rank, concept in enumerate(concepts, start=1):
-                rows.append((field, taxonomy, concept, rank, spec.kind, spec.unit_family))
+                rows.append((spec.field, taxonomy, concept, rank, spec.kind, spec.unit_family))
     schema = {name: _POLARS_TYPES[dtype] for name, dtype in REFERENCE_TYPES["concept_map"].items()}
     return pl.DataFrame(rows, schema=schema, orient="row")
 

@@ -336,7 +336,8 @@ def _print_qa(report: QaReport) -> None:
     typer.echo("Restatements")
     for restatement_count in report.restatement_counts:
         typer.echo(
-            f"  {restatement_count.cik} {restatement_count.field}: {restatement_count.count}"
+            f"  {restatement_count.cik} {restatement_count.field} "
+            f"[{restatement_count.kind}]: {restatement_count.count}"
         )
     for restatement in report.top_restatements:
         change = (
@@ -363,6 +364,17 @@ def _print_qa(report: QaReport) -> None:
             f"{_iso_ts(disagreement.acceptance_ts_api)} ({disagreement.seconds:.0f} s)"
         )
 
+    typer.echo("Legacy 8-K events (accepted before 2004-08-23; item codes are unreliable)")
+    for legacy in report.legacy_events:
+        typer.echo(f"  {legacy.cik} {legacy.ticker or '-'}: {legacy.count}")
+
+    typer.echo("Filings by source")
+    for counted in report.filings_by_source:
+        typer.echo(f"  {counted.source}: {counted.count}")
+    typer.echo("Filings by acceptance_ts_source")
+    for counted in report.filings_by_acceptance_source:
+        typer.echo(f"  {counted.source}: {counted.count}")
+
     typer.echo("Unmapped concepts")
     for unmapped in report.unmapped_concepts:
         typer.echo(f"  {unmapped.taxonomy}:{unmapped.concept}: {unmapped.count}")
@@ -378,6 +390,15 @@ def _print_qa(report: QaReport) -> None:
         typer.echo(
             f"  {unexpected_unit.cik} {unexpected_unit.field} unit {unexpected_unit.unit}: "
             f"expected {families}"
+        )
+
+    typer.echo("Ratio gaps (input present, no ratios_pit row)")
+    for reason, count in report.ratio_gap_counts.items():
+        typer.echo(f"  {reason}: {count}")
+    for gap in report.ratio_gaps:
+        typer.echo(
+            f"  {gap.cik} {gap.ratio} {_period(gap.period_start, gap.period_end)} "
+            f"{gap.period_type}: {gap.reason}"
         )
 
     typer.echo("Conflicting values within one accession")
