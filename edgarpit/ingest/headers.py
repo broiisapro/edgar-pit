@@ -159,12 +159,17 @@ def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -
     null; ``headers`` maps an accession to its parsed :class:`HeaderInfo`. For a
     filing whose accession is in ``headers``, ``acceptance_ts`` is the header's
     aware UTC time, ``acceptance_ts_source`` is ``'sgml_header'`` and
-    ``ts_imputed`` is false. Every other filing falls back to ``filing_date``
-    23:59:59 America/New_York converted to UTC (an upper bound on the true
-    acceptance time, because EDGAR dates an after-hours filing the next day)
-    with ``acceptance_ts_source='filing_date_eod'`` and ``ts_imputed=true``
-    (decision A-1). The result is validated against ``FilingsSchema`` before it
-    is returned; ``acceptance_ts_api`` is passed through untouched.
+    ``ts_imputed`` is false. Every other filing falls back to the later of
+    ``filing_date`` 23:59:59 America/New_York and ``acceptance_ts_api + 6 h``
+    (the API term only when it is present), with
+    ``acceptance_ts_source='filing_date_eod'`` and ``ts_imputed=true``
+    (decision A-23). The six-hour margin covers the submissions API's observed
+    four- to five-hour shift in either direction, so the fallback stays an upper
+    bound on the true acceptance time even for paper filings (which EDGAR dates
+    up to a week before acceptance) and never leaks a value early; the
+    end-of-day term is the bound for holdings with no API timestamp. The result
+    is validated against ``FilingsSchema`` before it is returned;
+    ``acceptance_ts_api`` is passed through untouched.
     """
     header_ts = pl.col("accession").replace_strict(
         {accession: info.acceptance_ts for accession, info in headers.items()},
@@ -172,7 +177,7 @@ def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -
         return_dtype=pl.Datetime("us", "UTC"),
     )
     has_header = header_ts.is_not_null()
-    fallback_ts = (
+    filing_date_eod = (
         (
             pl.col("filing_date").cast(pl.Datetime("us"))
             + pl.duration(hours=23, minutes=59, seconds=59)
@@ -180,6 +185,8 @@ def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -
         .dt.replace_time_zone("America/New_York", ambiguous="latest", non_existent="raise")
         .dt.convert_time_zone("UTC")
     )
+    api_margin = pl.col("acceptance_ts_api") + pl.duration(hours=6)
+    fallback_ts = pl.max_horizontal(filing_date_eod, api_margin)
     result = filings.with_columns(
         pl.when(has_header).then(header_ts).otherwise(fallback_ts).alias("acceptance_ts"),
         pl.when(has_header)

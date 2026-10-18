@@ -8,12 +8,12 @@ touches the network.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from edgarpit.ingest.headers import (
@@ -89,7 +89,9 @@ def is_skipped(local: datetime) -> bool:
     return True
 
 
-def synthetic_filings(rows: list[tuple[str, date]], cik: str = "0000000000") -> pl.DataFrame:
+def synthetic_filings(
+    rows: list[tuple[str, date]], cik: str = "0000000000", api: datetime | None = None
+) -> pl.DataFrame:
     """A minimal valid ``filings`` frame: ``(accession, filing_date)`` rows."""
     columns: dict[str, list[object]] = {name: [] for name in _FRAME_DTYPES}
     for accession, filing_date in rows:
@@ -101,7 +103,7 @@ def synthetic_filings(rows: list[tuple[str, date]], cik: str = "0000000000") -> 
             "report_date": None,
             "acceptance_ts": None,
             "acceptance_ts_source": None,
-            "acceptance_ts_api": None,
+            "acceptance_ts_api": api,
             "ts_imputed": None,
             "primary_document": None,
             "items": None,
@@ -112,6 +114,14 @@ def synthetic_filings(rows: list[tuple[str, date]], cik: str = "0000000000") -> 
         for name in _FRAME_DTYPES:
             columns[name].append(values[name])
     return pl.DataFrame(columns, schema=_FRAME_DTYPES)
+
+
+def fallback_bound(filing_date: date, api: datetime | None) -> datetime:
+    """The A-23 fallback: greatest(filing_date 23:59:59 New York, api + 6 h)."""
+    end_of_day = datetime.combine(filing_date, time(23, 59, 59), tzinfo=NEW_YORK).astimezone(UTC)
+    if api is None:
+        return end_of_day
+    return max(end_of_day, api + timedelta(hours=6))
 
 
 def fixture_filing_forms(cik: str) -> dict[str, str]:
@@ -251,7 +261,7 @@ def test_apply_acceptance_prefers_the_header() -> None:
         (date(2024, 11, 3), datetime(2024, 11, 4, 4, 59, 59, tzinfo=UTC)),
     ],
 )
-def test_apply_acceptance_falls_back_to_filing_date_end_of_day(
+def test_apply_acceptance_falls_back_to_filing_date_end_of_day_without_an_api_value(
     filing_date: date, expected: datetime
 ) -> None:
     filings = synthetic_filings([("0000000000-00-000001", filing_date)])
@@ -261,6 +271,65 @@ def test_apply_acceptance_falls_back_to_filing_date_end_of_day(
     assert row["acceptance_ts_source"] == "filing_date_eod"
     assert row["ts_imputed"] is True
     FilingsSchema.validate(result)
+
+
+def test_apply_acceptance_fallback_takes_the_api_margin_for_paper_filings() -> None:
+    """A-23 on RY's paper filing 9999999997-18-002767 read without its header.
+
+    2018-03-08 23:59:59 New York (2018-03-09 04:59:59Z) is a week before the
+    true acceptance (2018-03-15 13:44:25 ET = 17:44:25Z), so the filing-date
+    bound alone would leak the filing's facts early. The API value is four
+    hours late, and ``acceptance_ts_api + 6 h`` (2018-03-16 03:44:25Z) is the
+    conservative bound.
+    """
+    api = datetime(2018, 3, 15, 21, 44, 25, tzinfo=UTC)
+    filings = synthetic_filings([("9999999997-18-002767", date(2018, 3, 8))], api=api)
+    row = apply_acceptance(filings, {}).row(0, named=True)
+    assert row["acceptance_ts"] == datetime(2018, 3, 16, 3, 44, 25, tzinfo=UTC)
+    assert row["acceptance_ts"] > datetime(2018, 3, 15, 17, 44, 25, tzinfo=UTC)
+    assert row["acceptance_ts_source"] == "filing_date_eod"
+    assert row["ts_imputed"] is True
+
+
+def test_apply_acceptance_fallback_keeps_the_end_of_day_when_the_api_is_not_late() -> None:
+    filing_date = date(2024, 1, 2)
+    api = datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC)
+    filings = synthetic_filings([("0000000000-00-000001", filing_date)], api=api)
+    row = apply_acceptance(filings, {}).row(0, named=True)
+    assert row["acceptance_ts"] == fallback_bound(filing_date, api)
+    assert row["acceptance_ts"] == datetime(2024, 1, 3, 4, 59, 59, tzinfo=UTC)
+
+
+# The deadline is off because a single Polars pass can exceed the 200 ms
+# default under load on the shared build machine without any difference in
+# behaviour.
+@settings(max_examples=100, deadline=None)
+@given(
+    filing_date=st.dates(min_value=date(1990, 1, 1), max_value=date(2040, 12, 31)),
+    api=st.none()
+    | st.datetimes(
+        min_value=datetime(1990, 1, 1), max_value=datetime(2041, 1, 5), timezones=st.just(UTC)
+    ).map(lambda moment: moment.replace(microsecond=0)),
+)
+def test_apply_acceptance_fallback_is_never_early(filing_date: date, api: datetime | None) -> None:
+    """A-23: the fallback is never earlier than any plausible acceptance time.
+
+    Whatever the true acceptance time is, it cannot be earlier than 00:00:00
+    New York on the filing date; and because the submissions API shift is
+    signed, it cannot be later than ``acceptance_ts_api + 6 h`` either. The
+    property checks the frame ``apply_acceptance`` actually produces against
+    both bounds, and against the exact ``greatest(...)`` formula.
+    """
+    filings = synthetic_filings([("0000000000-00-000001", filing_date)], api=api)
+    row = apply_acceptance(filings, {}).row(0, named=True)
+    assert row["acceptance_ts"] == fallback_bound(filing_date, api)
+    assert row["acceptance_ts"] >= datetime.combine(
+        filing_date, time(0, 0, 0), tzinfo=NEW_YORK
+    ).astimezone(UTC)
+    if api is not None:
+        assert row["acceptance_ts"] >= api + timedelta(hours=6)
+    assert row["acceptance_ts_source"] == "filing_date_eod"
+    assert row["ts_imputed"] is True
 
 
 def test_apply_acceptance_leaves_unmatched_filings_on_the_fallback() -> None:

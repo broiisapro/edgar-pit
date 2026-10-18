@@ -7,7 +7,8 @@ Every test here runs ``ingest_filings`` against ``tests/fixtures/sec`` through
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, time, timedelta
+import shutil
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import pytest
 
+from edgarpit.ingest.headers import parse_header
 from edgarpit.ingest.submissions import ingest_filings, load_item_labels
 from edgarpit.rawcache import RawCache
 from edgarpit.schemas import Events8kSchema, FilingsSchema
@@ -41,9 +43,15 @@ EXPECTED_DISAGREEMENTS = {RY_CIK: 191, APPLE_CIK: 76, SHOP_CIK: 0}
 # The one fixture filing whose header acceptance time is later than its
 # ``filingDate`` 23:59:59 New York: an SEC paper filing (``<PAPER>`` in the
 # header) whose acceptance happened 2018-03-15 although EDGAR dates it
-# 2018-03-08. For paper filings the ``filing_date_eod`` fallback is therefore
-# not an upper bound; for every other fixture filing it is.
+# 2018-03-08. Its true acceptance is 2018-03-15 13:44:25 New York.
 PAPER_ACCESSION = "9999999997-18-002767"
+PAPER_ACCEPTED = datetime(2018, 3, 15, 17, 44, 25, tzinfo=UTC)
+
+# RY's FY2023 40-F, the first version of the reference restatement, lives in a
+# submissions page and has a cached header; removing its API row turns it into
+# a header-only accession (decision A-24).
+HEADER_ONLY_ACCESSION = "0001193125-23-285639"
+HEADER_ONLY_PAGE = "CIK0001000275-submissions-005"
 
 
 def fixture_row_count(cik: str) -> int:
@@ -54,6 +62,38 @@ def fixture_row_count(cik: str) -> int:
         for key in RAW.keys("submissions_page", cik)
     ]
     return sum(len(rows["accessionNumber"]) for rows in arrays)
+
+
+def copy_cik_cache(tmp_path: Path, cik: str = RY_CIK) -> Path:
+    """Copy one issuer's fixture cache endpoints into ``tmp_path`` for edits."""
+    root = tmp_path / "cache"
+    for endpoint in ("submissions", "submissions_page", "companyfacts", "headers"):
+        shutil.copytree(FIXTURES / "raw" / endpoint / cik, root / "raw" / endpoint / cik)
+    return root
+
+
+def remove_accession(path: Path, accession: str) -> None:
+    """Delete one filing's row from every parallel array of a submissions document."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    filings = document.get("filings")
+    arrays: dict[str, Any] = (
+        filings["recent"] if isinstance(filings, dict) and "recent" in filings else document
+    )
+    accessions = arrays["accessionNumber"]
+    count = len(accessions)
+    index = accessions.index(accession)
+    for values in arrays.values():
+        if isinstance(values, list) and len(values) == count:
+            del values[index]
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def fallback_bound(filing_date: date, api: datetime | None) -> datetime:
+    """The A-23 fallback: greatest(filing_date 23:59:59 New York, api + 6 h)."""
+    end_of_day = datetime.combine(filing_date, time(23, 59, 59), tzinfo=NEW_YORK).astimezone(UTC)
+    if api is None:
+        return end_of_day
+    return max(end_of_day, api + timedelta(hours=6))
 
 
 def test_ingest_filings_validates_and_keeps_every_fixture_row() -> None:
@@ -102,13 +142,12 @@ def test_header_vs_api_disagreements_are_counted_and_bounded() -> None:
     print("header-vs-API disagreements > 60 s (count, filings with API):", counts)
 
 
-def test_header_acceptance_never_exceeds_the_filing_date_end_of_day() -> None:
-    """The ``filing_date_eod`` fallback must never be earlier than the truth.
+def test_header_acceptance_never_exceeds_the_fallback() -> None:
+    """The A-23 fallback must never be earlier than the truth.
 
-    Decision A-1 makes the fallback an upper bound because EDGAR dates an
-    after-hours filing the next day. This checks the bound on every fixture
-    filing that has a header; the only known exception is the paper filing
-    named above.
+    The fallback is ``greatest(filing_date 23:59:59 New York,
+    acceptance_ts_api + 6 h)``, so on every fixture filing that has a header
+    the header's acceptance time must be at or before it -- with no exceptions.
     """
     violations: set[str] = set()
     for cik in CIKS:
@@ -117,10 +156,60 @@ def test_header_acceptance_never_exceeds_the_filing_date_end_of_day() -> None:
         for row in filings.iter_rows(named=True):
             if row["accession"] not in header_accessions:
                 continue
-            bound = datetime.combine(row["filing_date"], time(23, 59, 59), tzinfo=NEW_YORK)
-            if row["acceptance_ts"] > bound.astimezone(UTC):
+            bound = fallback_bound(row["filing_date"], row["acceptance_ts_api"])
+            if row["acceptance_ts"] > bound:
                 violations.add(row["accession"])
-    assert violations == {PAPER_ACCESSION}
+    assert violations == set()
+
+
+def test_paper_filing_fallback_covers_its_true_acceptance(tmp_path: Path) -> None:
+    """A-23 on a temp copy of the cache with the paper filing's header removed.
+
+    The filing-date bound alone (2018-03-09 04:59:59Z) is seven days before the
+    true acceptance (2018-03-15 17:44:25Z); the API value is four hours late,
+    so the fallback must take the ``acceptance_ts_api + 6 h`` term.
+    """
+    root = copy_cik_cache(tmp_path)
+    shutil.rmtree(root / "raw" / "headers" / RY_CIK / PAPER_ACCESSION)
+    filings, _ = ingest_filings(RawCache(root), RY_CIK, LABELS)
+    row = filings.filter(pl.col("accession") == PAPER_ACCESSION).row(0, named=True)
+    assert row["acceptance_ts"] >= PAPER_ACCEPTED
+    assert row["acceptance_ts"] == datetime(2018, 3, 16, 3, 44, 25, tzinfo=UTC)
+    assert row["acceptance_ts_source"] == "filing_date_eod"
+    assert row["ts_imputed"] is True
+
+
+def test_header_only_accession_becomes_a_filings_row(tmp_path: Path) -> None:
+    """A-24: a cached header with no submissions row still yields a filings row.
+
+    The row is built entirely from the header; without decision A-24 the
+    accession would be absent from ``raw.filings`` and dbt would impute its
+    facts from ``filed``.
+    """
+    root = copy_cik_cache(tmp_path)
+    page = next((root / "raw" / "submissions_page" / RY_CIK / HEADER_ONLY_PAGE).glob("*.json"))
+    remove_accession(page, HEADER_ONLY_ACCESSION)
+    filings, _ = ingest_filings(RawCache(root), RY_CIK, LABELS)
+    FilingsSchema.validate(filings)
+    rows = filings.filter(pl.col("accession") == HEADER_ONLY_ACCESSION)
+    assert rows.height == 1
+    row = rows.row(0, named=True)
+    header = parse_header(RAW.latest("headers", RY_CIK, HEADER_ONLY_ACCESSION).decode("utf-8"))
+    assert row["cik"] == RY_CIK
+    assert row["form"] == header.form == "40-F"
+    assert row["filing_date"] == header.filing_date
+    assert row["report_date"] == header.period
+    assert row["acceptance_ts"] == header.acceptance_ts
+    assert row["acceptance_ts_source"] == "sgml_header"
+    assert row["acceptance_ts_api"] is None
+    assert row["ts_imputed"] is False
+    assert row["primary_document"] is None
+    assert row["items"] == header.items
+    assert row["is_amendment"] is False
+    assert row["is_xbrl"] is False
+    assert row["source"] == "header"
+    # The removed submissions row reappears as the header-only row.
+    assert len(filings) == fixture_row_count(RY_CIK)
 
 
 def test_missing_submissions_raises() -> None:
