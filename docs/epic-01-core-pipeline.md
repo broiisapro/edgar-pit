@@ -13,6 +13,8 @@ Turn the frozen Epic 00 interfaces into the working point-in-time pipeline this 
 
 Everything below describes the merged code, not the issue text. Exact column lists stay in `docs/architecture.md` sections 5–7; this document is the map of how the pieces fit and the reasoning behind them.
 
+> Correction (Epic 02): the fallback acceptance time described below was made conservative by decision A-23, and `fundamentals_pit` gained `restatement_kind` by decision A-25; see `docs/epic-02-integration.md`.
+
 ## How it works
 
 The path a build takes: **fetch → ingest → load → dbt → query/API/explorer → QA → export**.
