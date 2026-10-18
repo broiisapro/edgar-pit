@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 from collections import Counter
@@ -53,6 +54,8 @@ DB_NAME = "edgarpit.duckdb"
 BUILD_INFO_NAME = "build-info.json"
 DBT_TARGET_DIRNAME = "dbt-target"
 TRANSFORM_DIR = Path(__file__).resolve().parents[1] / "transform"
+
+LOGGER = logging.getLogger("edgarpit.load")
 
 # Tables counted into build-info.json, in report order: the staging tables and
 # reference tables first, then the dbt models.
@@ -244,6 +247,42 @@ def _cached_ciks(raw: RawCache) -> list[str]:
     return ciks
 
 
+def _cross_issuer_rank(frame: pl.DataFrame) -> pl.DataFrame:
+    """Order rows of one accession so the preferred issuer's row comes first.
+
+    A row whose CIK matches the accession's own ten-digit prefix (the filer in
+    the common case) is ``_borrowed=False`` and ranks before a row another
+    issuer listed; ties fall back to the smallest CIK. The sort is total, so
+    the choice is deterministic.
+    """
+    return frame.with_columns(
+        (pl.col("accession").str.slice(0, 10) != pl.col("cik")).alias("_borrowed")
+    ).sort("accession", "_borrowed", "cik")
+
+
+def _deduplicate_filings(
+    filings: pl.DataFrame, events_8k: pl.DataFrame
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Resolve accessions the submissions API lists under several issuers.
+
+    SEC lists some filings (ownership schedules, Forms 3 and 4) in the
+    submissions history of every CIK involved, and a filing agent's CIK can
+    prefix the accession, so the same accession can arrive from more than one
+    issuer. The frozen contract keys ``raw.filings`` by accession alone, so the
+    repeats are resolved here, before validation: the filer's own row wins,
+    otherwise the smallest CIK. ``raw.events_8k`` is deduplicated on
+    ``(accession, item_code)`` with the same rule. Both frames keep every
+    column and their input rows otherwise untouched.
+    """
+    filings = _cross_issuer_rank(filings).unique(
+        subset="accession", keep="first", maintain_order=True
+    )
+    events_8k = _cross_issuer_rank(events_8k).unique(
+        subset=["accession", "item_code"], keep="first", maintain_order=True
+    )
+    return filings.drop("_borrowed"), events_8k.drop("_borrowed")
+
+
 def _run_dbt(db_path: Path, target_path: Path) -> dbtRunnerResult:
     """Run ``dbt build --target build`` against ``db_path`` and return the result.
 
@@ -348,7 +387,8 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     with a cached submissions document, in ascending order, is ingested with
     :func:`edgarpit.ingest.submissions.ingest_filings` (item labels from
     ``config/8k_items.yaml``) and :func:`edgarpit.ingest.companyfacts.ingest_facts`;
-    the frames are concatenated, validated and loaded into
+    the frames are concatenated, cross-issuer repeats of one accession are
+    resolved (see :func:`_deduplicate_filings`), validated and loaded into
     ``<out_dir>/edgarpit.duckdb`` together with the reference tables, the
     connection is closed, and dbt runs ``build --target build`` on the project
     in ``transform/`` with ``EDGARPIT_DB`` pointing at the database. dbt
@@ -376,12 +416,23 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
         filings_frames.append(filings)
         events_frames.append(events_8k)
         facts_frames.append(ingest_facts(raw, cik))
+    filings = pl.concat(filings_frames)
+    events_8k = pl.concat(events_frames)
+    deduplicated_filings, deduplicated_events = _deduplicate_filings(filings, events_8k)
+    dropped_filings = filings.height - deduplicated_filings.height
+    dropped_events = events_8k.height - deduplicated_events.height
+    if dropped_filings or dropped_events:
+        LOGGER.warning(
+            "resolved %d cross-issuer duplicate filing rows and %d event rows",
+            dropped_filings,
+            dropped_events,
+        )
     con = duckdb.connect(str(db_path))
     try:
         load_tables(
             con,
-            filings=pl.concat(filings_frames),
-            events_8k=pl.concat(events_frames),
+            filings=deduplicated_filings,
+            events_8k=deduplicated_events,
             facts_raw=pl.concat(facts_frames),
         )
         load_reference_tables(con)
