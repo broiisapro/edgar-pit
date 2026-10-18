@@ -200,11 +200,20 @@ def _print_fetch(report: FetchReport, out: Path) -> None:
     for line in report.errors:
         typer.echo(f"error: {line}", err=True)
     typer.echo(
-        f"fetched {len(report.issuers)} issuers in {report.elapsed_seconds:.1f}s: "
-        f"{report.requests} requests, "
-        f"{sum(row.headers_fetched for row in report.issuers)} headers fetched, "
-        f"{sum(row.headers_cached for row in report.issuers)} already cached, "
-        f"{sum(row.headers_not_found for row in report.issuers)} not found"
+        f"{'issuer':<8} {'cik':<10} {'status':<6} {'requests':>8} "
+        f"{'headers':>7} {'cached':>6} {'404':>4}"
+    )
+    for row in report.issuers:
+        typer.echo(
+            f"{row.ticker:<8} {row.cik or '-':<10} "
+            f"{'failed' if row.errors else 'ok':<6} {row.requests:>8} "
+            f"{row.headers_fetched:>7} {row.headers_cached:>6} {row.headers_not_found:>4}"
+        )
+    typer.echo(
+        f"summary: {report.issuers_ok} issuers ok, {report.issuers_failed} failed; "
+        f"{report.requests} requests; {report.elapsed_seconds:.1f}s; "
+        f"headers {report.headers_fetched} fetched, {report.headers_cached} cached, "
+        f"{report.headers_not_found} not found"
     )
     typer.echo(f"raw cache: {out}")
 

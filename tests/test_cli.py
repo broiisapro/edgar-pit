@@ -365,17 +365,27 @@ class _StubClient:
 
 def stub_fetch(*args: object, **kwargs: object) -> FetchReport:
     report = FetchReport(elapsed_seconds=0.5)
-    for ticker, cik in (("RY", "0001000275"), ("AAPL", "0000320193")):
-        report.issuers.append(
-            IssuerFetchReport(
-                cik=cik,
-                ticker=ticker,
-                submissions=1,
-                companyfacts=1,
-                headers_fetched=2,
-                requests=4,
-            )
+    report.issuers.append(
+        IssuerFetchReport(
+            cik="0001000275",
+            ticker="RY",
+            submissions=1,
+            companyfacts=1,
+            headers_fetched=2,
+            requests=4,
         )
+    )
+    report.issuers.append(
+        IssuerFetchReport(
+            cik="0000320193",
+            ticker="AAPL",
+            submissions=1,
+            companyfacts=1,
+            headers_fetched=2,
+            headers_404=["0000320193-24-000001"],
+            requests=5,
+        )
+    )
     return report
 
 
@@ -393,7 +403,12 @@ def test_fetch_with_a_monkeypatched_fetch_function(
     monkeypatch.setattr("edgarpit.cli.fetch_universe", stub_fetch)
     result = RUNNER.invoke(app, ["fetch", "--universe", str(path), "--out", str(tmp_path / "raw")])
     assert result.exit_code == 0, result.output
-    assert "fetched 2 issuers in 0.5s: 8 requests, 4 headers fetched" in result.stdout
+    assert "RY" in result.stdout and "0001000275" in result.stdout
+    assert "AAPL" in result.stdout and "0000320193" in result.stdout
+    assert (
+        "summary: 2 issuers ok, 0 failed; 9 requests; 0.5s; "
+        "headers 4 fetched, 0 cached, 1 not found" in result.stdout
+    )
     assert f"raw cache: {tmp_path / 'raw'}" in result.stdout
 
 
@@ -410,6 +425,9 @@ def test_fetch_with_errors_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     result = RUNNER.invoke(app, ["fetch", "--universe", str(path), "--out", str(tmp_path / "raw")])
     assert result.exit_code == 1
     assert "error: 0001000275: HTTP 503" in result.stderr
+    assert "summary: 0 issuers ok, 1 failed" in result.stdout
+    row = next(line for line in result.stdout.splitlines() if line.startswith("RY"))
+    assert "0001000275" in row and "failed" in row
 
 
 def test_build_calls_build_from_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
