@@ -268,12 +268,19 @@ def test_ry_fy2023_revenue_versions_and_restatement(staging_build: DbtBuild) -> 
     assert second[13] == "revision"
 
 
-def test_shop_fy2022_revenue_repeat_is_not_a_restatement(staging_build: DbtBuild) -> None:
+def test_shop_fy2022_revenue_selects_the_preferred_total(staging_build: DbtBuild) -> None:
+    """The refreshed companyfacts expose ``Revenues`` for Shopify FY2022.
+
+    The FY2024 10-K carries Shopify's total revenue for FY2022
+    (5,600,000,000) alongside the older contract-revenue rows, so the
+    lowest-rank rule (decision A-18) selects ``Revenues`` and the period has
+    a single version.
+    """
     rows = query(
         staging_build.db,
         """
         select version, value, is_restatement, pct_change_vs_first, accession, period_type,
-               restatement_kind
+               restatement_kind, source_concept
         from main.fundamentals_pit
         where cik = ? and field = 'revenue'
           and period_start = date '2022-01-01' and period_end = date '2022-12-31'
@@ -282,13 +289,18 @@ def test_shop_fy2022_revenue_repeat_is_not_a_restatement(staging_build: DbtBuild
         [SHOP_CIK],
     )
 
-    assert len(rows) == 2
-    assert rows[0][0:4] == (1, 5_599_864_000.0, False, 0.0)
-    assert rows[1][0:3] == (2, 5_600_000_000.0, False)
-    assert rows[1][3] == pytest.approx(136_000.0 / 5_599_864_000.0)
-    assert rows[1][4] == "0001594805-24-000007"
-    assert {row[5] for row in rows} == {"FY"}
-    assert [row[6] for row in rows] == ["none", "none"]
+    assert rows == [
+        (
+            1,
+            5_600_000_000.0,
+            False,
+            0.0,
+            "0001594805-25-000012",
+            "FY",
+            "none",
+            "Revenues",
+        )
+    ]
 
 
 def test_apple_fy2019_eps_split_adjustment(synthetic_build: DbtBuild) -> None:
@@ -489,7 +501,7 @@ def test_stg_facts_removes_exact_duplicates(synthetic_build: DbtBuild) -> None:
         """,
     )
 
-    assert counts == [(151, 152)]
+    assert counts == [(150, 151)]
 
 
 def test_mixed_currency_inputs_produce_no_ratio_row(synthetic_build: DbtBuild) -> None:
