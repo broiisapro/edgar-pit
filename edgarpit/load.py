@@ -12,6 +12,11 @@ insert leaves the previously loaded tables untouched.
 ingest every cached issuer, load the frames and the reference tables, then run
 the dbt project with ``dbt build``. ``python -m edgarpit.load --raw DIR --out
 DIR`` does the same and prints the loaded row counts and the dbt summary.
+A successful build also writes ``<out_dir>/build-info.json`` next to the
+database: the package version, the raw cache path, per-CIK document counts and
+the min/max ``fetched_at`` from the raw manifest, the row count of every
+contract table and the dbt node summary. ``edgarpit export`` reads the fetch
+range from that file, so a built database carries its provenance.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import duckdb
 import polars as pl
 from polars.datatypes import DataType, DataTypeClass
 
+from edgarpit import __version__
 from edgarpit.concepts import (
     DEFAULT_CONCEPT_MAP_PATH,
     ConceptMap,
@@ -44,8 +50,23 @@ if TYPE_CHECKING:
     from dbt.cli.main import dbtRunnerResult
 
 DB_NAME = "edgarpit.duckdb"
+BUILD_INFO_NAME = "build-info.json"
 DBT_TARGET_DIRNAME = "dbt-target"
 TRANSFORM_DIR = Path(__file__).resolve().parents[1] / "transform"
+
+# Tables counted into build-info.json, in report order: the staging tables and
+# reference tables first, then the dbt models.
+BUILD_INFO_TABLES: tuple[str, ...] = (
+    "raw.filings",
+    "raw.events_8k",
+    "raw.facts_raw",
+    "raw.concept_map",
+    "raw.universe",
+    "main.fundamentals_pit",
+    "main.ratios_pit",
+    "main.events_8k",
+    "main.filings",
+)
 
 DEFAULT_UNIVERSE_CSV = Path(__file__).resolve().parents[1] / "config" / "universe.csv"
 
@@ -260,6 +281,67 @@ def _run_dbt(db_path: Path, target_path: Path) -> dbtRunnerResult:
             os.environ["EDGARPIT_DB"] = previous
 
 
+def _manifest_documents(raw: RawCache) -> dict[str, dict[str, int]]:
+    """Per-CIK document counts by endpoint from the raw cache manifest.
+
+    Every manifest row is one stored document, so a re-fetched submissions
+    document counts twice (versioning is the cache's job). Rows without a CIK
+    (the global ``company_tickers`` document) are not per-issuer and are
+    skipped. The result is ordered by CIK and endpoint, so the written file is
+    stable across builds over the same cache.
+    """
+    documents: dict[str, dict[str, int]] = {}
+    for row in raw.manifest_rows():
+        cik = row.get("cik")
+        endpoint = row.get("endpoint")
+        if not isinstance(cik, str) or not cik or not isinstance(endpoint, str):
+            continue
+        counts = documents.setdefault(cik, {})
+        counts[endpoint] = counts.get(endpoint, 0) + 1
+    return {cik: dict(sorted(counts.items())) for cik, counts in sorted(documents.items())}
+
+
+def _manifest_fetch_range(raw: RawCache) -> dict[str, str] | None:
+    """The min and max ``fetched_at`` stamps in the raw manifest, or ``None``."""
+    stamps = [
+        row["fetched_at"] for row in raw.manifest_rows() if isinstance(row.get("fetched_at"), str)
+    ]
+    if not stamps:
+        return None
+    return {"min": min(stamps), "max": max(stamps)}
+
+
+def _table_counts(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Row count of every table in :data:`BUILD_INFO_TABLES`, in that order."""
+    counts: dict[str, int] = {}
+    for table in BUILD_INFO_TABLES:
+        row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
+        assert row is not None
+        counts[table] = int(row[0])
+    return counts
+
+
+def _write_build_info(out_dir: Path, raw: RawCache, counts: dict[str, int], dbt: str) -> Path:
+    """Write ``<out_dir>/build-info.json`` and return its path.
+
+    The document records the package version, the raw cache path, per-CIK
+    document counts, the raw manifest's ``fetched_at`` range, the contract
+    table row counts and the dbt node summary. It carries no wall-clock time:
+    the only timestamps are the cache's own fetch stamps.
+    """
+    document: dict[str, object] = {
+        "package_version": __version__,
+        "raw_cache": str(raw.root.resolve()),
+        "documents": _manifest_documents(raw),
+        "sec_fetch_range": _manifest_fetch_range(raw),
+        "tables": counts,
+        "dbt": dbt,
+    }
+    path = out_dir / BUILD_INFO_NAME
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return path
+
+
 def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     """Build the database from a raw cache directory.
 
@@ -272,7 +354,11 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     ``<out_dir>/edgarpit.duckdb`` together with the reference tables, the
     connection is closed, and dbt runs ``build --target build`` on the project
     in ``transform/`` with ``EDGARPIT_DB`` pointing at the database. dbt
-    artifacts go to ``<out_dir>/dbt-target``.
+    artifacts go to ``<out_dir>/dbt-target``. After a successful dbt run,
+    ``<out_dir>/build-info.json`` is written next to the database with the
+    package version, the raw cache path, per-CIK document counts, the raw
+    manifest's ``fetched_at`` range, the contract table row counts and the dbt
+    node summary.
 
     Returns the database path. Raises the ingest, Pandera, DuckDB or dbt error
     unchanged, and :class:`RuntimeError` when dbt reports a failed node, so a
@@ -307,6 +393,12 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     if not result.success:
         failed = result.exception if result.exception is not None else "dbt reported failed nodes"
         raise RuntimeError(f"dbt build failed for {db_path}: {failed}")
+    con = duckdb.connect(str(db_path))
+    try:
+        counts = _table_counts(con)
+    finally:
+        con.close()
+    _write_build_info(out, raw, counts, _dbt_summary(out / DBT_TARGET_DIRNAME))
     return db_path
 
 
