@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -351,11 +352,20 @@ def run_app() -> AppTest:
     return at
 
 
+def release_url(server: ReleaseServer, name: str = "edgarpit.duckdb") -> str:
+    """Return a URL no earlier test run could have cached.
+
+    The query string makes the explorer's cache key unique per run; the test
+    server ignores it when resolving the file.
+    """
+    return f"{server.base}/{name}?run={uuid.uuid4().hex}"
+
+
 def test_released_database_is_downloaded_rendered_and_cached(
     released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(released_database))
 
     at = run_app()
     assert not at.exception
@@ -379,7 +389,7 @@ def test_local_database_wins_over_the_release_url(
     db_path: Path, released_database: ReleaseServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(db_path))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(released_database))
 
     at = run_app()
 
@@ -412,7 +422,7 @@ def test_checksum_mismatch_shows_an_error_page(
     released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(released_database))
     monkeypatch.setenv("EDGARPIT_DB_SHA256", "0" * 64)
 
     at = run_app()
@@ -442,7 +452,7 @@ def test_malformed_checksum_is_rejected_before_downloading(
     released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(released_database))
     monkeypatch.setenv("EDGARPIT_DB_SHA256", "not-a-digest")
 
     at = run_app()
@@ -457,7 +467,7 @@ def test_oversized_download_is_rejected(
     release_server: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{release_server.base}/huge.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(release_server, "huge.duckdb"))
 
     at = run_app()
 
@@ -472,7 +482,7 @@ def test_a_body_that_is_not_a_database_shows_an_error_page(
 ) -> None:
     (released_database.root / "broken.duckdb").write_text("<html>not a database</html>")
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/broken.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", release_url(released_database, "broken.duckdb"))
 
     at = run_app()
 
