@@ -11,7 +11,7 @@ Epic 02 made the pipeline correct and ran it end to end; Epic 03 makes the proje
 - the Epic 02 live run is finished and recorded, including the pre-2001 SGML headers that blocked the first build (#87, #70, #88);
 - the release contents, the deployment steps and the remaining limitations are written down in this document (#83).
 
-Everything below describes the merged code. The steps the owner runs after merge — making the repository public, publishing the `v1.0.0` release, deploying the explorer, filling the two README placeholders — are listed as steps in "What the owner runs after merge", not claimed as done.
+Everything below describes the merged code. The README links the `v1.0.0` release page and the hosted explorer at `https://edgar-pit.streamlit.app`; the links resolve once the owner makes the repository public, publishes the release and deploys the explorer, which are the steps listed in "What the owner runs after merge" and not claimed as done here.
 
 ## How it works
 
@@ -62,7 +62,7 @@ For the hosted explorer the release also carries the database itself (`edgarpit.
 
 ### README (issue #82)
 
-`README.md` follows the order a quant researcher, a data-team hiring manager and a finance professor need: the PRD §15 opening paragraph, the chart with a two-sentence caption, five lines on acceptance time vs period end vs filing date plus the submissions-JSON caveat, the offline quick start with pasted output and the recording, live data with the measured numbers and fair-access behaviour, the five interfaces (Python, DuckDB SQL, REST, explorer, Parquet release) each with a command that was run, the data-model table, coverage and limitations including two real QA-reported gaps, how it is tested (classic-bug tests by name, property test, end-to-end module, CI, export determinism), and the MIT licence with the SEC credit. `<explorer-url>` and `<release-url>` are the two placeholders the owner fills at release.
+`README.md` follows the order a quant researcher, a data-team hiring manager and a finance professor need: the PRD §15 opening paragraph, the chart with a two-sentence caption, five lines on acceptance time vs period end vs filing date plus the submissions-JSON caveat, the offline quick start with pasted output and the recording, live data with the measured numbers and fair-access behaviour, the five interfaces (Python, DuckDB SQL, REST, explorer, Parquet release) each with a command that was run, the data-model table, coverage and limitations including two real QA-reported gaps, how it is tested (classic-bug tests by name, property test, end-to-end module, CI, export determinism), and the MIT licence with the SEC credit. The release link points at the `v1.0.0` tag and the explorer link at `https://edgar-pit.streamlit.app`; both are set, so no placeholder is left for the owner to fill.
 
 ## Key decisions and reasoning
 
@@ -86,18 +86,19 @@ For the hosted explorer the release also carries the database itself (`edgarpit.
 
 ## What the owner runs after merge
 
+The README already links the release and the explorer, so no placeholder needs filling; these steps make the links resolve.
+
 1. **Make the repository public.** Confirm the self-hosted runner is stopped and deregistered first; hosted CI is already in place.
 2. **Publish the `v1.0.0` release.** Build the live database, run `edgarpit export --db ./build/edgarpit.duckdb --out ./release`, then attach `edgarpit.duckdb`, `manifest.json` and the five Parquet files to a GitHub release tagged `v1.0.0`.
-3. **Deploy the explorer.** Compute `shasum -a 256 edgarpit.duckdb`, create the app on `share.streamlit.io` for repository `broiisapro/edgar-pit`, branch `main`, main file `explorer/app.py`, Python 3.12, and set the secrets `EDGARPIT_DB_URL` (the release asset URL) and `EDGARPIT_DB_SHA256` (the digest). Cloud installs from `uv.lock`.
-4. **Fill the two README placeholders.** Replace `<explorer-url>` and `<release-url>` with the deployed app URL and the release URL.
-5. **Tag the epic.** Annotated tag `epic-03-complete` after verification (decision G-4).
+3. **Deploy the explorer.** Compute `shasum -a 256 edgarpit.duckdb`, create the app on `share.streamlit.io` for repository `broiisapro/edgar-pit`, branch `main`, main file `explorer/app.py`, Python 3.12, and set the secrets `EDGARPIT_DB_URL` (the release asset URL) and `EDGARPIT_DB_SHA256` (the digest), then deploy it at `https://edgar-pit.streamlit.app`. Cloud installs from `uv.lock`.
+4. **Tag the epic.** Annotated tag `epic-03-complete` after verification (decision G-4).
 
 ## Deviations from the plan
 
 - **The README's live numbers are quoted from PR #79, not re-measured while writing it.** The 40-issuer fetch takes ~43 minutes and was already run and merged; the document says when it was measured.
 - **The recording is rendered by `agg`, which is installed locally, not a project dependency.** The tool documents the `brew install agg` step and fails with a clear message when the binary is missing.
 - **The README's DuckDB SQL example uses the DuckDB CLI.** The project does not install the CLI; the example names the command a reader runs after installing it.
-- **The explorer is not deployed and the release does not exist at merge time.** Both are owner steps above; the README says `<explorer-url>` and `<release-url>` rather than a URL that would 404.
+- **The explorer is not deployed and the release does not exist at merge time.** Both are owner steps above; the README links `https://github.com/broiisapro/edgar-pit/releases/tag/v1.0.0` and `https://edgar-pit.streamlit.app`, which start resolving when the owner publishes the release and deploys the app.
 - **The repository is still private when this epic merges.** Everything is written for a public audience, but the visibility change is an owner action after the checks above.
 
 ## Known limitations and deferred items
