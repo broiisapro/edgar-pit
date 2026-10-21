@@ -1,4 +1,4 @@
-# Orchestration and agent worktrees: never committed
+# Local tooling and scratch checkouts: never committed
 .orchestration/
 .worktrees/
 

@@ -102,7 +102,7 @@ curl -fsS "localhost:8000/asof?ticker=RY&field=revenue&asof=2024-01-15T00:00:00Z
 EDGARPIT_DB=/tmp/ep/edgarpit.duckdb uv run streamlit run explorer/app.py
 ```
 
-Pick an issuer and a field to see every version on a timeline, move the as-of slider and watch later versions grey out, and browse 8-K items with links to the filing index pages. A hosted copy of the same app runs at `<explorer-url>`.
+Pick an issuer and a field to see every version on a timeline, move the as-of slider and watch later versions grey out, and browse 8-K items with links to the filing index pages. A hosted copy of the same app runs at [edgar-pit.streamlit.app](https://edgar-pit.streamlit.app).
 
 ### Parquet release
 
@@ -110,7 +110,7 @@ Pick an issuer and a field to see every version on a timeline, move the as-of sl
 uv run edgarpit export --db /tmp/ep/edgarpit.duckdb --out /tmp/ep/release
 ```
 
-`export` writes `fundamentals_pit.parquet`, `ratios_pit.parquet`, `events_8k.parquet`, `filings.parquet`, `facts_raw.parquet` and a `manifest.json` with row counts, SHA-256 per file and the SEC fetch range. The Phase 1 release is attached at `<release-url>`.
+`export` writes `fundamentals_pit.parquet`, `ratios_pit.parquet`, `events_8k.parquet`, `filings.parquet`, `facts_raw.parquet` and a `manifest.json` with row counts, SHA-256 per file and the SEC fetch range. The Phase 1 release is attached at [v1.0.0](https://github.com/broiisapro/edgar-pit/releases/tag/v1.0.0). The same release carries `edgarpit.duckdb`, the full database: point the explorer at it with `EDGARPIT_DB=/path/to/edgarpit.duckdb`, or pass `db="/path/to/edgarpit.duckdb"` to `asof`.
 
 ## Data model
 
@@ -137,7 +137,7 @@ Full column contracts, the staging schema and the query semantics are in [`docs/
 
 - Classic point-in-time bugs have named tests that fail when the rule breaks: `tests/test_query_asof.py::test_restatement_accepted_after_asof_is_not_returned`, `tests/test_query_asof.py::test_period_end_before_asof_but_filed_after_is_excluded`, `tests/test_query_asof.py::test_property_no_row_after_asof` (Hypothesis, random as-of timestamps), `tests/test_ratios.py::test_mixed_currency_ratio_is_rejected`, `tests/test_companyfacts.py::test_ifrs_and_usgaap_map_to_same_canonical_field`, and the dbt test `transform/tests/assert_ratio_inputs_not_from_future.sql`.
 - The end-to-end module drives the installed CLI through `subprocess` over the fixture cache and pins the RY restatement boundary, the `qa` exit codes, the API and the explorer.
-- CI runs `lint`, `types`, `tests` and `dbt` on every pull request. Tests never touch the network: HTTP is mocked with `respx`, and live checks are marked `network` and excluded. The suite is 462 tests; the two `network` tests are deselected by default.
+- CI runs `lint`, `types`, `tests` and `dbt` on every pull request. Tests never touch the network: HTTP is mocked with `respx`, and live checks are marked `network` and excluded. The suite is 463 tests; the two `network` tests are deselected by default.
 - Two independent builds of the same fixtures produce byte-identical Parquet files and manifests that are equal after removing `build_timestamp`.
 
 ## Licence and data
