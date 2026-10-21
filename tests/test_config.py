@@ -11,7 +11,7 @@ from edgarpit.config import ConfigError, Settings, validate_user_agent
 
 VALID_USER_AGENTS = [
     "Jane Doe jane@example.com",
-    "Moksh Siruvani moksh.siruvani@gmail.com",
+    "Jane Doe jane.doe@example.com",
     "Acme Research ops@acme.co.uk",
     "a b c@d.io",
 ]
