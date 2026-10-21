@@ -4,6 +4,9 @@
 
 # Secrets
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -18,8 +21,8 @@ dist/
 build/
 
 # Data and build outputs (fixtures under tests/fixtures/ are committed)
-/data/
-/release/
+data/
+release/
 *.duckdb
 *.duckdb.wal
 
