@@ -8,6 +8,13 @@ The conversion to UTC is DST-aware (decision A-22): an ambiguous wall time (the
 repeated hour when DST ends, 01:00-02:00) resolves to the later UTC instant so
 the result is never earlier than the truth, and a wall time in the skipped hour
 when DST starts raises ``ValueError``.
+
+EDGAR headers of filings from before about 2001 carry no acceptance time.
+:func:`parse_header` reports exactly that case as
+:class:`MissingAcceptanceTime`, a ``ValueError`` whose ``header`` still carries
+the form, period, items and ``<DATE-OF-FILING-DATE-CHANGE>`` floor (decision
+A-26); every other malformation stays a plain ``ValueError`` so a corrupt cache
+fails loudly.
 """
 
 from __future__ import annotations
@@ -48,6 +55,39 @@ class HeaderInfo:
     filing_date: date
     period: date | None
     items: str | None
+
+
+@dataclass(frozen=True)
+class HeaderWithoutAcceptance:
+    """The fields a header still provides when it carries no acceptance time.
+
+    Returned on :class:`MissingAcceptanceTime` for pre-2001 headers (decision
+    A-26). ``filing_date`` is the header's ``<FILING-DATE>``, ``period`` its
+    ``<PERIOD>``, ``items`` its ``<ITEMS>`` codes joined with ``,`` and
+    ``date_of_filing_date_change`` the latest ``<DATE-OF-FILING-DATE-CHANGE>``
+    when the header has one (``None`` otherwise). All dates are New York local
+    calendar dates.
+    """
+
+    accession: str
+    form: str
+    filing_date: date
+    period: date | None
+    items: str | None
+    date_of_filing_date_change: date | None
+
+
+class MissingAcceptanceTime(ValueError):
+    """A header has no ``<ACCEPTANCE-DATETIME>`` value (decision A-26).
+
+    ``header`` carries the fields that are still usable. Ingest does not treat
+    this as corruption: the filing takes the A-23 fallback acceptance time, and
+    the header's items and ``<DATE-OF-FILING-DATE-CHANGE>`` floor are kept.
+    """
+
+    def __init__(self, header: HeaderWithoutAcceptance) -> None:
+        super().__init__(f"SGML header {header.accession} has no <ACCEPTANCE-DATETIME>")
+        self.header = header
 
 
 def _header_tags(text: str) -> dict[str, list[str]]:
@@ -112,17 +152,44 @@ def parse_header(text: str) -> HeaderInfo:
     ``<ITEMS>`` line with ``,`` in file order and is ``None`` when the header
     has none.
 
-    Raises ``ValueError`` naming the tag when a required tag
-    (``<ACCEPTANCE-DATETIME>``, ``<ACCESSION-NUMBER>``, ``<TYPE>``,
-    ``<FILING-DATE>``) is missing or malformed, or when ``<PERIOD>`` is present
-    but malformed.
+    Raises :class:`MissingAcceptanceTime` when ``<ACCEPTANCE-DATETIME>`` is
+    absent or empty (pre-2001 headers, decision A-26); the exception carries
+    the form, filing date, period, items and any
+    ``<ACCEPTANCE-DATETIME>``. Raises plain ``ValueError`` naming the
+    tag when any other required tag (``<ACCESSION-NUMBER>``, ``<TYPE>``,
+    ``<FILING-DATE>``) is missing or malformed, when
+    ``<ACCEPTANCE-DATETIME>`` is malformed, when ``<PERIOD>`` is present but
+    malformed, or when a header without an acceptance time has a malformed
+    ``<DATE-OF-FILING-DATE-CHANGE>``, so a corrupt cache never passes silently.
     """
     tags = _header_tags(text)
     accession = _required(tags, "ACCESSION-NUMBER")
     if not _ACCESSION_RE.fullmatch(accession):
         raise ValueError(f"malformed <ACCESSION-NUMBER>: {accession!r}")
     form = _required(tags, "TYPE")
-    acceptance = _required(tags, "ACCEPTANCE-DATETIME")
+    filing_date = _parse_day("FILING-DATE", _required(tags, "FILING-DATE"))
+    periods = [value for value in tags.get("PERIOD", []) if value]
+    period = _parse_day("PERIOD", periods[0]) if periods else None
+    items = [value for value in tags.get("ITEMS", []) if value]
+    items_text = ",".join(items) if items else None
+    acceptances = [value for value in tags.get("ACCEPTANCE-DATETIME", []) if value]
+    if not acceptances:
+        changes = [
+            _parse_day("DATE-OF-FILING-DATE-CHANGE", value)
+            for value in tags.get("DATE-OF-FILING-DATE-CHANGE", [])
+            if value
+        ]
+        raise MissingAcceptanceTime(
+            HeaderWithoutAcceptance(
+                accession=accession,
+                form=form,
+                filing_date=filing_date,
+                period=period,
+                items=items_text,
+                date_of_filing_date_change=max(changes) if changes else None,
+            )
+        )
+    acceptance = acceptances[0]
     match = _ACCEPTANCE_RE.fullmatch(acceptance)
     if match is None:
         raise ValueError(f"malformed <ACCEPTANCE-DATETIME>: {acceptance!r}")
@@ -137,17 +204,28 @@ def parse_header(text: str) -> HeaderInfo:
         )
     except ValueError as exc:
         raise ValueError(f"malformed <ACCEPTANCE-DATETIME>: {acceptance!r}") from exc
-    filing_date = _parse_day("FILING-DATE", _required(tags, "FILING-DATE"))
-    periods = [value for value in tags.get("PERIOD", []) if value]
-    period = _parse_day("PERIOD", periods[0]) if periods else None
-    items = [value for value in tags.get("ITEMS", []) if value]
     return HeaderInfo(
         accession=accession,
         form=form,
         acceptance_ts=_new_york_to_utc(local),
         filing_date=filing_date,
         period=period,
-        items=",".join(items) if items else None,
+        items=items_text,
+    )
+
+
+def _end_of_day_utc(day: pl.Expr) -> pl.Expr:
+    """Return the UTC instant of 23:59:59 New York on a ``DATE`` expression.
+
+    ``day`` is a Polars expression holding a date. The result is a
+    timezone-aware UTC datetime expression; an ambiguous local end of day (DST
+    ending) resolves to the later instant and a skipped one raises (decision
+    A-22), so the bound is never earlier than the truth.
+    """
+    return (
+        (day.cast(pl.Datetime("us")) + pl.duration(hours=23, minutes=59, seconds=59))
+        .dt.replace_time_zone("America/New_York", ambiguous="latest", non_existent="raise")
+        .dt.convert_time_zone("UTC")
     )
 
 
@@ -177,16 +255,10 @@ def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -
         return_dtype=pl.Datetime("us", "UTC"),
     )
     has_header = header_ts.is_not_null()
-    filing_date_eod = (
-        (
-            pl.col("filing_date").cast(pl.Datetime("us"))
-            + pl.duration(hours=23, minutes=59, seconds=59)
-        )
-        .dt.replace_time_zone("America/New_York", ambiguous="latest", non_existent="raise")
-        .dt.convert_time_zone("UTC")
+    fallback_ts = pl.max_horizontal(
+        _end_of_day_utc(pl.col("filing_date")),
+        pl.col("acceptance_ts_api") + pl.duration(hours=6),
     )
-    api_margin = pl.col("acceptance_ts_api") + pl.duration(hours=6)
-    fallback_ts = pl.max_horizontal(filing_date_eod, api_margin)
     result = filings.with_columns(
         pl.when(has_header).then(header_ts).otherwise(fallback_ts).alias("acceptance_ts"),
         pl.when(has_header)
@@ -194,6 +266,33 @@ def apply_acceptance(filings: pl.DataFrame, headers: Mapping[str, HeaderInfo]) -
         .otherwise(pl.lit("filing_date_eod"))
         .alias("acceptance_ts_source"),
         (~has_header).alias("ts_imputed"),
+    )
+    FilingsSchema.validate(result)
+    return result
+
+
+def apply_acceptance_floors(filings: pl.DataFrame, floors: Mapping[str, date]) -> pl.DataFrame:
+    """Raise imputed acceptance times to their accession's A-26 floor.
+
+    ``filings`` is a frame returned by :func:`apply_acceptance`; ``floors`` maps
+    an accession whose cached header has no ``<ACCEPTANCE-DATETIME>`` to the
+    latest date in its ``<DATE-OF-FILING-DATE-CHANGE>`` (decision A-26). For
+    those accessions, when ``acceptance_ts`` is imputed, it is raised to at
+    least that date's 23:59:59 America/New_York; the existing fallback term is
+    kept when it is later, so this can only move a value later (never earlier
+    than the truth). Rows whose acceptance time came from an SGML header and
+    accessions without a floor are untouched. The result is validated against
+    ``FilingsSchema`` and returned; ``acceptance_ts_api`` is passed through.
+    """
+    if not floors:
+        FilingsSchema.validate(filings)
+        return filings
+    floor_date = pl.col("accession").replace_strict(floors, default=None, return_dtype=pl.Date)
+    result = filings.with_columns(
+        pl.when(pl.col("ts_imputed"))
+        .then(pl.max_horizontal(pl.col("acceptance_ts"), _end_of_day_utc(floor_date)))
+        .otherwise(pl.col("acceptance_ts"))
+        .alias("acceptance_ts")
     )
     FilingsSchema.validate(result)
     return result

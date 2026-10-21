@@ -19,7 +19,9 @@ from hypothesis import strategies as st
 from edgarpit.ingest.headers import (
     NEW_YORK,
     HeaderInfo,
+    MissingAcceptanceTime,
     apply_acceptance,
+    apply_acceptance_floors,
     parse_header,
     required_accessions,
 )
@@ -224,7 +226,6 @@ def test_period_is_optional_and_items_join_in_file_order() -> None:
 VALID_HEADER = header_text("20240101120000")
 
 _BROKEN_HEADERS = [
-    (VALID_HEADER.replace("<ACCEPTANCE-DATETIME>20240101120000\n", ""), "ACCEPTANCE-DATETIME"),
     (VALID_HEADER.replace("<ACCESSION-NUMBER>0000000000-00-000000", ""), "ACCESSION-NUMBER"),
     (VALID_HEADER.replace("<TYPE>8-K", ""), "TYPE"),
     (VALID_HEADER.replace("<FILING-DATE>20240101", ""), "FILING-DATE"),
@@ -237,8 +238,64 @@ _BROKEN_HEADERS = [
 
 @pytest.mark.parametrize(("text", "tag"), _BROKEN_HEADERS)
 def test_missing_or_malformed_tags_raise_naming_the_tag(text: str, tag: str) -> None:
-    with pytest.raises(ValueError, match=f"<{tag}>"):
+    with pytest.raises(ValueError, match=f"<{tag}>") as raised:
         parse_header(text)
+    # Only an absent acceptance time has its own subclass (decision A-26);
+    # every other malformation must stay a plain ValueError so a corrupt cache
+    # fails the build loudly.
+    assert type(raised.value) is ValueError
+
+
+WITHOUT_ACCEPTANCE = VALID_HEADER.replace("<ACCEPTANCE-DATETIME>20240101120000\n", "")
+
+
+def test_missing_acceptance_time_raises_the_specific_error_with_its_fields() -> None:
+    with pytest.raises(MissingAcceptanceTime) as raised:
+        parse_header(WITHOUT_ACCEPTANCE)
+    header = raised.value.header
+    assert header.accession == "0000000000-00-000000"
+    assert header.form == "8-K"
+    assert header.filing_date == date(2024, 1, 1)
+    assert header.period == date(2024, 1, 1)
+    assert header.items is None
+    assert header.date_of_filing_date_change is None
+
+
+def test_empty_acceptance_tag_is_missing_not_malformed() -> None:
+    """Five live 2009 headers carry an empty ``<ACCEPTANCE-DATETIME>``."""
+    with pytest.raises(MissingAcceptanceTime):
+        parse_header(header_text(""))
+
+
+def test_another_malformation_stays_a_plain_value_error_without_an_acceptance() -> None:
+    text = WITHOUT_ACCEPTANCE.replace("<ACCESSION-NUMBER>0000000000-00-000000", "")
+    with pytest.raises(ValueError, match="<ACCESSION-NUMBER>") as raised:
+        parse_header(text)
+    assert type(raised.value) is ValueError
+
+
+def test_missing_acceptance_keeps_items_and_the_date_change_floor() -> None:
+    text = WITHOUT_ACCEPTANCE.replace(
+        "<FILING-DATE>20240101",
+        "<FILING-DATE>20240101\n"
+        "<DATE-OF-FILING-DATE-CHANGE>20240115\n"
+        "<DATE-OF-FILING-DATE-CHANGE>20240110",
+    ).replace("<PERIOD>20240101\n", "<PERIOD>20240101\n<ITEMS>1.01\n<ITEMS>9.01\n")
+    with pytest.raises(MissingAcceptanceTime) as raised:
+        parse_header(text)
+    header = raised.value.header
+    assert header.items == "1.01,9.01"
+    assert header.date_of_filing_date_change == date(2024, 1, 15)
+
+
+def test_missing_acceptance_with_a_malformed_date_change_still_raises_plain() -> None:
+    text = WITHOUT_ACCEPTANCE.replace(
+        "<FILING-DATE>20240101",
+        "<FILING-DATE>20240101\n<DATE-OF-FILING-DATE-CHANGE>2024-01-15",
+    )
+    with pytest.raises(ValueError, match="<DATE-OF-FILING-DATE-CHANGE>") as raised:
+        parse_header(text)
+    assert type(raised.value) is ValueError
 
 
 def test_apply_acceptance_prefers_the_header() -> None:
@@ -298,6 +355,39 @@ def test_apply_acceptance_fallback_keeps_the_end_of_day_when_the_api_is_not_late
     row = apply_acceptance(filings, {}).row(0, named=True)
     assert row["acceptance_ts"] == fallback_bound(filing_date, api)
     assert row["acceptance_ts"] == datetime(2024, 1, 3, 4, 59, 59, tzinfo=UTC)
+
+
+def test_apply_acceptance_floor_raises_the_fallback_to_the_later_date() -> None:
+    """A-26: a re-dated filing is never timed before its DATE-OF-FILING-DATE-CHANGE."""
+    filing_date = date(1996, 12, 13)
+    floor = date(1996, 12, 20)
+    filings = synthetic_filings([("0000000000-00-000001", filing_date)])
+    row = apply_acceptance_floors(
+        apply_acceptance(filings, {}), {"0000000000-00-000001": floor}
+    ).row(0, named=True)
+    assert row["acceptance_ts"] == datetime(1996, 12, 21, 4, 59, 59, tzinfo=UTC)
+    assert row["acceptance_ts_source"] == "filing_date_eod"
+    assert row["ts_imputed"] is True
+
+
+def test_apply_acceptance_floor_never_lowers_the_filing_date_bound() -> None:
+    filing_date = date(2024, 1, 2)
+    filings = synthetic_filings([("0000000000-00-000001", filing_date)])
+    row = apply_acceptance_floors(
+        apply_acceptance(filings, {}), {"0000000000-00-000001": date(2023, 12, 1)}
+    ).row(0, named=True)
+    assert row["acceptance_ts"] == fallback_bound(filing_date, None)
+    assert row["acceptance_ts"] == datetime(2024, 1, 3, 4, 59, 59, tzinfo=UTC)
+
+
+def test_apply_acceptance_floor_leaves_a_header_time_untouched() -> None:
+    filing_date = date(2023, 11, 30)
+    filings = synthetic_filings([(RY_FY2023_40F, filing_date)])
+    accepted = apply_acceptance(filings, {RY_FY2023_40F: header_info(RY_CIK, RY_FY2023_40F)})
+    row = apply_acceptance_floors(accepted, {RY_FY2023_40F: date(2024, 6, 1)}).row(0, named=True)
+    assert row["acceptance_ts"] == datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
+    assert row["acceptance_ts_source"] == "sgml_header"
+    assert row["ts_imputed"] is False
 
 
 # The deadline is off because a single Polars pass can exceed the 200 ms

@@ -65,7 +65,9 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
 - `acceptance_ts` comes from `<ACCEPTANCE-DATETIME>YYYYMMDDHHMMSS` in `https://www.sec.gov/Archives/edgar/data/<cik-int>/<accession-no-dashes>/<accession>.hdr.sgml`, interpreted in `America/New_York` (DST-aware via `zoneinfo`) and converted to UTC.
 - Headers are fetched for every accession referenced by a `us-gaap`/`ifrs-full` fact and every 8-K/8-K/A, under the same rate limiter and User-Agent; they are immutable, so a cached header is never re-fetched.
 - `acceptance_ts_api` keeps the API value for QA comparison only.
-- Fallback when no header exists: `filing_date` 23:59:59 America/New_York → UTC, `acceptance_ts_source='filing_date_eod'`, `ts_imputed=true` (an upper bound on the true time, so never lookahead).
+- Fallback when no header yields an acceptance time: `greatest(filing_date 23:59:59 America/New_York, acceptance_ts_api + 6 h)`, the API term only when present, with `acceptance_ts_source='filing_date_eod'` and `ts_imputed=true` (decision A-23). The six-hour margin covers the submissions API's observed four- to five-hour shift in either direction, so paper filings (which EDGAR may date a week before acceptance) are never timed before their true acceptance and cannot leak a value early.
+- Pre-2001 headers carry no `<ACCEPTANCE-DATETIME>` (decision A-26): `parse_header` raises `MissingAcceptanceTime` only for that case, ingest uses the fallback above raised to at least `<DATE-OF-FILING-DATE-CHANGE>` 23:59:59 America/New_York when the header has one, and the header's `<ITEMS>` still feed the 8-K events. Any other malformed header fails the build.
+- A cached header whose accession has no submissions row becomes a `raw.filings` row built from the header (`source='header'`, `acceptance_ts_source='sgml_header'`, decision A-24).
 
 ## 5. Raw cache
 
@@ -100,7 +102,7 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
 | items | VARCHAR NULL | raw comma-separated 8-K items |
 | is_amendment | BOOLEAN | form ends with `/A` |
 | is_xbrl | BOOLEAN | |
-| source | VARCHAR | `recent` or the page file name |
+| source | VARCHAR | `recent`, a page file name, or `header` (a row built from a cached header, decision A-24) |
 
 ### `raw.events_8k` — one row per (8-K or 8-K/A, item)
 | column | type |

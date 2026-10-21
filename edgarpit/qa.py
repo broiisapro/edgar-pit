@@ -12,6 +12,10 @@ returns a :class:`QaReport`:
   audit list, which excludes split adjustments);
 - imputed acceptance timestamps by source and header-vs-API disagreements over
   60 s (count and worst ten);
+- header-required filings (a ``us-gaap``/``ifrs-full`` fact carrier or a
+  ``8-K``/``8-K/A``) whose acceptance time had to be imputed, counted per
+  issuer: the cached headers that carry no ``<ACCEPTANCE-DATETIME>`` (decision
+  A-26) plus any required header the fetch stage could not retrieve;
 - 8-K events accepted before the 2004 item-code change, counted per issuer (the
   pre-2004 item codes are not reliable metadata);
 - filings by ``source`` (``recent``, page file names, ``header``) and by
@@ -141,6 +145,22 @@ class LegacyEventCount:
 
 
 @dataclass(frozen=True)
+class HeaderWithoutAcceptanceTime:
+    """Header-required filings one issuer timed with the A-23 fallback.
+
+    A header-required filing carries a ``us-gaap``/``ifrs-full`` fact or is an
+    ``8-K``/``8-K/A``, so the fetch stage retrieved its SGML header. A count
+    here means the header yielded no acceptance time (pre-2001 headers, decision
+    A-26) or was never retrieved, and the build used the conservative
+    ``filing_date_eod`` bound instead.
+    """
+
+    cik: str
+    ticker: str | None
+    count: int
+
+
+@dataclass(frozen=True)
 class FilingCount:
     """How many ``raw.filings`` rows carry one value of a column."""
 
@@ -224,6 +244,7 @@ class QaReport:
     imputed_by_source: dict[str, int] = field(default_factory=dict)
     disagreement_count: int = 0
     disagreements: list[AcceptanceDisagreement] = field(default_factory=list)
+    headers_without_acceptance: list[HeaderWithoutAcceptanceTime] = field(default_factory=list)
     legacy_events: list[LegacyEventCount] = field(default_factory=list)
     filings_by_source: list[FilingCount] = field(default_factory=list)
     filings_by_acceptance_source: list[FilingCount] = field(default_factory=list)
@@ -388,6 +409,46 @@ def _timestamps(
         ).fetchall()
     ]
     return imputed, disagreement_count, worst
+
+
+def _headers_without_acceptance(
+    con: duckdb.DuckDBPyConnection,
+) -> list[HeaderWithoutAcceptanceTime]:
+    """Header-required filings per issuer whose acceptance time was imputed.
+
+    A filing needs a header when it carries a ``us-gaap``/``ifrs-full`` fact or
+    is an ``8-K``/``8-K/A`` (decision A-1); the fetch stage retrieves exactly
+    those headers. Counting the imputed rows of that set gives the headers that
+    produced no acceptance time (pre-2001 headers without
+    ``<ACCEPTANCE-DATETIME>``, decision A-26), plus a required header that
+    could not be retrieved. Rows are ordered by CIK.
+    """
+    return [
+        HeaderWithoutAcceptanceTime(cik=row[0], ticker=row[1], count=int(row[2]))
+        for row in con.execute(
+            """
+            WITH header_required AS (
+                SELECT DISTINCT accession
+                FROM raw.facts_raw
+                WHERE taxonomy IN ('us-gaap', 'ifrs-full')
+                UNION
+                SELECT accession
+                FROM raw.filings
+                WHERE form IN ('8-K', '8-K/A')
+            ), imputed AS (
+                SELECT filings.cik, count(*) AS count
+                FROM raw.filings AS filings
+                JOIN header_required ON header_required.accession = filings.accession
+                WHERE filings.acceptance_ts_source = 'filing_date_eod'
+                GROUP BY filings.cik
+            )
+            SELECT imputed.cik, universe.ticker, imputed.count
+            FROM imputed
+            LEFT JOIN raw.universe AS universe ON universe.cik = imputed.cik
+            ORDER BY imputed.cik
+            """
+        ).fetchall()
+    ]
 
 
 def _legacy_events(con: duckdb.DuckDBPyConnection) -> list[LegacyEventCount]:
@@ -691,6 +752,7 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
     ]
     restatement_counts, top_restatements = _restatements(con)
     imputed, disagreement_count, disagreements = _timestamps(con)
+    headers_without_acceptance = _headers_without_acceptance(con)
     multi_currency, unexpected_units = _unit_anomalies(con)
     ratio_gap_counts, ratio_gaps = _ratio_gaps(con)
     return QaReport(
@@ -703,6 +765,7 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
         imputed_by_source=imputed,
         disagreement_count=disagreement_count,
         disagreements=disagreements,
+        headers_without_acceptance=headers_without_acceptance,
         legacy_events=_legacy_events(con),
         filings_by_source=_filings_by(con, "source"),
         filings_by_acceptance_source=_filings_by(con, "acceptance_ts_source"),

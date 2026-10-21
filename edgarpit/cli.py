@@ -30,7 +30,7 @@ import typer
 from edgarpit.config import ConfigError, Settings
 from edgarpit.export import export_release
 from edgarpit.fetch import FetchReport, fetch_universe
-from edgarpit.load import BUILD_INFO_NAME, build_from_raw
+from edgarpit.load import BUILD_INFO_NAME, BUILD_INFO_TABLES, build_from_raw
 from edgarpit.qa import QaReport, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
@@ -83,6 +83,7 @@ def _asof_payload(row: AsOfResult, *, asof_ts: str, period: str) -> dict[str, An
         "acceptance_ts": _iso_ts(row.acceptance_ts),
         "version": row.version,
         "is_restatement": row.is_restatement,
+        "restatement_kind": row.restatement_kind,
         "ts_imputed": row.ts_imputed,
     }
 
@@ -232,7 +233,10 @@ def build(
     """Build ``<out>/edgarpit.duckdb`` from a raw cache: ingest, load, then dbt.
 
     ``--offline --fixtures DIR`` and ``--data DIR`` identify the raw cache; both
-    run the same local pipeline (no network is used either way).
+    run the same local pipeline (no network is used either way). After a
+    successful build the row count of every contract table and the dbt node
+    summary are printed from the ``build-info.json`` the build wrote, then the
+    database path.
     """
     if offline and data is not None:
         raise typer.BadParameter("--offline and --data are mutually exclusive")
@@ -246,9 +250,34 @@ def build(
         raise typer.BadParameter("specify --offline --fixtures DIR or --data DIR")
     try:
         db = build_from_raw(raw_dir, out)
+        _print_build_summary(db)
     except Exception as error:  # the CLI boundary turns any build failure into exit 1
         _fail(f"{type(error).__name__}: {error}")
     typer.echo(f"database: {db}")
+
+
+def _print_build_summary(db: Path) -> None:
+    """Print the table row counts and dbt summary recorded next to ``db``.
+
+    ``db`` is the database path returned by
+    :func:`edgarpit.load.build_from_raw`; its sibling ``build-info.json`` holds
+    the counts of :data:`edgarpit.load.BUILD_INFO_TABLES` and the dbt node
+    summary. Raises ``RuntimeError`` when that file is missing or malformed,
+    because a finished build must carry its provenance record.
+    """
+    info_path = Path(db).parent / BUILD_INFO_NAME
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read build info {info_path}: {error}") from error
+    tables = info.get("tables")
+    if not isinstance(tables, dict):
+        raise RuntimeError(f"build info {info_path} has no table counts")
+    for table in BUILD_INFO_TABLES:
+        typer.echo(f"{table}: {int(tables[table])} rows")
+    dbt = info.get("dbt")
+    if isinstance(dbt, str):
+        typer.echo(f"dbt build: {dbt}")
 
 
 @app.command()
@@ -272,7 +301,7 @@ def asof(
     value, currency, unit, period_start, period_end, accession and
     acceptance_ts; ``--json`` prints an array with those keys plus the rest of
     the result (ticker, period_type, form, version, is_restatement,
-    ts_imputed) and the echoed ``asof``/``period`` arguments.
+    restatement_kind, ts_imputed) and the echoed ``asof``/``period`` arguments.
     """
     if (cik is None) == (ticker is None):
         raise typer.BadParameter("exactly one of --cik or --ticker is required")
@@ -363,6 +392,13 @@ def _print_qa(report: QaReport) -> None:
             f"{_iso_ts(disagreement.acceptance_ts)} vs "
             f"{_iso_ts(disagreement.acceptance_ts_api)} ({disagreement.seconds:.0f} s)"
         )
+
+    typer.echo("Headers without acceptance time")
+    for headerless in report.headers_without_acceptance:
+        typer.echo(f"  {headerless.cik} {headerless.ticker or '-'}: {headerless.count}")
+    typer.echo(
+        f"  total: {sum(headerless.count for headerless in report.headers_without_acceptance)}"
+    )
 
     typer.echo("Legacy 8-K events (accepted before 2004-08-23; item codes are unreliable)")
     for legacy in report.legacy_events:
