@@ -64,6 +64,7 @@ dev = [
     "ruff>=0.17,<0.18",
     "mypy>=2.4,<3",
     "types-PyYAML>=6.0.12",
+    "vl-convert-python>=1.8,<2",
 ]
 
 [build-system]
