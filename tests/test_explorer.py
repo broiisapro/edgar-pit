@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +16,11 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = Path(__file__).resolve().parents[1] / "explorer" / "app.py"
+
+BUILD_INFO_RANGE = {
+    "min": "20261017T040215210934Z",
+    "max": "20261017T040326728091Z",
+}
 
 RY_CIK = "0001000275"
 AAPL_CIK = "0000320193"
@@ -253,4 +262,204 @@ def test_missing_database_shows_a_clear_message(
     assert not at.exception
     messages = [error.value for error in at.error]
     assert any(str(missing) in message for message in messages)
+    assert not at.get("vega_lite_chart")
+
+
+@dataclass
+class ReleaseServer:
+    """A local HTTP server standing in for a GitHub release download.
+
+    ``root`` holds the served files, ``base`` is the URL prefix and ``hits``
+    counts requests per path so tests can prove the download happens once.
+    """
+
+    root: Path
+    base: str
+    hits: Counter[str]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_release_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("EDGARPIT_DB_URL", "EDGARPIT_DB_SHA256"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def release_server(tmp_path: Path) -> ReleaseServer:
+    root = tmp_path / "release"
+    root.mkdir()
+    hits: Counter[str] = Counter()
+
+    class Handler(BaseHTTPRequestHandler):
+        """Serve files from ``root``; ``huge.duckdb`` declares an oversized body."""
+
+        def do_GET(self) -> None:
+            name = self.path.split("?", 1)[0].lstrip("/")
+            hits[name] += 1
+            if name == "huge.duckdb":
+                self.send_response(200)
+                self.send_header("Content-Length", str(500 * 1024 * 1024 + 1))
+                self.end_headers()
+                return
+            path = root / name
+            if not path.is_file():
+                self.send_error(404)
+                return
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep request logging out of the test output."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield ReleaseServer(
+            root=root,
+            base=f"http://127.0.0.1:{server.server_address[1]}",
+            hits=hits,
+        )
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+@pytest.fixture
+def released_database(release_server: ReleaseServer, db_path: Path) -> ReleaseServer:
+    (release_server.root / "edgarpit.duckdb").write_bytes(db_path.read_bytes())
+    (release_server.root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "build_timestamp": "2026-10-20T12:00:00Z",
+                "sec_fetch_range": BUILD_INFO_RANGE,
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return release_server
+
+
+def run_app() -> AppTest:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    return at
+
+
+def test_released_database_is_downloaded_rendered_and_cached(
+    released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+
+    at = run_app()
+    assert not at.exception
+    captions = [caption.value for caption in at.caption]
+    assert any(
+        "SEC fetch range: 2026-10-17 04:02 UTC to 2026-10-17 04:03 UTC" in text
+        and "2026-10-20 12:00 UTC" in text
+        for text in captions
+    )
+    assert any(option.startswith("AAPL") for option in at.sidebar.selectbox(key="issuer").options)
+    assert at.get("vega_lite_chart")
+
+    at.sidebar.selectbox(key="field").set_value("revenue")
+    at.run()
+    assert not at.exception
+    assert released_database.hits["edgarpit.duckdb"] == 1
+    assert released_database.hits["manifest.json"] == 1
+
+
+def test_local_build_info_supplies_the_sec_fetch_range(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (db_path.parent / "build-info.json").write_text(
+        json.dumps({"package_version": "1.0.0", "sec_fetch_range": BUILD_INFO_RANGE}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EDGARPIT_DB", str(db_path))
+
+    at = run_app()
+
+    assert not at.exception
+    captions = [caption.value for caption in at.caption]
+    assert any(
+        "SEC fetch range: 2026-10-17 04:02 UTC to 2026-10-17 04:03 UTC" in text for text in captions
+    )
+    assert at.get("vega_lite_chart")
+
+
+def test_checksum_mismatch_shows_an_error_page(
+    released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_SHA256", "0" * 64)
+
+    at = run_app()
+
+    assert not at.exception
+    errors = [error.value for error in at.error]
+    assert any("EDGARPIT_DB_SHA256" in message for message in errors)
+    assert not at.get("vega_lite_chart")
+
+
+def test_non_http_database_url_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"file://{tmp_path}/edgarpit.duckdb")
+
+    at = run_app()
+
+    assert not at.exception
+    errors = [error.value for error in at.error]
+    assert any("http(s) URL" in message for message in errors)
+    assert not at.get("vega_lite_chart")
+
+
+def test_malformed_checksum_is_rejected_before_downloading(
+    released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_SHA256", "not-a-digest")
+
+    at = run_app()
+
+    assert not at.exception
+    errors = [error.value for error in at.error]
+    assert any("64-character hexadecimal" in message for message in errors)
+    assert released_database.hits["edgarpit.duckdb"] == 0
+
+
+def test_oversized_download_is_rejected(
+    release_server: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{release_server.base}/huge.duckdb")
+
+    at = run_app()
+
+    assert not at.exception
+    errors = [error.value for error in at.error]
+    assert any("500 MB" in message for message in errors)
+    assert not at.get("vega_lite_chart")
+
+
+def test_a_body_that_is_not_a_database_shows_an_error_page(
+    released_database: ReleaseServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (released_database.root / "broken.duckdb").write_text("<html>not a database</html>")
+    monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/broken.duckdb")
+
+    at = run_app()
+
+    assert not at.exception
+    errors = [error.value for error in at.error]
+    assert any("not a readable DuckDB database" in message for message in errors)
     assert not at.get("vega_lite_chart")
