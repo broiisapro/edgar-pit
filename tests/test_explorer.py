@@ -375,6 +375,20 @@ def test_released_database_is_downloaded_rendered_and_cached(
     assert released_database.hits["manifest.json"] == 1
 
 
+def test_local_database_wins_over_the_release_url(
+    db_path: Path, released_database: ReleaseServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EDGARPIT_DB", str(db_path))
+    monkeypatch.setenv("EDGARPIT_DB_URL", f"{released_database.base}/edgarpit.duckdb")
+
+    at = run_app()
+
+    assert not at.exception
+    assert released_database.hits["edgarpit.duckdb"] == 0
+    assert not any("Reading the released database" in caption.value for caption in at.caption)
+    assert at.get("vega_lite_chart")
+
+
 def test_local_build_info_supplies_the_sec_fetch_range(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
