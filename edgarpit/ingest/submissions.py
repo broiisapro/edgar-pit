@@ -22,9 +22,16 @@ from typing import Any
 import polars as pl
 import yaml
 
-from edgarpit.ingest.headers import HeaderInfo, apply_acceptance, parse_header
+from edgarpit.ingest.headers import (
+    HeaderInfo,
+    HeaderWithoutAcceptance,
+    MissingAcceptanceTime,
+    apply_acceptance,
+    apply_acceptance_floors,
+    parse_header,
+)
 from edgarpit.rawcache import RawCache
-from edgarpit.schemas import Events8kSchema, FilingsSchema
+from edgarpit.schemas import Events8kSchema
 
 logger = logging.getLogger(__name__)
 
@@ -297,46 +304,117 @@ def explode_8k_items(filings: pl.DataFrame, item_labels: Mapping[str, str]) -> p
 
 
 def _header_only_filings(
-    cik: str, headers: Mapping[str, HeaderInfo], known: set[str]
+    cik: str,
+    headers: Mapping[str, HeaderInfo],
+    missing: Mapping[str, HeaderWithoutAcceptance],
+    known: set[str],
 ) -> pl.DataFrame:
     """Build filings rows from cached headers whose accession has no API row.
 
     ``cik`` is the issuer's ten-character CIK, ``headers`` maps an accession
-    with a cached SGML header to its parsed :class:`HeaderInfo` and ``known``
-    the accessions already carried by the submissions frame. Returns one
-    ``FilingsSchema`` row per header accession outside ``known``, ordered by
-    accession, with every field taken from the header: ``form``,
+    with a usable SGML header to its parsed :class:`HeaderInfo`, ``missing``
+    maps an accession whose header carries no acceptance time to its
+    :class:`HeaderWithoutAcceptance` and ``known`` the accessions already
+    carried by the submissions frame. Returns one ``FilingsSchema`` row per
+    header accession outside ``known``, ordered by accession, with ``form``,
     ``filing_date``, ``report_date`` from ``<PERIOD>`` (null when absent),
-    ``acceptance_ts`` with ``acceptance_ts_source='sgml_header'`` and
-    ``ts_imputed=false``, ``acceptance_ts_api`` null because no API value
-    exists, ``items`` from ``<ITEMS>``, ``is_amendment`` from the form,
+    ``items`` from ``<ITEMS>``, ``is_amendment`` from the form,
     ``is_xbrl=false``, ``primary_document`` null and ``source='header'``
-    (decision A-24). The frame is validated under ``FilingsSchema`` before it
-    is returned.
+    (decision A-24). The acceptance columns stay null: the caller fills them
+    with :func:`edgarpit.ingest.headers.apply_acceptance`, so a usable header
+    supplies ``acceptance_ts_source='sgml_header'`` while a header without an
+    acceptance time takes the A-23 fallback (decision A-26).
     """
-    rows = [
-        {
-            "cik": cik,
-            "accession": accession,
-            "form": finder.form,
-            "filing_date": finder.filing_date,
-            "report_date": finder.period,
-            "acceptance_ts": finder.acceptance_ts,
-            "acceptance_ts_source": "sgml_header",
-            "acceptance_ts_api": None,
-            "ts_imputed": False,
-            "primary_document": None,
-            "items": finder.items,
-            "is_amendment": finder.form.endswith("/A"),
-            "is_xbrl": False,
-            "source": "header",
-        }
-        for accession, finder in sorted(headers.items())
-        if accession not in known
-    ]
-    frame = pl.DataFrame(rows, schema=_FILINGS_DTYPES)
-    FilingsSchema.validate(frame)
-    return frame
+    rows: list[dict[str, object]] = []
+    for accession, info in sorted(headers.items()):
+        if accession in known:
+            continue
+        rows.append(
+            {
+                "cik": cik,
+                "accession": accession,
+                "form": info.form,
+                "filing_date": info.filing_date,
+                "report_date": info.period,
+                "acceptance_ts": None,
+                "acceptance_ts_source": None,
+                "acceptance_ts_api": None,
+                "ts_imputed": None,
+                "primary_document": None,
+                "items": info.items,
+                "is_amendment": info.form.endswith("/A"),
+                "is_xbrl": False,
+                "source": "header",
+            }
+        )
+    for accession, missing_info in sorted(missing.items()):
+        if accession in known:
+            continue
+        rows.append(
+            {
+                "cik": cik,
+                "accession": accession,
+                "form": missing_info.form,
+                "filing_date": missing_info.filing_date,
+                "report_date": missing_info.period,
+                "acceptance_ts": None,
+                "acceptance_ts_source": None,
+                "acceptance_ts_api": None,
+                "ts_imputed": None,
+                "primary_document": None,
+                "items": missing_info.items,
+                "is_amendment": missing_info.form.endswith("/A"),
+                "is_xbrl": False,
+                "source": "header",
+            }
+        )
+    return pl.DataFrame(rows, schema=_FILINGS_DTYPES)
+
+
+def _cached_headers(
+    raw: RawCache, cik: str
+) -> tuple[dict[str, HeaderInfo], dict[str, HeaderWithoutAcceptance]]:
+    """Parse every cached header for one issuer, separating unusable ones.
+
+    Returns ``(headers, missing)`` keyed by accession: ``headers`` holds the
+    headers that yield an acceptance time, ``missing`` the pre-2001 headers
+    that carry none (decision A-26). Any other ``ValueError`` from
+    :func:`edgarpit.ingest.headers.parse_header` still propagates: a corrupt
+    cache fails the build rather than being quietly timed by the fallback.
+    """
+    headers: dict[str, HeaderInfo] = {}
+    missing: dict[str, HeaderWithoutAcceptance] = {}
+    for accession in raw.keys("headers", cik):
+        body = raw.latest("headers", cik, accession)
+        if body is None:  # pragma: no cover - keys() lists existing directories only
+            continue
+        try:
+            headers[accession] = parse_header(body.decode("utf-8"))
+        except MissingAcceptanceTime as error:
+            missing[accession] = error.header
+    return headers, missing
+
+
+def _fill_header_items(
+    filings: pl.DataFrame, missing: Mapping[str, HeaderWithoutAcceptance]
+) -> pl.DataFrame:
+    """Fill a filing's null ``items`` from a header without an acceptance time.
+
+    ``filings`` is a ``FilingsSchema`` frame already carrying acceptance
+    times; ``missing`` maps an accession to its header. Only rows whose
+    submissions record has no ``items`` are changed, so the API value wins
+    whenever it exists; the header's codes are still used for the 8-K event
+    explosion (decision A-26).
+    """
+    items = {accession: header.items for accession, header in missing.items() if header.items}
+    if not items:
+        return filings
+    return filings.with_columns(
+        pl.when(pl.col("items").is_null())
+        .then(pl.col("accession").replace_strict(items, default=None, return_dtype=pl.String))
+        .otherwise(pl.col("items"))
+        .alias("items")
+    )
 
 
 def ingest_filings(
@@ -350,15 +428,21 @@ def ingest_filings(
     :func:`edgarpit.ingest.submissions.load_item_labels`. Reads the latest
     submissions document, every page file it lists (in listed order) and every
     cached SGML header for the issuer, then attaches the authoritative
-    acceptance times from the headers (decision A-1). A cached header whose
-    accession is absent from the submissions document still becomes a filings
-    row built from the header, so every fetched header is used (decision A-24);
-    such a row and its facts are never imputed from ``filed``. Returns
+    acceptance times from the headers (decision A-1). A header without an
+    ``<ACCEPTANCE-DATETIME>`` (pre-2001 filings, decision A-26) is not fatal:
+    its filing takes the A-23 fallback, raised to at least the header's
+    ``<DATE-OF-FILING-DATE-CHANGE>`` when present, and the header's ``<ITEMS>``
+    fill a submissions row that has none; one warning per issuer names the
+    count and the first five accessions. A cached header whose accession is
+    absent from the submissions document still becomes a filings row built
+    from the header, so every fetched header is used (decision A-24); such a
+    row and its facts are never imputed from ``filed``. Returns
     ``(filings, events_8k)``, valid under
     :class:`edgarpit.schemas.FilingsSchema` and
     :class:`edgarpit.schemas.Events8kSchema`. Raises ``ValueError`` when the
-    issuer has no cached submissions document, or when a page listed by the
-    document is not in the cache.
+    issuer has no cached submissions document, when a page listed by the
+    document is not in the cache, or when a cached header is malformed in any
+    way other than a missing acceptance time.
     """
     main_body = raw.latest("submissions", cik)
     if main_body is None:
@@ -376,18 +460,29 @@ def ingest_filings(
             raise ValueError(f"missing cached submissions page {name} for CIK {cik}")
         pages.append(json.loads(body))
 
-    headers: dict[str, HeaderInfo] = {}
-    for accession in raw.keys("headers", cik):
-        body = raw.latest("headers", cik, accession)
-        if body is None:  # pragma: no cover - keys() lists existing directories only
-            continue
-        headers[accession] = parse_header(body.decode("utf-8"))
+    headers, missing = _cached_headers(raw, cik)
+    if missing:
+        logger.warning(
+            "CIK %s: %d cached headers have no <ACCEPTANCE-DATETIME>; using the "
+            "filing-date fallback for them (first five: %s)",
+            cik,
+            len(missing),
+            ", ".join(sorted(missing)[:5]),
+        )
+    floors = {
+        accession: header.date_of_filing_date_change
+        for accession, header in missing.items()
+        if header.date_of_filing_date_change is not None
+    }
 
     submissions = parse_submissions(main, pages)
-    filings = apply_acceptance(submissions, headers)
+    filings = apply_acceptance_floors(apply_acceptance(submissions, headers), floors)
+    filings = _fill_header_items(filings, missing)
     known = set(submissions["accession"].to_list())
-    header_only = _header_only_filings(cik, headers, known)
+    header_only = _header_only_filings(cik, headers, missing, known)
     if header_only.height:
-        filings = pl.concat([filings, header_only])
+        filings = pl.concat(
+            [filings, apply_acceptance_floors(apply_acceptance(header_only, headers), floors)]
+        )
     events = explode_8k_items(filings, item_labels)
     return filings, events

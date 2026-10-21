@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from edgarpit.cli import app
 from edgarpit.qa import (
     FilingCount,
+    HeaderWithoutAcceptanceTime,
     KeyViolation,
     LegacyEventCount,
     MultiCurrency,
@@ -559,6 +560,9 @@ def test_run_qa_populates_every_section(tmp_path: Path) -> None:
     assert conflict.values == [1.0, 2.0]
 
     assert report.legacy_events == []
+    assert report.headers_without_acceptance == [
+        HeaderWithoutAcceptanceTime(cik=APPLE_CIK, ticker="AAPL", count=1)
+    ]
     assert report.filings_by_source == [FilingCount(source="recent", count=3)]
     assert report.filings_by_acceptance_source == [
         FilingCount(source="filing_date_eod", count=1),
@@ -593,6 +597,7 @@ def test_cli_qa_prints_sections_and_exits_0(tmp_path: Path) -> None:
         "Restatements",
         "Imputed timestamps",
         "Header-vs-API disagreements over 60 s: 1",
+        "Headers without acceptance time",
         "Legacy 8-K events (accepted before 2004-08-23; item codes are unreliable)",
         "Filings by source",
         "Filings by acceptance_ts_source",
@@ -606,6 +611,8 @@ def test_cli_qa_prints_sections_and_exits_0(tmp_path: Path) -> None:
     assert "  recent: 3" in result.stdout
     assert "  sgml_header: 2" in result.stdout
     assert "  missing input: 2" in result.stdout
+    assert f"  {APPLE_CIK} AAPL: 1" in result.stdout
+    assert "  total: 1" in result.stdout
     assert "0001000275 revenue [revision]: 1" in result.stdout
     assert "0000320193 eps_diluted [split_adjustment]: 1" in result.stdout
     assert "0001193125-24-270294" in result.stdout
@@ -750,6 +757,63 @@ def test_filings_are_counted_by_source_and_acceptance_source(tmp_path: Path) -> 
     assert report.filings_by_acceptance_source == [
         FilingCount(source="filing_date_eod", count=1),
         FilingCount(source="sgml_header", count=4),
+    ]
+
+
+def test_headers_without_acceptance_count_only_header_required_filings(tmp_path: Path) -> None:
+    """A-26 section: a plain filing that needs no header is not counted.
+
+    The fetch stage retrieves headers only for fact-carrying filings and
+    8-Ks (decision A-1), so an imputed 10-K with no facts is not a missing
+    header; an imputed 8-K is.
+    """
+    db = build_qa_db(tmp_path / "edgarpit.duckdb")
+    insert_rows(
+        db,
+        "raw.filings",
+        [
+            (
+                APPLE_CIK,
+                "0000320193-22-000099",
+                "10-K",
+                date(2022, 11, 3),
+                date(2022, 9, 24),
+                utc(2022, 11, 4, 3, 59, 59),
+                "filing_date_eod",
+                None,
+                True,
+                "aapl-2022.htm",
+                None,
+                False,
+                True,
+                "recent",
+            ),
+            (
+                RY_CIK,
+                "0001000275-99-000001",
+                "8-K",
+                date(1999, 1, 4),
+                None,
+                utc(1999, 1, 5, 4, 59, 59),
+                "filing_date_eod",
+                None,
+                True,
+                "ry8k.htm",
+                "5",
+                False,
+                True,
+                "recent",
+            ),
+        ],
+    )
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        report = run_qa(con)
+    finally:
+        con.close()
+    assert report.headers_without_acceptance == [
+        HeaderWithoutAcceptanceTime(cik=APPLE_CIK, ticker="AAPL", count=1),
+        HeaderWithoutAcceptanceTime(cik=RY_CIK, ticker="RY", count=1),
     ]
 
 

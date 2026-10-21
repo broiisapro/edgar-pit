@@ -43,6 +43,7 @@ ASOF_JSON_KEYS = {
     "acceptance_ts",
     "version",
     "is_restatement",
+    "restatement_kind",
     "ts_imputed",
 }
 
@@ -146,6 +147,7 @@ def test_asof_json_matches_expected_asof(tmp_path: Path) -> None:
     assert row["form"] == "40-F"
     assert row["version"] == 1
     assert row["is_restatement"] is False
+    assert row["restatement_kind"] == "none"
     assert row["ts_imputed"] is False
 
 
@@ -438,6 +440,26 @@ def test_build_calls_build_from_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     def fake_build(raw_dir: Path, out_dir: Path) -> Path:
         calls["raw_dir"] = raw_dir
         calls["out_dir"] = out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "build-info.json").write_text(
+            json.dumps(
+                {
+                    "tables": {
+                        "raw.filings": 12,
+                        "raw.events_8k": 0,
+                        "raw.facts_raw": 3,
+                        "raw.concept_map": 61,
+                        "raw.universe": 40,
+                        "main.fundamentals_pit": 7,
+                        "main.ratios_pit": 2,
+                        "main.events_8k": 0,
+                        "main.filings": 12,
+                    },
+                    "dbt": "PASS=68 WARN=0 ERROR=0 SKIP=0 TOTAL=68",
+                }
+            ),
+            encoding="utf-8",
+        )
         return out_dir / "edgarpit.duckdb"
 
     monkeypatch.setattr("edgarpit.cli.build_from_raw", fake_build)
@@ -448,10 +470,25 @@ def test_build_calls_build_from_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
     assert result.exit_code == 0, result.output
     assert calls == {"raw_dir": fixtures, "out_dir": out}
+    assert "raw.filings: 12 rows" in result.stdout
+    assert "main.fundamentals_pit: 7 rows" in result.stdout
+    assert "dbt build: PASS=68 WARN=0 ERROR=0 SKIP=0 TOTAL=68" in result.stdout
     assert f"database: {out / 'edgarpit.duckdb'}" in result.stdout
 
     data_result = RUNNER.invoke(app, ["build", "--data", str(fixtures), "--out", str(out)])
     assert data_result.exit_code == 0, data_result.output
+
+
+def test_build_without_build_info_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A build that leaves no provenance record is a failure, not a quiet success."""
+
+    def fake_build(raw_dir: Path, out_dir: Path) -> Path:
+        return out_dir / "edgarpit.duckdb"
+
+    monkeypatch.setattr("edgarpit.cli.build_from_raw", fake_build)
+    result = RUNNER.invoke(app, ["build", "--data", str(tmp_path), "--out", str(tmp_path / "out")])
+    assert result.exit_code == 1
+    assert "cannot read build info" in result.stderr
 
 
 def test_build_failure_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
