@@ -319,6 +319,22 @@ RAW_FILINGS_ROWS = [
         True,
         "recent",
     ),
+    (
+        APPLE_CIK,
+        "0000320193-23-000777",
+        "10-Q",
+        date(2023, 11, 2),
+        date(2023, 9, 30),
+        utc(2023, 11, 3, 3, 59, 59),
+        "filing_date_eod",
+        utc(2023, 11, 2, 21),
+        True,
+        "aapl-10q2.htm",
+        None,
+        False,
+        True,
+        "recent",
+    ),
 ]
 
 EVENTS_ROWS = [
@@ -524,7 +540,7 @@ def test_run_qa_populates_every_section(tmp_path: Path) -> None:
     assert restated.pct_change_vs_first is not None
     assert restated.pct_change_vs_first < -0.08
 
-    assert report.imputed_by_source == {"filing_date_eod": 1}
+    assert report.imputed_by_source == {"filing_date_eod": 2}
     assert report.disagreement_count == 1
     assert len(report.disagreements) == 1
     disagreement = report.disagreements[0]
@@ -563,9 +579,9 @@ def test_run_qa_populates_every_section(tmp_path: Path) -> None:
     assert report.headers_without_acceptance == [
         HeaderWithoutAcceptanceTime(cik=APPLE_CIK, ticker="AAPL", count=1)
     ]
-    assert report.filings_by_source == [FilingCount(source="recent", count=3)]
+    assert report.filings_by_source == [FilingCount(source="recent", count=4)]
     assert report.filings_by_acceptance_source == [
-        FilingCount(source="filing_date_eod", count=1),
+        FilingCount(source="filing_date_eod", count=2),
         FilingCount(source="sgml_header", count=2),
     ]
     assert report.ratio_gap_counts == {"missing input": 2}
@@ -608,7 +624,8 @@ def test_cli_qa_prints_sections_and_exits_0(tmp_path: Path) -> None:
         "Key uniqueness: OK",
     ):
         assert section in result.stdout, section
-    assert "  recent: 3" in result.stdout
+    assert "  recent: 4" in result.stdout
+    assert "  filing_date_eod: 2" in result.stdout
     assert "  sgml_header: 2" in result.stdout
     assert "  missing input: 2" in result.stdout
     assert f"  {APPLE_CIK} AAPL: 1" in result.stdout
@@ -752,10 +769,10 @@ def test_filings_are_counted_by_source_and_acceptance_source(tmp_path: Path) -> 
     assert report.filings_by_source == [
         FilingCount(source="0000320193-submissions-001.json", count=1),
         FilingCount(source="header", count=1),
-        FilingCount(source="recent", count=3),
+        FilingCount(source="recent", count=4),
     ]
     assert report.filings_by_acceptance_source == [
-        FilingCount(source="filing_date_eod", count=1),
+        FilingCount(source="filing_date_eod", count=2),
         FilingCount(source="sgml_header", count=4),
     ]
 

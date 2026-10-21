@@ -18,6 +18,7 @@ from edgarpit.concepts import DEFAULT_CONCEPT_MAP_PATH, ConceptSpec, load_concep
 from edgarpit.load import (
     BUILD_INFO_NAME,
     REFERENCE_TYPES,
+    _deduplicate_filings,
     build_from_raw,
     load_reference_tables,
     load_tables,
@@ -369,3 +370,60 @@ def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -
     assert {"main.fundamentals_pit", "main.ratios_pit", "main.events_8k", "main.filings"} <= set(
         info["tables"]
     )
+
+
+def test_cross_issuer_duplicate_accessions_keep_the_filer_row() -> None:
+    """When the accession prefix names an issuer, that issuer's row wins."""
+    filings = pl.DataFrame(
+        {
+            "cik": ["0001141391", "0000019617", "0000019617"],
+            "accession": [
+                "0000019617-04-000164",
+                "0000019617-04-000164",
+                "0000019617-05-000155",
+            ],
+        }
+    )
+    events = pl.DataFrame(
+        {
+            "cik": ["0001141391", "0000019617"],
+            "accession": ["0000019617-04-000164", "0000019617-04-000164"],
+            "item_code": ["5", "5"],
+        }
+    )
+
+    deduplicated, deduplicated_events = _deduplicate_filings(filings, events)
+
+    assert deduplicated.height == 2
+    assert deduplicated["accession"].n_unique() == 2
+    kept = deduplicated.filter(pl.col("accession") == "0000019617-04-000164")
+    assert kept["cik"].to_list() == ["0000019617"]
+    assert deduplicated_events.height == 1
+    assert deduplicated_events["cik"].to_list() == ["0000019617"]
+
+
+def test_cross_issuer_duplicate_accessions_fall_back_to_the_smallest_cik() -> None:
+    """A filing agent prefixes the accession, so no issuer owns it; CIK order wins."""
+    filings = pl.DataFrame(
+        {
+            "cik": ["0001594805", "0000009631"],
+            "accession": ["0001085146-24-000941", "0001085146-24-000941"],
+        }
+    )
+    events = pl.DataFrame(
+        {
+            "cik": ["0001594805", "0000009631", "0000009631"],
+            "accession": [
+                "0001085146-24-000941",
+                "0001085146-24-000941",
+                "0001085146-24-000941",
+            ],
+            "item_code": ["2.02", "2.02", "5.02"],
+        }
+    )
+
+    deduplicated, deduplicated_events = _deduplicate_filings(filings, events)
+
+    assert deduplicated["cik"].to_list() == ["0000009631"]
+    assert deduplicated_events["cik"].unique().to_list() == ["0000009631"]
+    assert sorted(deduplicated_events["item_code"].to_list()) == ["2.02", "5.02"]
