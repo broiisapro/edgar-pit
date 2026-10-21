@@ -342,7 +342,7 @@ def check_database(path: Path) -> None:
     """
     try:
         con = duckdb.connect(str(path), read_only=True)
-    except duckdb.Error as exc:
+    except (duckdb.Error, OSError) as exc:
         raise ReleaseDownloadError(f"{path.name} is not a readable DuckDB database: {exc}") from exc
     con.close()
 
@@ -388,9 +388,17 @@ def resolve_database() -> tuple[DatabaseSource | None, str | None]:
             "EDGARPIT_DB_URL to the released edgarpit.duckdb asset, or create one with "
             "`uv run python -m edgarpit.devdb --out <dir>` and the dbt models."
         )
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
+    try:
+        parts = urlsplit(url)
+        is_http = parts.scheme in ("http", "https") and bool(parts.netloc)
+    except ValueError:
+        is_http = False
+    if not is_http:
         return None, f"EDGARPIT_DB_URL must be an http(s) URL; got {url!r}."
+    try:
+        httpx.URL(url)
+    except (httpx.InvalidURL, ValueError) as exc:
+        return None, f"EDGARPIT_DB_URL is not a valid URL ({exc}); got {url!r}."
     sha256 = os.environ.get("EDGARPIT_DB_SHA256", "").strip() or None
     if sha256 is not None and not _SHA256_RE.fullmatch(sha256):
         return None, (

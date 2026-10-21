@@ -423,9 +423,12 @@ def test_checksum_mismatch_shows_an_error_page(
     assert not at.get("vega_lite_chart")
 
 
-def test_non_http_database_url_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", ["file:///tmp/edgarpit.duckdb", "http://[bad"])
+def test_unusable_database_url_is_rejected(
+    url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("EDGARPIT_DB", str(tmp_path / "missing.duckdb"))
-    monkeypatch.setenv("EDGARPIT_DB_URL", f"file://{tmp_path}/edgarpit.duckdb")
+    monkeypatch.setenv("EDGARPIT_DB_URL", url)
 
     at = run_app()
 
