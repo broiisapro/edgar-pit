@@ -5,17 +5,23 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   lint:
-    runs-on: [self-hosted, Linux, ARM64, edgar-pit]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Install
         run: uv sync --frozen
       - name: Ruff check
@@ -24,33 +30,42 @@ jobs:
         run: uv run ruff format --check .
 
   types:
-    runs-on: [self-hosted, Linux, ARM64, edgar-pit]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Install
         run: uv sync --frozen
       - name: Mypy
         run: uv run mypy edgarpit
 
   tests:
-    runs-on: [self-hosted, Linux, ARM64, edgar-pit]
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Install
         run: uv sync --frozen
       - name: Pytest
         run: uv run pytest -q
 
   dbt:
-    runs-on: [self-hosted, Linux, ARM64, edgar-pit]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Install
         run: uv sync --frozen
       - name: Build the offline database
