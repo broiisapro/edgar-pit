@@ -155,12 +155,12 @@ def parse_header(text: str) -> HeaderInfo:
     Raises :class:`MissingAcceptanceTime` when ``<ACCEPTANCE-DATETIME>`` is
     absent or empty (pre-2001 headers, decision A-26); the exception carries
     the form, filing date, period, items and any
-    ``<DATE-OF-FILING-DATE-CHANGE>``. Raises plain ``ValueError`` naming the
+    ``<ACCEPTANCE-DATETIME>``. Raises plain ``ValueError`` naming the
     tag when any other required tag (``<ACCESSION-NUMBER>``, ``<TYPE>``,
     ``<FILING-DATE>``) is missing or malformed, when
-    ``<ACCEPTANCE-DATETIME>`` is malformed, or when ``<PERIOD>`` or
-    ``<DATE-OF-FILING-DATE-CHANGE>`` is present but malformed, so a corrupt
-    cache never passes silently.
+    ``<ACCEPTANCE-DATETIME>`` is malformed, when ``<PERIOD>`` is present but
+    malformed, or when a header without an acceptance time has a malformed
+    ``<DATE-OF-FILING-DATE-CHANGE>``, so a corrupt cache never passes silently.
     """
     tags = _header_tags(text)
     accession = _required(tags, "ACCESSION-NUMBER")
