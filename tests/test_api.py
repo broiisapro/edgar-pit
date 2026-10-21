@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 import api.main as api_main
 from api.main import app
-from edgarpit import query
+from edgarpit import __version__, query
 
 RY_CIK = "0001000275"
 AAPL_CIK = "0000320193"
@@ -148,6 +148,14 @@ def test_health(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_app_version_matches_the_package_version(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+
+    assert __version__ == "1.0.0"
+    assert app.version == __version__
+    assert schema["info"]["version"] == __version__
 
 
 def test_asof_returns_the_version_known_at_the_time(client: TestClient) -> None:

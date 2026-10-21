@@ -16,7 +16,7 @@ import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, PlainSerializer
 
-from edgarpit import query
+from edgarpit import __version__, query
 from edgarpit.config import Settings
 
 
@@ -88,7 +88,7 @@ app = FastAPI(
         "is at or before t. Timestamps are ISO-8601 UTC with a 'Z' suffix; values are "
         "in the unit reported by the filing."
     ),
-    version="0.1.0",
+    version=__version__,
 )
 
 
