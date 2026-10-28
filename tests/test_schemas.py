@@ -13,9 +13,6 @@ from pandera.errors import SchemaError
 from edgarpit.schemas import (
     COLUMNS,
     DUCKDB_TYPES,
-    PHASE2_COLUMNS,
-    PHASE2_DUCKDB_TYPES,
-    PHASE2_SCHEMAS,
     SCHEMAS,
     Events8kSchema,
     FactsRawSchema,
@@ -206,37 +203,25 @@ def test_duckdb_ddl_rejects_unknown_table_and_schema() -> None:
         duckdb_ddl("filings", schema="raw; DROP TABLE filings")
 
 
-# --- Phase 2 raw tables: raw.filings_text and raw.fx_daily -------------------
+# --- raw.filings_text and raw.fx_daily (decisions A-31, A-32, A-38) ----------
 
 
-def test_phase2_frames_pass() -> None:
+def test_filings_text_and_fx_frames_pass() -> None:
     FilingsTextSchema.validate(doubles.filings_text_frame())
     FxDailySchema.validate(doubles.fx_daily_frame())
 
 
-def test_phase2_empty_frames_pass() -> None:
+def test_filings_text_and_fx_empty_frames_pass() -> None:
     FilingsTextSchema.validate(doubles.filings_text_frame().head(0))
     FxDailySchema.validate(doubles.fx_daily_frame().head(0))
 
 
-def test_phase2_columns_match_schema_order() -> None:
-    for table, schema in PHASE2_SCHEMAS.items():
-        assert list(schema.to_schema().columns) == PHASE2_COLUMNS[table]
-
-
-def test_phase2_duckdb_types_cover_exactly_the_columns() -> None:
-    assert set(PHASE2_DUCKDB_TYPES) == set(PHASE2_COLUMNS)
-    for table, columns in PHASE2_COLUMNS.items():
-        assert list(PHASE2_DUCKDB_TYPES[table]) == columns
-
-
-def test_phase2_tables_leave_the_epic1_staging_contract_alone() -> None:
-    # The Phase 2 tables are declared beside the staging tables, not in them:
-    # load.load_tables and the staging CSVs still describe exactly three tables.
-    assert set(SCHEMAS) == {"filings", "events_8k", "facts_raw"}
-    assert set(COLUMNS) == {"filings", "events_8k", "facts_raw"}
-    assert set(DUCKDB_TYPES) == set(COLUMNS)
-    assert set(PHASE2_SCHEMAS) == {"filings_text", "fx_daily"}
+def test_the_staging_contract_covers_all_five_raw_tables() -> None:
+    # Decision A-38: filings_text and fx_daily are staging tables now, not a
+    # separate Phase 2 mapping, so every consumer reads one contract.
+    assert set(SCHEMAS) == {"filings", "events_8k", "facts_raw", "filings_text", "fx_daily"}
+    assert set(COLUMNS) == set(SCHEMAS)
+    assert set(DUCKDB_TYPES) == set(SCHEMAS)
 
 
 def test_duckdb_ddl_creates_the_phase2_tables() -> None:
@@ -244,11 +229,11 @@ def test_duckdb_ddl_creates_the_phase2_tables() -> None:
     try:
         con.execute("CREATE SCHEMA raw")
         con.execute("SET TimeZone='UTC'")
-        for table in PHASE2_COLUMNS:
+        for table in ("filings_text", "fx_daily"):
             con.execute(duckdb_ddl(table))
-        for table, columns in PHASE2_COLUMNS.items():
+        for table in ("filings_text", "fx_daily"):
             described = [row[0] for row in con.execute(f"DESCRIBE raw.{table}").fetchall()]
-            assert described == columns
+            assert described == COLUMNS[table]
         types = {row[0]: row[1] for row in con.execute("DESCRIBE raw.fx_daily").fetchall()}
         assert types["rate_date"] == "DATE"
         assert types["known_at"] == "TIMESTAMP WITH TIME ZONE"

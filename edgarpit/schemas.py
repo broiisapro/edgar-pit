@@ -2,17 +2,12 @@
 
 This module is the executable form of the staging contract (section 6 of
 ``docs/architecture.md``): the column names, order, dtypes and nullability of
-``raw.filings``, ``raw.events_8k`` and ``raw.facts_raw``. ``COLUMNS`` and
-``duckdb_ddl`` exist so the loader (Epic 01) and the development database
-builder create exactly the tables these schemas validate.
-
-The Phase 2 raw tables, ``raw.filings_text`` and ``raw.fx_daily`` (Epic 04 and
-Epic 05), are declared in the parallel ``PHASE2_SCHEMAS``, ``PHASE2_COLUMNS``
-and ``PHASE2_DUCKDB_TYPES`` mappings with the same shape as the three staging
-tables. They are kept apart from ``COLUMNS``/``DUCKDB_TYPES`` so that the Epic
-01 staging contract, the staging CSVs under ``tests/fixtures/staging`` and
-``load.load_tables`` stay exactly as they are until their own loaders land;
-``duckdb_ddl`` accepts a table from either mapping.
+the five tables the loader writes — ``raw.filings``, ``raw.events_8k``,
+``raw.facts_raw``, ``raw.filings_text`` and ``raw.fx_daily``. ``SCHEMAS``,
+``COLUMNS``, ``DUCKDB_TYPES`` and ``duckdb_ddl`` exist so that
+``load.load_tables`` and the development database builder create exactly the
+tables these schemas validate, and so that ``tests/fixtures/staging`` mirrors
+them one CSV per table.
 """
 
 from __future__ import annotations
@@ -169,20 +164,12 @@ class FxDailySchema(pa.DataFrameModel):
         unique = ("series", "rate_date")
 
 
-# The Phase 2 raw tables. They are deliberately not entries of ``SCHEMAS``,
-# ``COLUMNS`` and ``DUCKDB_TYPES``: those three describe the Epic 01 staging
-# tables that ``load.load_tables`` writes and that the staging CSVs in
-# ``tests/fixtures/staging`` mirror. Their loaders arrive with their own issues
-# and will then move these tables into the three staging mappings.
-PHASE2_SCHEMAS: dict[str, type[pa.DataFrameModel]] = {
-    "filings_text": FilingsTextSchema,
-    "fx_daily": FxDailySchema,
-}
-
 SCHEMAS: dict[str, type[pa.DataFrameModel]] = {
     "filings": FilingsSchema,
     "events_8k": Events8kSchema,
     "facts_raw": FactsRawSchema,
+    "filings_text": FilingsTextSchema,
+    "fx_daily": FxDailySchema,
 }
 
 COLUMNS: dict[str, list[str]] = {
@@ -225,6 +212,26 @@ COLUMNS: dict[str, list[str]] = {
         "accession",
         "filed",
         "frame",
+    ],
+    "filings_text": [
+        "cik",
+        "accession",
+        "acceptance_ts",
+        "ts_imputed",
+        "document",
+        "doc_type",
+        "section",
+        "section_order",
+        "text",
+        "sha256",
+        "char_count",
+    ],
+    "fx_daily": [
+        "series",
+        "rate_date",
+        "value",
+        "known_at",
+        "source",
     ],
 }
 
@@ -269,32 +276,6 @@ DUCKDB_TYPES: dict[str, dict[str, str]] = {
         "filed": "DATE",
         "frame": "VARCHAR",
     },
-}
-
-PHASE2_COLUMNS: dict[str, list[str]] = {
-    "filings_text": [
-        "cik",
-        "accession",
-        "acceptance_ts",
-        "ts_imputed",
-        "document",
-        "doc_type",
-        "section",
-        "section_order",
-        "text",
-        "sha256",
-        "char_count",
-    ],
-    "fx_daily": [
-        "series",
-        "rate_date",
-        "value",
-        "known_at",
-        "source",
-    ],
-}
-
-PHASE2_DUCKDB_TYPES: dict[str, dict[str, str]] = {
     "filings_text": {
         "cik": "VARCHAR(10)",
         "accession": "VARCHAR",
@@ -324,13 +305,13 @@ def duckdb_ddl(table: str, schema: str = "raw") -> str:
     """Return the ``CREATE TABLE`` statement for a raw table.
 
     ``table`` is one of the staging tables (``filings``, ``events_8k``,
-    ``facts_raw``) or a Phase 2 table (``filings_text``, ``fx_daily``);
-    ``schema`` is the DuckDB schema to create it in. Raises ``ValueError`` for
-    an unknown table or an invalid schema name.
+    ``facts_raw``, ``filings_text``, ``fx_daily``); ``schema`` is the DuckDB
+    schema to create it in. Raises ``ValueError`` for an unknown table or an
+    invalid schema name.
     """
-    types = DUCKDB_TYPES.get(table) or PHASE2_DUCKDB_TYPES.get(table)
+    types = DUCKDB_TYPES.get(table)
     if types is None:
-        known = ", ".join(sorted({*DUCKDB_TYPES, *PHASE2_DUCKDB_TYPES}))
+        known = ", ".join(sorted(DUCKDB_TYPES))
         raise ValueError(f"unknown staging table {table!r}; expected one of {known}")
     if not _IDENTIFIER_RE.fullmatch(schema):
         raise ValueError(f"invalid DuckDB schema name {schema!r}")
