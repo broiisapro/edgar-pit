@@ -178,8 +178,11 @@ def test_incremental_fetch_accepts_the_keyword(tmp_path: Path) -> None:
     assert report.requests == 0
 
 
-def test_currency_is_refused_until_the_usd_model_exists() -> None:
-    with pytest.raises(NotImplementedError, match="currency"):
-        query.asof("AAPL", "revenue", "2024-01-01T00:00:00Z", currency="USD")
-    with pytest.raises(NotImplementedError, match="currency"):
-        query.history("AAPL", "revenue", currency="USD")
+def test_currency_is_part_of_the_usd_read_surface() -> None:
+    """The USD read replaced the stub; an unsupported currency is still refused."""
+    # A currency outside the Literal reaches the runtime guard.
+    unsupported: Any = "CAD"
+    with pytest.raises(ValueError, match="currency"):
+        query.asof("AAPL", "revenue", "2024-01-01T00:00:00Z", currency=unsupported)
+    with pytest.raises(ValueError, match="currency"):
+        query.history("AAPL", "revenue", currency=unsupported)
