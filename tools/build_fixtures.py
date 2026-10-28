@@ -66,6 +66,21 @@ only, to the tickers in ``config/universe.csv`` plus ``EXTRA_TICKERS``.  The
 rest of the fixture tree is left untouched and the manifest is rewritten with
 the refreshed row.  Run it with ``uv run python tools/build_fixtures.py
 --company-tickers``.
+
+``--text`` builds the 8-K text fixtures under ``tests/fixtures/sec_text``
+(decision A-30) for the filings in :data:`TEXT_ITEM_2_02`,
+:data:`TEXT_OTHER_8KS` and :data:`TEXT_8K_AMENDMENTS`, which must already be
+present in the submissions fixtures::
+
+    tests/fixtures/sec_text/raw/filing_index/<cik>/<accession>/<fetched_at>.html
+    tests/fixtures/sec_text/raw/documents/<cik>/<accession>__<filename>/<fetched_at>.<ext>
+    tests/fixtures/sec_text/raw/manifest.jsonl
+
+Every filing's ``<accession>-index-headers.html`` is fetched, then its primary
+document and every ``EX-99.1`` it lists.  Bytes are stored exactly as SEC
+served them, so the fixture manifest rows carry ``"trimmed": false``; the tree
+is separate from ``tests/fixtures/sec`` so that manifest and its checks stay
+untouched.  Run it with ``uv run python tools/build_fixtures.py --text``.
 """
 
 from __future__ import annotations
@@ -83,6 +98,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -92,6 +108,8 @@ from zoneinfo import ZoneInfo
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec"
 RAW_DIR = FIXTURE_ROOT / "raw"
+TEXT_FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec_text"
+TEXT_RAW_DIR = TEXT_FIXTURE_ROOT / "raw"
 STAGING_DIR = REPO_ROOT / "tests" / "fixtures" / "staging"
 EXPECTED_ASOF_PATH = REPO_ROOT / "tests" / "fixtures" / "expected_asof.json"
 UNIVERSE_PATH = REPO_ROOT / "config" / "universe.csv"
@@ -173,7 +191,46 @@ UNMAPPED_SELECTION: dict[str, tuple[str, str]] = {
 }
 
 APPLE_CIK = "0000320193"
+SHOPIFY_CIK = "0001594805"
 APPLE_8K_COUNT = 10
+
+# 8-K text fixtures (``--text``, decision A-30).  Royal Bank of Canada files
+# 6-Ks rather than 8-Ks and has no 8-K row in the submissions fixtures, so it
+# contributes no text fixture.
+#
+# Item 2.02 (results of operations): at least eight Apple and four Shopify
+# filings, chosen across the formats the parser must survive -- Workiva pages
+# with hidden inline XBRL, the newer EDGAR layout, press releases with wide
+# financial tables, and (for Shopify) a filing that also carries Item 7.01.
+TEXT_ITEM_2_02: dict[str, tuple[str, ...]] = {
+    APPLE_CIK: (
+        "0000320193-22-000006",
+        "0000320193-22-000069",
+        "0000320193-23-000005",
+        "0000320193-23-000104",
+        "0000320193-24-000067",
+        "0000320193-25-000007",
+        "0000320193-25-000077",
+        "0000320193-26-000018",
+    ),
+    SHOPIFY_CIK: (
+        "0001594805-25-000011",
+        "0001594805-25-000072",
+        "0001594805-26-000006",
+        "0001594805-26-000046",
+    ),
+}
+
+# Two 8-Ks without Item 2.02: multi-item officer changes and a Regulation FD
+# disclosure, both without an exhibit.
+TEXT_OTHER_8KS: dict[str, tuple[str, ...]] = {
+    APPLE_CIK: ("0001193125-22-225365", "0001140361-24-040659"),
+}
+
+# The only 8-K/A in the submissions fixtures.
+TEXT_8K_AMENDMENTS: dict[str, tuple[str, ...]] = {
+    APPLE_CIK: ("0001140361-26-035325",),
+}
 
 # The trimmed ``company_tickers.json`` fixture keeps the universe's tickers and
 # a few real tickers outside it, so resolution sees non-universe entries too.
@@ -487,10 +544,18 @@ def header_url(cik: str, accession: str) -> str:
 
 
 class Manifest:
-    """Collects ``raw/manifest.jsonl`` rows while storing fixture files."""
+    """Collects ``raw/manifest.jsonl`` rows while storing fixture files.
 
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+    ``root`` is the fixture root the ``path`` column is relative to; the
+    default is the submissions fixture tree, and ``--text`` passes the
+    separate text root so both manifests keep the same row shape.
+    """
+
+    def __init__(
+        self, rows: list[dict[str, Any]] | None = None, *, root: Path = FIXTURE_ROOT
+    ) -> None:
         self.rows: list[dict[str, Any]] = list(rows or [])
+        self.root = root
 
     def store(
         self,
@@ -502,13 +567,14 @@ class Manifest:
         url: str,
         body: bytes,
         http_status: int,
+        trimmed: bool = True,
     ) -> Path:
         relative = Path("raw") / endpoint / (cik or "_")
         if key:
             relative = relative / key
         stamp = now_stamp()
         relative = relative / f"{stamp}{suffix}"
-        path = FIXTURE_ROOT / relative
+        path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():  # pragma: no cover - microsecond names make this absurd
             raise FixtureError(f"refusing to overwrite {path}")
@@ -523,7 +589,7 @@ class Manifest:
                 "bytes": len(body),
                 "fetched_at": stamp,
                 "http_status": http_status,
-                "trimmed": True,
+                "trimmed": trimmed,
             }
         )
         return path
@@ -531,12 +597,12 @@ class Manifest:
     def write(self) -> None:
         rows = sorted(self.rows, key=lambda row: row["path"])
         lines = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
-        (RAW_DIR / "manifest.jsonl").write_text(lines, encoding="utf-8")
+        (self.root / "raw" / "manifest.jsonl").write_text(lines, encoding="utf-8")
 
 
-def load_manifest_rows() -> list[dict[str, Any]]:
-    """Read the stored fixture manifest, or return an empty list when absent."""
-    path = RAW_DIR / "manifest.jsonl"
+def load_manifest_rows(root: Path = FIXTURE_ROOT) -> list[dict[str, Any]]:
+    """Read the stored fixture manifest under ``root``, or return an empty list."""
+    path = root / "raw" / "manifest.jsonl"
     if not path.is_file():
         return []
     return [
@@ -707,6 +773,206 @@ def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
         issuer["headers_fetched"] = fetched
         issuer["headers_missing"] = missing
         summary["issuers"][cik] = issuer
+
+    manifest.write()
+    return summary
+
+
+@dataclass(frozen=True)
+class IndexDocument:
+    """One ``<DOCUMENT>`` block of an EDGAR ``-index-headers.html`` page.
+
+    ``document_type`` is the SGML ``<TYPE>`` (for example ``8-K`` or
+    ``EX-99.1``), ``sequence`` its 1-based position in the filing, and
+    ``filename`` the name of the document in the accession directory.
+    """
+
+    document_type: str
+    sequence: int
+    filename: str
+
+
+_INDEX_DOCUMENT_RE = re.compile(r"&lt;DOCUMENT&gt;(.*?)&lt;/DOCUMENT&gt;", re.S)
+_INDEX_TYPE_RE = re.compile(r"&lt;TYPE&gt;([^\n&<]*)")
+_INDEX_SEQUENCE_RE = re.compile(r"&lt;SEQUENCE&gt;(\d+)")
+_INDEX_FILENAME_RE = re.compile(r"&lt;FILENAME&gt;([^\n&<]*)")
+_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def text_selection() -> list[tuple[str, str]]:
+    """Return the ``(cik, accession)`` pairs of the 8-K text fixtures.
+
+    Output order is the fetch order: every Item 2.02 filing (Apple, then
+    Shopify), the non-2.02 filings, then the amendment.  The selection is
+    fixed in :data:`TEXT_ITEM_2_02`, :data:`TEXT_OTHER_8KS` and
+    :data:`TEXT_8K_AMENDMENTS` so a rerun stores the same filings.
+    """
+    pairs: list[tuple[str, str]] = []
+    for group in (TEXT_ITEM_2_02, TEXT_OTHER_8KS, TEXT_8K_AMENDMENTS):
+        for cik, accessions in group.items():
+            pairs.extend((cik, accession) for accession in accessions)
+    return pairs
+
+
+def filing_index_url(cik: str, accession: str) -> str:
+    """Return the ``-index-headers.html`` URL of ``accession`` for ``cik``."""
+    return (
+        f"{ARCHIVES_HOST}/Archives/edgar/data/{int(cik)}/"
+        f"{accession.replace('-', '')}/{accession}-index-headers.html"
+    )
+
+
+def document_url(cik: str, accession: str, filename: str) -> str:
+    """Return the archive URL of one document inside ``accession``."""
+    return f"{ARCHIVES_HOST}/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{filename}"
+
+
+def parse_index_documents(text: str) -> list[IndexDocument]:
+    """Parse the document list of an EDGAR ``-index-headers.html`` page.
+
+    ``text`` is the decoded HTML; the page embeds its index header as escaped
+    SGML, so the ``<DOCUMENT>`` blocks appear as ``&lt;DOCUMENT&gt;``.  The
+    result is ordered by ``<SEQUENCE>``.  Raises :class:`FixtureError` when
+    the page lists no documents or a block lacks ``TYPE``, ``SEQUENCE`` or
+    ``FILENAME``, which means SEC changed the page and the selection logic
+    must be re-checked against it.
+    """
+    blocks = _INDEX_DOCUMENT_RE.findall(text)
+    if not blocks:
+        raise FixtureError("index-headers page lists no <DOCUMENT> blocks")
+    documents: list[IndexDocument] = []
+    for block in blocks:
+        document_type = _INDEX_TYPE_RE.search(block)
+        sequence = _INDEX_SEQUENCE_RE.search(block)
+        filename = _INDEX_FILENAME_RE.search(block)
+        if document_type is None or sequence is None or filename is None:
+            raise FixtureError(
+                f"index-headers <DOCUMENT> block lacks TYPE, SEQUENCE or FILENAME: {block[:120]!r}"
+            )
+        documents.append(
+            IndexDocument(
+                document_type=document_type.group(1).strip(),
+                sequence=int(sequence.group(1)),
+                filename=filename.group(1).strip(),
+            )
+        )
+    return sorted(documents, key=lambda document: document.sequence)
+
+
+def _check_filing_kind(cik: str, accession: str, row: dict[str, Any]) -> None:
+    """Assert a selected filing matches the category it was selected for."""
+    items = {item.strip() for item in (row.get("items") or "").split(",") if item.strip()}
+    form = row.get("form")
+    if accession in TEXT_ITEM_2_02.get(cik, ()):
+        if form not in EVENT_FORMS or "2.02" not in items:
+            raise FixtureError(
+                f"{accession} is selected for Item 2.02 but the submissions row is "
+                f"form {form!r} with items {row.get('items')!r}"
+            )
+    elif accession in TEXT_OTHER_8KS.get(cik, ()):
+        if form != "8-K" or "2.02" in items:
+            raise FixtureError(
+                f"{accession} is selected as a non-2.02 8-K but the submissions row is "
+                f"form {form!r} with items {row.get('items')!r}"
+            )
+    elif form != "8-K/A":
+        raise FixtureError(f"{accession} is selected as the 8-K/A but its form is {form!r}")
+
+
+def build_text(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
+    """Fetch and store the 8-K text fixtures under ``tests/fixtures/sec_text``.
+
+    For every pair from :func:`text_selection` the tool fetches the
+    ``-index-headers.html`` page, checks the selected filing's form and items
+    against the stored submissions fixtures, then fetches the primary document
+    (the index type equal to the form, whose filename must equal the
+    submissions ``primaryDocument``) and every ``EX-99.1`` the page lists.
+    Bodies are stored unmodified under the decision A-30 layout and the
+    separate manifest is rewritten from scratch, so a rerun reproduces the
+    tree (only ``fetched_at`` names change).  Returns per-issuer counts.
+    """
+    if TEXT_FIXTURE_ROOT.exists():
+        shutil.rmtree(TEXT_FIXTURE_ROOT)
+    TEXT_RAW_DIR.mkdir(parents=True)
+    manifest = Manifest(root=TEXT_FIXTURE_ROOT)
+    index = read_submissions_index()
+    summary: dict[str, Any] = {"issuers": {}, "filings": 0, "documents": 0, "exhibits": 0}
+
+    for cik, accession in text_selection():
+        entry = index.get(cik, {}).get(accession)
+        if entry is None:
+            raise FixtureError(f"{accession} is not in the submissions fixtures for {cik}")
+        row, _source = entry
+        _check_filing_kind(cik, accession, row)
+
+        url = filing_index_url(cik, accession)
+        status, body = _fetch(url, agent=agent, limiter=limiter)
+        if status != 200 or not body:
+            raise FixtureError(f"missing index-headers for {accession} (HTTP {status})")
+        manifest.store(
+            endpoint="filing_index",
+            cik=cik,
+            key=accession,
+            suffix=".html",
+            url=url,
+            body=body,
+            http_status=status,
+            trimmed=False,
+        )
+        documents = parse_index_documents(body.decode("utf-8", "replace"))
+        primary = [document for document in documents if document.document_type == row["form"]]
+        if len(primary) != 1:
+            raise FixtureError(
+                f"{accession}: expected one {row['form']} document in the index, "
+                f"found {len(primary)}"
+            )
+        primary_document = row.get("primaryDocument")
+        if primary_document and primary[0].filename != primary_document:
+            raise FixtureError(
+                f"{accession}: index primary {primary[0].filename!r} does not match "
+                f"submissions primaryDocument {primary_document!r}"
+            )
+        exhibits = [document for document in documents if document.document_type == "EX-99.1"]
+        if accession in TEXT_ITEM_2_02.get(cik, ()) and not exhibits:
+            raise FixtureError(f"{accession} has Item 2.02 but the index lists no EX-99.1")
+
+        issuer = summary["issuers"].setdefault(cik, {"filings": 0, "documents": 0, "exhibits": 0})
+        issuer["filings"] += 1
+        summary["filings"] += 1
+        for document in [primary[0], *exhibits]:
+            if not _FILENAME_RE.fullmatch(document.filename):
+                raise FixtureError(
+                    f"{accession}: unexpected document filename {document.filename!r}"
+                )
+            suffix = Path(document.filename).suffix
+            if not suffix:
+                raise FixtureError(f"{accession}: document {document.filename!r} has no extension")
+            document_body_status, document_body = _fetch(
+                document_url(cik, accession, document.filename),
+                agent=agent,
+                limiter=limiter,
+            )
+            if document_body_status != 200 or not document_body:
+                raise FixtureError(
+                    f"missing document {document.filename} for {accession} "
+                    f"(HTTP {document_body_status})"
+                )
+            manifest.store(
+                endpoint="documents",
+                cik=cik,
+                key=f"{accession}__{document.filename}",
+                suffix=suffix,
+                url=document_url(cik, accession, document.filename),
+                body=document_body,
+                http_status=document_body_status,
+                trimmed=False,
+            )
+            issuer["documents"] += 1
+            summary["documents"] += 1
+            if document.document_type == "EX-99.1":
+                issuer["exhibits"] += 1
+                summary["exhibits"] += 1
+        print(f"[{cik}] {accession} stored ({len(exhibits)} EX-99.1)", flush=True)
 
     manifest.write()
     return summary
@@ -1058,15 +1324,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Download and trim the SEC fixtures, or rebuild the staging CSVs."
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--staging",
         action="store_true",
         help="write tests/fixtures/staging/*.csv and expected_asof.json from the fixture tree",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--company-tickers",
         action="store_true",
         help="refresh only raw/company_tickers/_/<fetched_at>.json (decision A-17)",
+    )
+    modes.add_argument(
+        "--text",
+        action="store_true",
+        help="fetch the 8-K index, primary documents and EX-99.1 files into "
+        "tests/fixtures/sec_text (decision A-30)",
     )
     args = parser.parse_args(argv)
     if args.staging:
@@ -1092,6 +1365,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(summary_tickers, indent=2))
         print(f"company tickers written to {FIXTURE_ROOT}")
+        return 0
+    if args.text:
+        try:
+            text_summary = build_text(agent=agent, limiter=limiter)
+        except FixtureError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        text_bytes = sum(
+            path.stat().st_size for path in TEXT_FIXTURE_ROOT.rglob("*") if path.is_file()
+        )
+        text_summary["fixture_bytes"] = text_bytes
+        print(json.dumps(text_summary, indent=2))
+        print(f"text fixtures written to {TEXT_FIXTURE_ROOT} ({text_bytes / 1e6:.2f} MB)")
         return 0
     try:
         summary = build(agent=agent, limiter=limiter)
