@@ -12,39 +12,46 @@ edgar-pit builds a point-in-time (PIT) fundamentals and corporate-events dataset
 ## 2. Data flow
 
 ```
-config/universe.csv
+config/universe.csv, config/universe_large.csv
       │
       ▼
 SecClient (rate-limited, retrying, User-Agent)  ──►  raw cache (immutable, zstd, SHA-256 manifest)
   submissions + paginated pages                          │
-  companyfacts                                           │
+  companyfacts, companyconcept, frames                   │
   per-filing SGML headers (acceptance time)              │
   filing index + 8-K documents                           │
+  company_tickers                                        │
 ValetClient (same limiter) ──► Bank of Canada FX series  │
                                                          ▼
-ingest/submissions.py ─► filings, events_8k  ┐
-ingest/headers.py     ─► acceptance times    │
-ingest/companyfacts.py ─► facts_raw          ├─► load.py (Pandera-validated) ─► DuckDB schema `raw`
-text/ingest.py        ─► filings_text        │                                    │
-fx/valet.py           ─► fx_daily            ┘                                    ▼
-                                                     dbt (transform/): stg → int → fundamentals_pit, fundamentals_pit_usd,
-                                                     ratios_pit, events_8k, filings
+ingest/submissions.py   ─► filings, events_8k  ┐
+ingest/headers.py       ─► acceptance times    │
+ingest/companyfacts.py  ─► facts_raw           ├─► load.py (Pandera-validated) ─► DuckDB schema `raw`
+text/fetch.py           ─► index + docs         │
+text/ingest.py          ─► filings_text        │                                    │
+fx/valet.py             ─► fx_daily            ┘                                    ▼
+                                                     dbt (transform/): stg → int → fundamentals_pit,
+                                                     fundamentals_pit_usd, ratios_pit, events_8k,
+                                                     filings, filings_text
                                                                                        │
-                        query.py (asof/history/events) ◄───────────────────────────────┘
-                          │            │             │
-                     Python API    FastAPI       Streamlit explorer
+                    query.py (asof/history/events/filing_text) ◄───────────────────────┘
+                      │            │             │
+                  Python API    FastAPI       Streamlit explorer
                                                                                        │
                                                          export.py ─► Parquet + manifest.json (GitHub Release)
 ```
+
+`fetch`, `fetch-text` and `fx` only fill the raw cache; `build` only reads it,
+so the database remains a pure function of the cache (decision A-37).
 
 ## 3. Modules
 
 | Module | Responsibility |
 |---|---|
 | `edgarpit/config.py` | Settings from env (`SEC_USER_AGENT`, rate limit, paths, `EDGARPIT_DB`); pydantic-settings; `.env` support. |
-| `edgarpit/sec_client.py` | `SecClient`: `get_json(url)`, `get_text(url)`; token bucket ≤5 req/s; tenacity retries; raw cache writer + manifest; offline mode reading a cache/fixtures dir. |
-| `edgarpit/rawcache.py` | Raw cache layout, exclusive-create writes, manifest append, "latest per key" reader (compressed or plain). |
-| `edgarpit/universe.py` | Load/validate `config/universe.csv`; `resolve` against `company_tickers.json`. |
+| `edgarpit/sec_client.py` | `SecClient`: `get_json(url)`, `get_text(url)`; token bucket ≤5 req/s; tenacity retries; raw cache writer + manifest; offline mode reading a cache/fixtures dir; URL builders for submissions, companyfacts, companyconcept, frames, headers, filing indexes, documents, tickers. |
+| `edgarpit/rawcache.py` | Raw cache layout, exclusive-create writes, manifest append, "latest per key" reader (compressed or plain); `python -m edgarpit.rawcache verify DIR`. |
+| `edgarpit/universe.py` | Load/validate `config/universe.csv` (and the large universe); `resolve` against `company_tickers.json`. |
+| `tools/build_universe_large.py` | Build `config/universe_large.csv` from SEC frames, companyconcept and submissions (decision A-36); see section 5. |
 | `edgarpit/schemas.py` | Pandera (Polars) schemas for `filings`, `facts_raw`, `events_8k` (staging) and `filings_text`, `fx_daily` (Phase 2 raw); the column lists are the staging contract. |
 | `edgarpit/concepts.py` | Load `config/concept_map.yaml`; map `(taxonomy, concept)` → canonical field with rank. |
 | `edgarpit/ingest/submissions.py` | Submissions JSON (+ pages) → `filings`, `events_8k` DataFrames. |
@@ -53,18 +60,19 @@ fx/valet.py           ─► fx_daily            ┘                            
 | `edgarpit/text/discover.py` | Filing `-index-headers.html` → the primary 8-K/8-K/A document and every `EX-99.1` (decision A-30). |
 | `edgarpit/text/clean.py` | EDGAR HTML → plain text (decision A-31). |
 | `edgarpit/text/segment.py` | Plain text + the filing's item codes → item sections, or one `unsegmented` section (decision A-31). |
+| `edgarpit/text/fetch.py` | `fetch-text` orchestration: select the 8-Ks carrying the requested items from a built database and cache their index page and documents (decisions A-30, A-37, A-40); never writes `raw.filings_text`. |
 | `edgarpit/text/ingest.py` | Cached filing index and documents → `raw.filings_text`. |
-| `edgarpit/fx/valet.py` | Bank of Canada Valet client (same limiter, retries and cache) and `parse_valet` → `raw.fx_daily` (decision A-32). |
-| `edgarpit/load.py` | Validate DataFrames and load into `raw.*`; `build_from_raw(raw_dir, out_dir)` runs ingest → load → dbt. |
+| `edgarpit/fx/valet.py` | Bank of Canada Valet client (same limiter, retries and cache), `fetch_fx` (fetch the series into the cache only when it changed), and `parse_valet` → `raw.fx_daily` (decisions A-32, A-37). |
+| `edgarpit/load.py` | Validate DataFrames and load into `raw.*`; `build_from_raw(raw_dir, out_dir)` runs ingest (including cached text and FX) → load → dbt. |
 | `edgarpit/devdb.py` | Foundation helper: create `raw.*` tables from `tests/fixtures/staging/*.csv` (or empty) for dbt/query work before ingest exists. |
 | `edgarpit/ratios.py` | Python ratio rule (same-currency/unit guard) used by tests and query. |
-| `edgarpit/query.py` | `asof()`, `history()`, `events()` over DuckDB. |
-| `edgarpit/qa.py` | Coverage, restatements, imputed timestamps, unmapped concepts, unit/currency anomalies, header-vs-API disagreements; non-zero exit on key violations. |
-| `edgarpit/export.py` | Deterministic Parquet + `manifest.json`. |
-| `edgarpit/fetch.py` | Fetch orchestration for a universe (submissions, pages, companyfacts, headers, filing indexes, 8-K documents, FX series); `incremental` skips unchanged issuers (decision A-34). |
-| `edgarpit/cli.py` | Typer app `edgarpit`: `universe resolve`, `fetch`, `fetch-text`, `build`, `fx`, `asof`, `qa`, `export`. |
+| `edgarpit/query.py` | `asof()`, `history()`, `events()`, `filing_text()`, `issuers()`, `fields()` over DuckDB. |
+| `edgarpit/qa.py` | Coverage, restatements, imputed timestamps, unmapped concepts, unit/currency anomalies, header-vs-API disagreements, Phase 2 coverage (text rows, FX conversions and unconverted reasons); non-zero exit on key violations. |
+| `edgarpit/export.py` | Deterministic Parquet + `manifest.json`; the Phase 2 tables ship when the database has them (section 9). |
+| `edgarpit/fetch.py` | Fetch orchestration for a universe (submissions, pages, companyfacts, headers, filing indexes, 8-K documents); `incremental` skips unchanged issuers (decision A-34). |
+| `edgarpit/cli.py` | Typer app `edgarpit`: `universe resolve`, `fetch`, `fetch-text`, `build`, `fx`, `asof`, `qa`, `export` (section 12). |
 | `transform/` | dbt-duckdb project. |
-| `api/main.py` | FastAPI over `query.py`. |
+| `api/main.py` | FastAPI over `query.py`: `/asof`, `/history`, `/events`, `/text`, `/health`. |
 | `explorer/app.py` | Streamlit + Altair over `query.py`. |
 
 ## 4. Acceptance time (why the SGML header)
@@ -90,6 +98,8 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
   filing_index/<cik10>/<accession>/<fetched_at>.html.zst
   documents/<cik10>/<accession>__<filename>/<fetched_at>.<ext>.zst
   fx/_/<series>/<fetched_at>.json.zst
+  frames/_/<taxonomy>__<tag>__<unit>__<period>/<fetched_at>.json.zst
+  companyconcept/<cik10>/<taxonomy>__<tag>/<fetched_at>.json.zst
   manifest.jsonl
 ```
 
@@ -99,7 +109,25 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
 - `filing_index` keys are accessions: the page is `https://www.sec.gov/Archives/edgar/data/<cik-int>/<acc-no-dashes>/<accession>-index-headers.html`, which lists each document's SGML `<TYPE>` and `<FILENAME>` (`index.json` has no types).
 - `documents` keys are `<accession>__<filename>` and the stored file keeps the document's own extension (`.htm`, `.html`, `.txt`), so a key names exactly one file and a reader never mistakes one document for another. A filing's documents are immutable, so they are fetched once and never re-fetched.
 - `fx` keys are Bank of Canada Valet series ids (`FXUSDCAD`) in the global `_` slot, with `""` in the manifest's `cik`, like `company_tickers`. A series is stored whole, so the key does not depend on the date range requested.
+- `frames` documents are global XBRL snapshots from `/api/xbrl/frames/<taxonomy>/<tag>/<unit>/<period>.json`, keyed `<taxonomy>__<tag>__<unit>__<period>` in the global `_` slot with `""` in the manifest's `cik`. A frame is one calendar period, so it is an immutable snapshot.
+- `companyconcept` documents are one issuer's history of one tag from `/api/xbrl/companyconcept/CIK<cik10>/<taxonomy>/<tag>.json`, keyed `<taxonomy>__<tag>` under the issuer's CIK.
+- The fixture cache at `tests/fixtures/sec/raw` carries the 8-K text and `FXUSDCAD` roots and their manifest rows, so an offline build exercises text extraction and USD conversion end to end (decision A-44). `tests/fixtures/fx` keeps `IEXE0101` as research evidence only; it is never ingested.
 - All endpoints share the same rate limiter, User-Agent and retry policy (decisions A-2, A-3); the Bank of Canada requests go through the same client.
+
+### Large universe (decisions A-33, A-36)
+
+`config/universe_large.csv` is built by `tools/build_universe_large.py` from SEC
+and Bank of Canada data only: the top ~125 US issuers by `dei:EntityPublicFloat`
+and the top ~125 Canadian issuers by latest total assets in USD, with every
+`config/universe.csv` issuer kept. A Canadian issuer is one whose submissions
+business or mailing address is in a Canadian province (EDGAR state codes
+`A0`–`A9`, `B0`, `Z4`), found from a submissions sweep — a frame `loc` never
+decides it. Total assets come from `companyconcept` `us-gaap:Assets` or
+`ifrs-full:Assets`, converted at the latest `FXUSDCAD` observation for ranking
+only. Funds and blank-check companies are excluded; an issuer needs an annual
+report (10-K, 40-F or 20-F) within two years. The file is a static issuer list
+for a fetch run: frames carry no acceptance time, so nothing in it decides what
+was known when.
 
 ### Incremental fetch (decision A-34)
 
@@ -111,8 +139,10 @@ The five data tables below are the staging contract: `edgarpit/schemas.py`
 declares each one's columns, order, dtypes and nullability in `SCHEMAS`,
 `COLUMNS` and `DUCKDB_TYPES`, `load.load_tables` writes them in one
 transaction, and `tests/fixtures/staging/<table>.csv` mirrors them one CSV per
-table. `raw.concept_map` and `raw.universe` are the reference tables loaded by
-`load.load_reference_tables`.
+table. `build` creates `filings_text` and `fx_daily` empty when the raw cache
+holds no `filing_index` or `fx` entries, so a Phase 1 cache still builds
+(decision A-37). `raw.concept_map` and `raw.universe` are the reference tables
+loaded by `load.load_reference_tables`.
 
 ### `raw.filings` — one row per filing
 | column | type | notes |
@@ -242,7 +272,11 @@ Loaded by `edgarpit.load.load_reference_tables`; dbt maps concepts only through 
 | country | VARCHAR | |
 | filer_type | VARCHAR | |
 
-Loaded by `edgarpit.load.load_reference_tables` from `config/universe.csv`; dbt attaches tickers only through this table.
+Loaded by `edgarpit.load.load_reference_tables` from `config/universe.csv` (or
+`config/universe_large.csv` for a Phase 2 fetch); dbt attaches tickers only
+through this table. One ticker per CIK is the contract: separately registered
+subsidiaries (TC Energy and TransCanada PipeLines) stay separate rows (decision
+A-44).
 
 ## 7. Column contract — dbt output models (schema `main`)
 
@@ -286,7 +320,7 @@ Every column of `fundamentals_pit`, unchanged and in the same order, plus:
 | fx_rate_date | DATE NULL | observation date of `fx_rate`; null for a USD value and for an unconverted row |
 | fx_known_at | TIMESTAMPTZ NULL | `fx_rate_date` 17:00 `America/Toronto` in UTC; null like `fx_rate_date` |
 | converted | BOOLEAN | true when `value_usd` is populated |
-| asof_ts | TIMESTAMPTZ | `greatest(acceptance_ts, fx_known_at)`: when the converted row is known |
+| asof_ts | TIMESTAMPTZ | when the row is known: `greatest(acceptance_ts, fx_known_at)` for a converted CAD row and `acceptance_ts` for a USD or unconverted row |
 | unconverted_reason | VARCHAR NULL | null when converted; `no_rate` when a CAD period ends before the first observation; `currency_out_of_scope` for any other currency, including rows with no currency (decision A-38) |
 
 Key: the same `(cik, field, period_start, period_end, accession)` as
@@ -325,26 +359,54 @@ later restatement of the series) changes that choice.
 
 Invariant (dbt test `assert_ratio_inputs_not_from_future`): `numerator_acceptance_ts <= asof_ts AND denominator_acceptance_ts <= asof_ts`.
 
-### `events_8k` — as `raw.events_8k`, plus `ticker`. `filings` — as `raw.filings`, plus `ticker`. `filings_text` — as `raw.filings_text`, plus `ticker`.
+### `events_8k` — as `raw.events_8k`, plus `ticker`. `filings` — as `raw.filings`, plus `ticker`. `filings_text` — as `raw.filings_text`, plus `ticker` from `raw.universe`; its rows are known at the copied `acceptance_ts`, and no column of the text decides it (decision A-31).
 
 ## 8. Query semantics
 
-- `asof(identifier, field, asof_ts, period="FY", n=1, *, db=None, currency=None) -> list[AsOfResult]`: candidates are rows with `acceptance_ts <= asof_ts` and `period_type = period`; per period keep the max `(acceptance_ts, version)`; order by `period_end` desc; first `n`. `AsOfResult` fields: cik, ticker, field, value, unit, currency, period_start, period_end, period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, restatement_kind (decision A-25; the explorer marks only `revision` as a restatement and gives `split_adjustment` its own status).
-- `history(identifier, field, period=None, *, db=None, currency=None)` → every version, ordered by period_end, version.
-- `events(identifier, item=None, start=None, end=None)` → rows of `events_8k` by acceptance_ts.
-- `asof_ts` strings must carry a timezone (`Z` or offset); naive inputs are rejected.
-- `currency="USD"` reads `main.fundamentals_pit_usd` and applies the point-in-time rule to `asof_ts` instead of `acceptance_ts`, returning `value_usd` with the same `AsOfResult` fields (decision A-32). Until that model is built the keyword raises `NotImplementedError`; `None` keeps the row's own currency.
-
-REST (FastAPI): `GET /asof`, `GET /history`, `GET /events` with the same parameters; `ticker` or `cik`; OpenAPI at `/docs`.
+- `asof(identifier, field, asof_ts, period="FY", n=1, *, db=None, currency=None) -> list[AsOfResult]`: candidates are rows with `acceptance_ts <= asof_ts` and `period_type = period`; per period keep the max `(acceptance_ts, version)`; order by `period_end` desc; first `n`. `identifier` is a ticker (case-insensitive) or a CIK (digits, zero-padded).
+- `AsOfResult` fields: cik, ticker, field, value, unit, currency, period_start, period_end, period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, restatement_kind, asof_ts (decision A-25, A-41). `acceptance_ts` is the filing's acceptance time in UTC. `asof_ts` is the row's own known time for a USD read (`max(acceptance_ts, fx_known_at)` in UTC) and `None` for a reported read; it is the field a consumer compares with its clock when it uses a converted value, never an approximation derived from `period_end`.
+- `history(identifier, field, period=None, *, db=None, currency=None)` → every version, ordered by period_end, version. USD history returns only converted rows; a row with no usable rate is absent rather than null.
+- `events(identifier, item=None, start=None, end=None)` → rows of `main.events_8k` by acceptance_ts, optionally filtered to one item code and to an inclusive acceptance-time range.
+- `filing_text(identifier, *, item=None, start=None, end=None, db=None)` → rows of `main.filings_text` ordered by acceptance_ts, accession, document and section_order. `item="2.02"` keeps every section and exhibit of each filing whose `main.events_8k` rows carry that item (decision A-40), so Item 2.02 text is the join of the two tables on accession. Text is known at the filing's `acceptance_ts`; `ts_imputed` says that time was imputed.
+- `issuers(*, db=None)` → `(cik, ticker)` pairs; `fields(identifier, *, db=None)` → the canonical fields the issuer has.
+- `asof_ts` strings must carry a timezone (`Z` or offset); naive inputs are rejected with `ValueError`. Unknown or ambiguous tickers raise `LookupError` (`KeyError` is not used).
+- `currency="USD"` reads `main.fundamentals_pit_usd` and applies the point-in-time rule to the row's `asof_ts` instead of `acceptance_ts`, returning `value_usd` in the same `AsOfResult` shape with `currency="USD"`, the reported unit with its currency replaced (`CAD` → `USD`, `CAD/shares` → `USD/shares`) and `asof_ts` filled in (decision A-32, A-41). `None` reads the reported values and leaves `asof_ts` null. A database built before the Phase 2 models raises `MissingTableError`, which REST answers as 501; a database without `main.filings_text` does the same for `filing_text`.
+- The REST service exposes the same functions: `GET /asof`, `GET /history`, `GET /events`, `GET /text` and `GET /health`, taking `ticker` or `cik` (exactly one) and the same parameters. `/asof` and `/history` accept `currency=USD`; every `AsOfResponse` carries `asof_ts` (ISO-8601 UTC with `Z`, null for a reported read). OpenAPI is at `/docs`.
 
 ## 9. Determinism and export
 
 `build --offline` must produce identical Parquet hashes across runs: fixed `ORDER BY` on every exported table, no build timestamps inside data files, fixed Parquet writer settings (compression, row group size). Build time and fetch range go only into `manifest.json`.
 
+`export` writes one Parquet file per table. A Phase 1 database produces the
+five Phase 1 files; a Phase 2 database adds the three Phase 2 files because the
+models exist:
+
+| File | Source | Key (row order) |
+|---|---|---|
+| `fundamentals_pit.parquet` | `main.fundamentals_pit` | `cik, field, period_start, period_end, accession` |
+| `ratios_pit.parquet` | `main.ratios_pit` | `cik, ratio, period_start, period_end, asof_ts` |
+| `events_8k.parquet` | `main.events_8k` | `cik, accession, item_code` |
+| `filings.parquet` | `main.filings` | `cik, accession` |
+| `facts_raw.parquet` | `raw.facts_raw` | `cik, taxonomy, concept, unit, period_start, period_end, accession` |
+| `fundamentals_pit_usd.parquet` | `main.fundamentals_pit_usd` | `cik, field, period_start, period_end, accession` |
+| `filings_text.parquet` | `main.filings_text` | `accession, document, section_order, section` |
+| `fx_daily.parquet` | `raw.fx_daily` | `series, rate_date` |
+
+`filings_text` uses a 10 000-row group instead of 100 000 because a section is
+prose; every file is ZSTD-compressed.
+
+`manifest.json` lists every file with `table`, `file`, `rows`, `bytes` (the
+file size), `sha256` and `schema`; the `filings_text` entry also carries
+`text_bytes`, the uncompressed UTF-8 byte count of the section text, so a
+release reviewer can see the size budget of the only table whose rows can be
+arbitrarily long. The manifest's own `build_timestamp`, `database` and
+`sec_fetch_range` are the only values that change between two exports of the
+same database; the Parquet bytes do not.
+
 ## 10. Testing
 
 - Unit + property tests (Hypothesis) with no network; HTTP via respx; data via fixtures.
-- Classic-bug tests (must exist, must be able to fail): restatement accepted after as-of not returned; period end before as-of but filed after excluded; property "no row after as-of"; dbt future-input test; IFRS and US GAAP concepts map to the same field; mixed-currency ratio rejected.
+- Classic-bug tests (must exist, must be able to fail): restatement accepted after as-of not returned; period end before as-of but filed after excluded; property "no row after as-of"; dbt future-input test; IFRS and US GAAP concepts map to the same field; mixed-currency ratio rejected; a USD result is never known before either its filing's `acceptance_ts` or its rate's `known_at` (`tests/test_query_usd.py::test_usd_asof_ts_is_never_earlier_than_the_acceptance_time`).
 - `@pytest.mark.network` tests are excluded from CI.
 
 ## 11. CI
@@ -353,32 +415,62 @@ GitHub Actions, workflow `ci.yml`, jobs `lint`, `types`, `tests`, `dbt` (require
 
 ## 12. Command line (Phase 2 surface)
 
-The existing commands are unchanged; Phase 2 adds these signatures. Each lands
-with the issue that implements it, and the flags below are the agreed surface.
-
 ```
+edgarpit universe resolve [--universe CSV] (--offline --fixtures DIR | --data DIR) [--write]
 edgarpit fetch --universe CSV --out DIR [--incremental]
-edgarpit fetch-text --db PATH --items 2.02 [--limit N] [--data ./data]
+edgarpit fetch-text --db PATH --items 2.02 [--items ...] [--limit N] [--data ./data]
 edgarpit fx --out DIR
-edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS [--currency USD]
+edgarpit build (--offline --fixtures DIR | --data DIR) --out DIR
+edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS
+    [--period FY|Q] [--n N] [--currency USD] [--json]
+edgarpit qa --db PATH
+edgarpit export --db PATH --out DIR [--data DIR]
 ```
 
+- `universe resolve` validates every ticker against SEC's `company_tickers.json`
+  and fills missing CIKs; `--write` only when resolution is clean. With
+  `--offline` it reads the cached copy under `--fixtures`.
 - `fetch --incremental` fetches one submissions document per issuer and skips the
   issuers whose document is unchanged, reporting `skipped N unchanged`
-  (decision A-34).
+  (decision A-34). Without the flag every requested document is fetched.
 - `fetch-text` only fetches (decision A-37): it reads the 8-K filings whose
-  `items` contain one of `--items` from the database at `--db`, writes their
-  `-index-headers.html` and each referenced document into the raw cache under
-  `--data` (default `./data`), and stops after `--limit` filings when given. It
-  never fetches a document that is already cached (decision A-30) and it never
-  writes `raw.filings_text`: `edgarpit build` ingests the cached text.
+  `items` contain one of `--items` from the database at `--db` (needed only to
+  choose accessions), writes their `-index-headers.html` and every referenced
+  primary/`EX-99.1` document into the raw cache under `--data` (default
+  `./data`), and stops after `--limit` filings when given. It never fetches a
+  document that is already cached (decision A-30) and it never writes
+  `raw.filings_text`: `edgarpit build` ingests the cached text.
 - `fx` only fetches (decision A-37): it requests the `FXUSDCAD` history, stores
   the body in the raw cache at `--out` only when it differs from the latest
-  cached copy, and prints the row count. A repeat run with an unchanged series
-  adds no cache file.
+  cached copy, and prints the series, observation count, date range and whether
+  a file was stored. A repeat run with an unchanged series adds no cache file.
 - `build` ingests `raw.filings_text` from every cached `filing_index` and
   `raw.fx_daily` from the latest cached `fx` series, and creates both tables and
   their models empty when the cache holds no such endpoint, so a Phase 1 cache
   still builds (decision A-37).
 - `asof --currency USD` reads `main.fundamentals_pit_usd` and applies the
-  point-in-time rule to `asof_ts` (decision A-32).
+  point-in-time rule to `asof_ts` (decisions A-32, A-41); the human and JSON
+  output show `USD`. A database without that model exits 1 with the query's
+  message.
+- `qa` prints the Phase 2 section after the existing sections (text rows per
+  issuer, FX conversions, converted counts by reason) and still exits 1 only on
+  a key-uniqueness violation.
+- `export --data DIR` takes the SEC fetch range from the raw cache manifest;
+  without it the `build-info.json` beside the database supplies it.
+
+Exit codes are `0` success, `1` a data or fetch failure and `2` a usage error
+(bad flags, malformed timestamps, missing or malformed `SEC_USER_AGENT`). Every
+failure prints a one-line cause to stderr. The scheduled refresh and weekly
+release that call these commands are described in
+[`docs/operations.md`](operations.md).
+
+### Known limits
+
+- **8-K text starts in 2014.** EDGAR's `-index-headers.html` pages do not exist
+  for older filings, so an 8-K accepted before 2014 has no text; its items are
+  still events.
+- **The universe is SEC-only.** A company listed only on the TSX files nothing
+  with the SEC and is outside the dataset, however large it is.
+- **FX before 2017-01-03 is not converted.** The Bank of Canada's `FXUSDCAD`
+  series starts then; an earlier period end keeps `value_usd` null and
+  `unconverted_reason='no_rate'` (decision A-39).
