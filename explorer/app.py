@@ -24,6 +24,12 @@ The release publishes these assets:
 - ``fundamentals_pit.parquet``, ``ratios_pit.parquet``, ``events_8k.parquet``,
   ``filings.parquet`` and ``facts_raw.parquet`` — the five released tables.
 
+A database that also carries the Phase 2 models gets two more controls: a
+"Reported / USD" switch for the versions (``main.fundamentals_pit_usd``, decision
+A-32) and an "8-K text" section listing the issuer's Item 2.02 filings with each
+stored section in an expander (``main.filings_text``, decisions A-31 and A-40).
+Both disappear when the tables are absent, so a 1.0.0 release renders unchanged.
+
 Run locally with ``streamlit run explorer/app.py``; the tests drive it
 headlessly with ``streamlit.testing.v1.AppTest``.
 """
@@ -37,10 +43,11 @@ import re
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import duckdb
@@ -60,6 +67,8 @@ STATUS_ORDER = [
 ]
 STATUS_COLORS = ["#1f77b4", "#d62728", "#9467bd", "#ff7f0e", "#9e9e9e"]
 STATUS_SHAPES = ["circle", "diamond", "triangle-up", "square", "cross"]
+
+TORONTO = ZoneInfo("America/Toronto")
 
 VERSION_COLUMNS = [
     "period_end",
@@ -132,7 +141,7 @@ def _status(version: int, restatement_kind: str, known: bool) -> str:
 
     Only a ``revision`` is called a restatement; a ``split_adjustment`` gets
     its own status so stock splits are not shown as misleading restatements
-    (decision A-25). Versions accepted after the as-of time are ``not yet
+    (decision A-25). Versions not known at the as-of time are ``not yet
     accepted``.
     """
     if not known:
@@ -144,6 +153,20 @@ def _status(version: int, restatement_kind: str, known: bool) -> str:
     if version == 1:
         return "version 1"
     return "later version"
+
+
+def usd_known_at(acceptance_ts: datetime, period_end: date) -> datetime:
+    """Return the latest instant a USD-converted value can have become known.
+
+    A converted row's true known time is ``max(acceptance_ts, fx_known_at)``
+    (decision A-32) and the rate used is observed on or before ``period_end``,
+    published at 17:00 ``America/Toronto``. This bound is therefore never
+    earlier than the row's ``asof_ts``, so the page can never present a USD
+    value as known before it was; it may keep it greyed out until the rate for
+    its period end exists. Both inputs are as in :class:`edgarpit.query.AsOfResult`.
+    """
+    rate_latest = datetime.combine(period_end, time(17, 0), tzinfo=TORONTO).astimezone(UTC)
+    return max(acceptance_ts.astimezone(UTC), rate_latest)
 
 
 def _iso_z(value: datetime) -> str:
@@ -433,15 +456,25 @@ def provenance_caption(info: ReleaseInfo) -> str:
     return text
 
 
-def versions_frame(rows: list[query.AsOfResult], asof: datetime) -> pl.DataFrame:
+def versions_frame(
+    rows: list[query.AsOfResult], asof: datetime, *, currency: Literal["USD"] | None = None
+) -> pl.DataFrame:
     """Build the versions table for ``rows`` as a Polars frame.
 
     ``asof`` is the UTC instant of the "as of" control; each row gets a
-    ``known_at_asof`` flag (``acceptance_ts <= asof``) and a ``status`` used by
-    the chart and the table. Only ``revision`` versions are marked as
+    ``known_at_asof`` flag and a ``status`` used by the chart and the table.
+    Without ``currency`` a row is known when ``acceptance_ts <= asof``; with
+    ``currency="USD"`` the comparison uses :func:`usd_known_at`, because the
+    converted value also waits for the FX rate and must never be shown before
+    it was knowable (decision A-32). Only ``revision`` versions are marked as
     restatements; ``split_adjustment`` versions carry their own status (decision
     A-25). One row per filing version, in query order.
     """
+    known_at = [
+        row.acceptance_ts if currency is None else usd_known_at(row.acceptance_ts, row.period_end)
+        for row in rows
+    ]
+    known = [instant <= asof for instant in known_at]
     return pl.DataFrame(
         {
             "period_start": [row.period_start for row in rows],
@@ -452,12 +485,12 @@ def versions_frame(rows: list[query.AsOfResult], asof: datetime) -> pl.DataFrame
             "accession": [row.accession for row in rows],
             "form": [row.form for row in rows],
             "accepted": [_iso_z(row.acceptance_ts) for row in rows],
-            "known_at_asof": [row.acceptance_ts <= asof for row in rows],
+            "known_at_asof": known,
             "is_restatement": [row.is_restatement for row in rows],
             "restatement_kind": [row.restatement_kind for row in rows],
             "status": [
-                _status(row.version, row.restatement_kind, row.acceptance_ts <= asof)
-                for row in rows
+                _status(row.version, row.restatement_kind, is_known)
+                for row, is_known in zip(rows, known, strict=True)
             ],
         }
     )
@@ -476,6 +509,93 @@ def events_frame(rows: list[query.EventResult]) -> pl.DataFrame:
             "item_label": [row.item_label for row in rows],
             "form": [row.form for row in rows],
             "filing": [filing_url(row.cik, row.accession) for row in rows],
+        }
+    )
+
+
+def table_exists(db: str | Path | duckdb.DuckDBPyConnection, name: str) -> bool:
+    """Return whether ``db`` holds the schema-qualified table ``name``.
+
+    ``db`` is a database path or an open connection and ``name`` is
+    ``schema.table`` (``main.fundamentals_pit_usd``). The check is what the page
+    uses to show the USD and 8-K text controls only for a database that has
+    those models, so a 1.0.0 release renders exactly as before. A path is opened
+    read-only and closed again; a passed connection stays open. A name without a
+    schema is never found.
+    """
+    schema, _, table = name.partition(".")
+    if isinstance(db, duckdb.DuckDBPyConnection):
+        con = db
+        owned = False
+    else:
+        con = duckdb.connect(str(db), read_only=True)
+        owned = True
+    try:
+        found = con.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_catalog = current_database() AND table_schema = ? AND table_name = ?",
+            [schema, table],
+        ).fetchone()
+    finally:
+        if owned:
+            con.close()
+    return found is not None
+
+
+@dataclass(frozen=True)
+class TextFiling:
+    """One 8-K whose text is in the database.
+
+    ``acceptance_ts`` is timezone-aware UTC and the only thing that decides when
+    the text was known; ``sections`` holds the filing's rows in query order
+    (``document``, then ``section_order``), covering the primary document and
+    every ``EX-99.1`` exhibit.
+    """
+
+    cik: str
+    accession: str
+    acceptance_ts: datetime
+    sections: tuple[query.TextResult, ...]
+
+
+def text_filings(rows: list[query.TextResult]) -> list[TextFiling]:
+    """Group ``rows`` by accession into one :class:`TextFiling` per 8-K.
+
+    The filings keep the order of their first row, so passing the ordered
+    result of :func:`edgarpit.query.filing_text` gives oldest filing first.
+    Rows of one accession share the filing's acceptance time.
+    """
+    grouped: dict[str, list[query.TextResult]] = {}
+    for row in rows:
+        grouped.setdefault(row.accession, []).append(row)
+    return [
+        TextFiling(
+            cik=sections[0].cik,
+            accession=accession,
+            acceptance_ts=sections[0].acceptance_ts,
+            sections=tuple(sections),
+        )
+        for accession, sections in grouped.items()
+    ]
+
+
+def text_overview_frame(filings: list[TextFiling]) -> pl.DataFrame:
+    """Build the one-row-per-filing table shown above the 8-K text expanders.
+
+    Columns: ``accepted`` (UTC, ``Z`` suffix), ``accession``, ``documents`` (the
+    distinct document names of the filing, comma-separated, in query order),
+    ``sections`` (number of section rows) and ``filing`` (EDGAR index URL).
+    """
+    return pl.DataFrame(
+        {
+            "accepted": [_iso_z(filing.acceptance_ts) for filing in filings],
+            "accession": [filing.accession for filing in filings],
+            "documents": [
+                ", ".join(dict.fromkeys(section.document for section in filing.sections))
+                for filing in filings
+            ],
+            "sections": [len(filing.sections) for filing in filings],
+            "filing": [filing_url(filing.cik, filing.accession) for filing in filings],
         }
     )
 
@@ -552,6 +672,9 @@ def main() -> None:
     issuer = st.sidebar.selectbox("Issuer (ticker and CIK)", options=list(labels), key="issuer")
     cik = labels[issuer]
 
+    has_usd = table_exists(db_path, "main.fundamentals_pit_usd")
+    has_text = table_exists(db_path, "main.filings_text")
+
     available_fields = query.fields(cik, db=db_path)
     field = (
         st.sidebar.selectbox("Field", options=available_fields, key="field")
@@ -561,6 +684,19 @@ def main() -> None:
     period_choice = st.sidebar.radio("Period", options=["FY", "Q"], horizontal=True, key="period")
     quarterly = period_choice == "Q"
     period: Literal["FY", "Q"] = "Q" if quarterly else "FY"
+    currency: Literal["USD"] | None = None
+    if has_usd:
+        values_choice = st.sidebar.radio(
+            "Values",
+            options=["Reported", "USD"],
+            horizontal=True,
+            key="values",
+            help=(
+                "US$ values are converted at the Bank of Canada rate for the period "
+                "end and become known when that rate was published."
+            ),
+        )
+        currency = "USD" if values_choice == "USD" else None
     asof_date = st.sidebar.date_input("As of (UTC midnight)", value=date.today(), key="asof")
     asof = datetime(asof_date.year, asof_date.month, asof_date.day, tzinfo=UTC)
     st.sidebar.caption("Versions accepted after this instant are greyed out and marked not known.")
@@ -569,11 +705,17 @@ def main() -> None:
     if field is None:
         st.info("This issuer has no fundamental values in the database.")
     else:
-        rows = query.history(cik, field, period=period, db=db_path)
+        rows = query.history(cik, field, period=period, db=db_path, currency=currency)
         if not rows:
-            st.info(f"No {period} versions of {field} for this issuer.")
+            if currency == "USD":
+                st.info(
+                    f"No {period} versions of {field} could be converted to USD for this "
+                    "issuer (a value needs a CAD or USD currency and a published FX rate)."
+                )
+            else:
+                st.info(f"No {period} versions of {field} for this issuer.")
         else:
-            frame = versions_frame(rows, asof)
+            frame = versions_frame(rows, asof, currency=currency)
             known = int(frame["known_at_asof"].sum())
             chart_column, table_column = st.columns([3, 2])
             with chart_column:
@@ -581,6 +723,11 @@ def main() -> None:
             with table_column:
                 st.metric("versions known at the as-of", f"{known} of {len(frame)}")
                 st.dataframe(frame[VERSION_COLUMNS], width="stretch", hide_index=True)
+            if currency == "USD":
+                st.caption(
+                    "US$ values are known once the FX rate for their period end is "
+                    "published (17:00 America/Toronto); versions before that stay greyed out."
+                )
 
     st.subheader("8-K events")
     event_rows = query.events(cik, db=db_path)
@@ -597,6 +744,39 @@ def main() -> None:
                 )
             },
         )
+
+    if has_text:
+        st.subheader("8-K text")
+        text_rows = query.filing_text(cik, item="2.02", db=db_path)
+        if not text_rows:
+            st.info("This issuer has no Item 2.02 filing text in the database.")
+        else:
+            filings = text_filings(text_rows)
+            st.caption(
+                "Item 2.02 filings with their stored text: the primary document's sections "
+                "and every EX-99.1 exhibit. Text is known once the filing was accepted."
+            )
+            st.dataframe(
+                text_overview_frame(filings),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "filing": st.column_config.LinkColumn(
+                        "filing", display_text=r"(\d{10}-\d{2}-\d{6})-index\.htm$"
+                    )
+                },
+            )
+            for filing in filings:
+                st.markdown(
+                    f"**{filing.accession}** · accepted {_utc_label(filing.acceptance_ts)} · "
+                    f"[filing index]({filing_url(filing.cik, filing.accession)})"
+                )
+                for section in filing.sections:
+                    with st.expander(
+                        f"{section.document} · section {section.section} "
+                        f"({section.char_count} characters)"
+                    ):
+                        st.text(section.text)
 
 
 if __name__ == "__main__":
