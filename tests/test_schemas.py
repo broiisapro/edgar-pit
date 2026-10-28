@@ -224,7 +224,7 @@ def test_the_staging_contract_covers_all_five_raw_tables() -> None:
     assert set(DUCKDB_TYPES) == set(SCHEMAS)
 
 
-def test_duckdb_ddl_creates_the_phase2_tables() -> None:
+def test_duckdb_ddl_creates_filings_text_and_fx_daily() -> None:
     con = duckdb.connect()
     try:
         con.execute("CREATE SCHEMA raw")

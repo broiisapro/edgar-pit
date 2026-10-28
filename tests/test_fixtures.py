@@ -533,7 +533,7 @@ FX_FIXTURE_DIR = FIXTURE_ROOT / "fx" / "raw" / "fx" / "_" / "FXUSDCAD"
 
 
 def bank_of_canada_rates() -> dict[str, float]:
-    """The fixture ``FXUSDCAD`` observations as ``{date: value}`` strings."""
+    """The fixture ``FXUSDCAD`` observations as ``{rate date: value}``."""
     paths = sorted(FX_FIXTURE_DIR.glob("*.json"))
     assert len(paths) == 1
     document = json.loads(paths[0].read_text(encoding="utf-8"))
