@@ -164,13 +164,29 @@ def test_phase2_stubs_raise_not_implemented(tmp_path: Path) -> None:
         lambda: discover.exhibit_documents("<html></html>"),
         lambda: clean.html_to_text("<html></html>"),
         lambda: segment.segment_items("text", ["2.02"]),
-        lambda: ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings),
         lambda: valet.parse_valet({}),
         lambda: fetch.submissions_unchanged(None, {}),
     ]
     for call in calls:
         with pytest.raises(NotImplementedError):
             call()
+    # The filing-text ingest is implemented: an empty request is the empty
+    # ``raw.filings_text`` frame rather than an unimplemented stub.
+    empty = ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings)
+    assert empty.is_empty()
+    assert empty.columns == [
+        "cik",
+        "accession",
+        "acceptance_ts",
+        "ts_imputed",
+        "document",
+        "doc_type",
+        "section",
+        "section_order",
+        "text",
+        "sha256",
+        "char_count",
+    ]
 
 
 def test_incremental_fetch_is_refused_rather_than_silently_full(tmp_path: Path) -> None:
