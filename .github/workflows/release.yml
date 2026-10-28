@@ -154,6 +154,7 @@ jobs:
           fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "$TAG" \
             --notes-file meta/release-notes.md \
             assets/*

@@ -117,10 +117,11 @@ Two jobs. The first, `build`, is read-only and runs on `ubuntu-24.04` with a
 
 The second job, `publish`, is the only job with `contents: write` and a
 30-minute timeout. It downloads the artifact and runs `gh release create` with
-the tag, the notes file and every asset. If a release with that tag already
-exists it fails with a message instead of overwriting: published data releases
-are immutable, so a re-run on the same day waits for the next weekly run. That
-also keeps release tags append-only, like the `epic-NN-complete` tags.
+the tag, the notes file and every asset, targeting the commit the run was built
+from so the tag records which code produced the data. If a release with that tag
+already exists it fails with a message instead of overwriting: published data
+releases are immutable, so a re-run on the same day waits for the next weekly
+run. That also keeps release tags append-only, like the `epic-NN-complete` tags.
 
 ## Reading a failed run
 
