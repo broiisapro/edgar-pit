@@ -56,7 +56,9 @@ class AsOfResponse(BaseModel):
     ``restatement_kind`` is ``none``, ``split_adjustment`` or ``revision``. With
     ``currency=USD`` the value is converted, ``currency`` is ``USD`` and ``unit``
     carries the reported unit with its currency replaced (``CAD`` → ``USD``,
-    ``CAD/shares`` → ``USD/shares``); ``acceptance_ts`` stays the filing's time.
+    ``CAD/shares`` → ``USD/shares``); ``acceptance_ts`` stays the filing's time
+    and ``asof_ts`` is the converted row's known time, also ISO-8601 UTC with a
+    ``Z`` suffix. A reported read has ``asof_ts`` null (decision A-41).
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -77,6 +79,7 @@ class AsOfResponse(BaseModel):
     is_restatement: bool
     ts_imputed: bool
     restatement_kind: str
+    asof_ts: UtcTimestamp | None = None
 
 
 class EventResponse(BaseModel):

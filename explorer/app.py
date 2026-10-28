@@ -28,7 +28,9 @@ A database that also carries the Phase 2 models gets two more controls: a
 "Reported / USD" switch for the versions (``main.fundamentals_pit_usd``, decision
 A-32) and an "8-K text" section listing the issuer's Item 2.02 filings with each
 stored section in an expander (``main.filings_text``, decisions A-31 and A-40).
-Both disappear when the tables are absent, so a 1.0.0 release renders unchanged.
+A USD version is marked known at the row's own ``asof_ts`` (decision A-41).
+The Phase 2 controls disappear when the tables are absent, so a 1.0.0 release
+renders unchanged.
 
 Run locally with ``streamlit run explorer/app.py``; the tests drive it
 headlessly with ``streamlit.testing.v1.AppTest``.
@@ -43,11 +45,10 @@ import re
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
-from zoneinfo import ZoneInfo
 
 import altair as alt
 import duckdb
@@ -67,8 +68,6 @@ STATUS_ORDER = [
 ]
 STATUS_COLORS = ["#1f77b4", "#d62728", "#9467bd", "#ff7f0e", "#9e9e9e"]
 STATUS_SHAPES = ["circle", "diamond", "triangle-up", "square", "cross"]
-
-TORONTO = ZoneInfo("America/Toronto")
 
 VERSION_COLUMNS = [
     "period_end",
@@ -153,20 +152,6 @@ def _status(version: int, restatement_kind: str, known: bool) -> str:
     if version == 1:
         return "version 1"
     return "later version"
-
-
-def usd_known_at(acceptance_ts: datetime, period_end: date) -> datetime:
-    """Return the latest instant a USD-converted value can have become known.
-
-    A converted row's true known time is ``max(acceptance_ts, fx_known_at)``
-    (decision A-32) and the rate used is observed on or before ``period_end``,
-    published at 17:00 ``America/Toronto``. This bound is therefore never
-    earlier than the row's ``asof_ts``, so the page can never present a USD
-    value as known before it was; it may keep it greyed out until the rate for
-    its period end exists. Both inputs are as in :class:`edgarpit.query.AsOfResult`.
-    """
-    rate_latest = datetime.combine(period_end, time(17, 0), tzinfo=TORONTO).astimezone(UTC)
-    return max(acceptance_ts.astimezone(UTC), rate_latest)
 
 
 def _iso_z(value: datetime) -> str:
@@ -464,17 +449,17 @@ def versions_frame(
     ``asof`` is the UTC instant of the "as of" control; each row gets a
     ``known_at_asof`` flag and a ``status`` used by the chart and the table.
     Without ``currency`` a row is known when ``acceptance_ts <= asof``; with
-    ``currency="USD"`` the comparison uses :func:`usd_known_at`, because the
-    converted value also waits for the FX rate and must never be shown before
-    it was knowable (decision A-32). Only ``revision`` versions are marked as
+    ``currency="USD"`` the comparison uses the row's own ``asof_ts`` (decision
+    A-41), the instant the converted value became known, so the page never
+    presents a USD value before it was knowable and never approximates that
+    instant from the period end. Only ``revision`` versions are marked as
     restatements; ``split_adjustment`` versions carry their own status (decision
     A-25). One row per filing version, in query order.
     """
-    known_at = [
-        row.acceptance_ts if currency is None else usd_known_at(row.acceptance_ts, row.period_end)
-        for row in rows
+    known_at: list[datetime | None] = [
+        row.acceptance_ts if currency is None else row.asof_ts for row in rows
     ]
-    known = [instant <= asof for instant in known_at]
+    known = [instant is not None and instant <= asof for instant in known_at]
     return pl.DataFrame(
         {
             "period_start": [row.period_start for row in rows],

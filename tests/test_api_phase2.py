@@ -23,7 +23,6 @@ from fastapi.testclient import TestClient
 
 from api.main import app
 from edgarpit import query
-from edgarpit.schemas import duckdb_ddl
 
 RY_CIK = "0001000275"
 AAPL_CIK = "0000320193"
@@ -217,23 +216,7 @@ def build_phase2_db(*, path: Path) -> None:
     try:
         con.execute(doubles.FUNDAMENTALS_PIT_USD_DDL)
         _insert(con, "main.fundamentals_pit_usd", doubles.fundamentals_pit_usd_frame(USD_ROWS))
-        con.execute("CREATE SCHEMA IF NOT EXISTS raw")
-        con.execute(duckdb_ddl("filings_text"))
-        _insert(con, "raw.filings_text", doubles.filings_text_frame(TEXT_ROWS))
-        con.execute(
-            """
-            CREATE TABLE main.filings_text AS
-            SELECT text.cik, text.accession, text.acceptance_ts, text.ts_imputed, text.document,
-                   text.doc_type, text.section, text.section_order, text.text, text.sha256,
-                   text.char_count, issuers.ticker
-            FROM raw.filings_text AS text
-            LEFT JOIN (
-                SELECT DISTINCT cik, ticker FROM main.fundamentals_pit
-                UNION
-                SELECT DISTINCT cik, ticker FROM main.events_8k
-            ) AS issuers USING (cik)
-            """
-        )
+        doubles.create_filings_text_tables(con, doubles.filings_text_frame(TEXT_ROWS))
     finally:
         con.close()
 
@@ -288,6 +271,7 @@ def test_asof_usd_returns_the_converted_value(client: TestClient) -> None:
     assert body[0]["currency"] == "USD"
     assert body[0]["unit"] == "USD"
     assert body[0]["acceptance_ts"] == "2023-11-30T11:45:12Z"
+    assert body[0]["asof_ts"] == "2023-11-30T11:45:12Z"
     assert body[0]["accession"] == "0001193125-23-285639"
 
 
@@ -301,6 +285,7 @@ def test_asof_usd_waits_for_the_rate_that_converts_the_value(client: TestClient)
     assert len(at_publication) == 1
     assert at_publication[0]["value"] == pytest.approx(7_000_000_000.0 / FX_RATE)
     assert at_publication[0]["acceptance_ts"] == "2023-10-31T15:00:00Z"
+    assert at_publication[0]["asof_ts"] == "2023-10-31T21:00:00Z"
 
 
 def test_asof_usd_restatement_boundary(client: TestClient) -> None:
@@ -325,6 +310,11 @@ def test_history_usd_returns_only_converted_versions(client: TestClient) -> None
     ]
     assert {row["currency"] for row in body} == {"USD"}
     assert {row["unit"] for row in reported} == {"CAD"}
+    assert [row["asof_ts"] for row in body] == [
+        "2023-11-30T11:45:12Z",
+        "2024-12-04T16:30:00Z",
+    ]
+    assert {row["asof_ts"] for row in reported} == {None}
 
 
 @pytest.mark.parametrize("currency", ["CAD", "usd", "EUR"])

@@ -22,7 +22,6 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from edgarpit import query
-from edgarpit.schemas import duckdb_ddl
 from explorer import app as explorer
 
 APP_PATH = Path(__file__).resolve().parents[1] / "explorer" / "app.py"
@@ -268,23 +267,7 @@ def build_db(*, path: Path) -> None:
     try:
         con.execute(doubles.FUNDAMENTALS_PIT_USD_DDL)
         _insert(con, "main.fundamentals_pit_usd", doubles.fundamentals_pit_usd_frame(USD_ROWS))
-        con.execute("CREATE SCHEMA IF NOT EXISTS raw")
-        con.execute(duckdb_ddl("filings_text"))
-        _insert(con, "raw.filings_text", doubles.filings_text_frame(TEXT_ROWS))
-        con.execute(
-            """
-            CREATE TABLE main.filings_text AS
-            SELECT text.cik, text.accession, text.acceptance_ts, text.ts_imputed, text.document,
-                   text.doc_type, text.section, text.section_order, text.text, text.sha256,
-                   text.char_count, issuers.ticker
-            FROM raw.filings_text AS text
-            LEFT JOIN (
-                SELECT DISTINCT cik, ticker FROM main.fundamentals_pit
-                UNION
-                SELECT DISTINCT cik, ticker FROM main.events_8k
-            ) AS issuers USING (cik)
-            """
-        )
+        doubles.create_filings_text_tables(con, doubles.filings_text_frame(TEXT_ROWS))
     finally:
         con.close()
 
@@ -338,15 +321,6 @@ def test_table_exists_reads_the_phase2_models(db_path: Path, v1_db_path: Path) -
     assert explorer.table_exists(v1_db_path, "main.filings_text") is False
 
 
-def test_usd_known_at_is_never_earlier_than_the_rate_publication() -> None:
-    period_end = date(2023, 10, 31)
-
-    assert explorer.usd_known_at(
-        datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC), period_end
-    ) == datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
-    assert explorer.usd_known_at(SHOP_ACCEPTED, period_end) == OCT_31_RATE_KNOWN_AT
-
-
 def test_versions_frame_in_usd_waits_for_the_rate(db_path: Path) -> None:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -361,6 +335,7 @@ def test_versions_frame_in_usd_waits_for_the_rate(db_path: Path) -> None:
     assert before["status"].to_list() == ["not yet accepted"]
     assert after["known_at_asof"].to_list() == [True]
     assert after["status"].to_list() == ["version 1"]
+    assert rows[0].asof_ts == OCT_31_RATE_KNOWN_AT
     # Reported knowledge follows the acceptance time, one hour after 15:00 UTC;
     # the USD value still waits for the 21:00 UTC publication.
     assert reported["known_at_asof"].to_list() == [True]
