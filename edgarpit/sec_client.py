@@ -30,16 +30,17 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt
 
 from edgarpit.config import ConfigError, Settings, validate_user_agent
-from edgarpit.rawcache import ENDPOINT_SUFFIX, RawCache
+from edgarpit.rawcache import ENDPOINT_SUFFIX, RawCache, document_key
 
 DATA_HOST = "https://data.sec.gov"
 ARCHIVES_HOST = "https://www.sec.gov"
+VALET_HOST = "https://www.bankofcanada.ca"
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 6
@@ -55,6 +56,12 @@ _SUBMISSIONS_RE = re.compile(r"/submissions/CIK(\d{10})\.json")
 _SUBMISSIONS_PAGE_RE = re.compile(r"/submissions/(CIK(\d{10})-submissions-\d+)\.json")
 _COMPANYFACTS_RE = re.compile(r"/api/xbrl/companyfacts/CIK(\d{10})\.json")
 _HEADER_RE = re.compile(r"/Archives/edgar/data/(\d+)/(\d+)/(\d{10}-\d{2}-\d{6})\.hdr\.sgml")
+_FILING_INDEX_RE = re.compile(
+    r"/Archives/edgar/data/(\d+)/(\d+)/(\d{10}-\d{2}-\d{6})-index-headers\.html"
+)
+_DOCUMENT_RE = re.compile(r"/Archives/edgar/data/(\d+)/(\d+)/([^/]+)")
+_ACCESSION_DIGITS_RE = re.compile(r"(\d{10})(\d{2})(\d{6})")
+_VALET_RE = re.compile(r"/valet/observations/([A-Za-z0-9_.-]+)/json")
 
 
 class SecClientError(RuntimeError):
@@ -115,12 +122,49 @@ def company_tickers_url() -> str:
     return f"{ARCHIVES_HOST}/files/company_tickers.json"
 
 
-def classify(url: str) -> tuple[str, str, str]:
-    """Split a known SEC URL into ``(endpoint, cik10, key)``.
+def filing_index_url(cik: str, accession: str) -> str:
+    """URL of the ``-index-headers.html`` document that lists a filing's files.
 
-    Keys are the page stem for ``submissions_page`` and the accession for
-    ``headers``; the main documents and ``company_tickers`` use an empty key.
-    Raises :class:`ValueError` for URLs outside the documented endpoints.
+    ``cik`` is the issuer's CIK (digits, zero-padded) and ``accession`` the
+    filing's ``NNNNNNNNNN-YY-NNNNNN`` number. The page carries each document's
+    SGML ``<TYPE>`` and ``<FILENAME>``, which is how 8-K documents are found
+    (decision A-30); it is immutable, so it is cached forever.
+    """
+    return (
+        f"{ARCHIVES_HOST}/Archives/edgar/data/{int(_cik10(cik))}/"
+        f"{accession.replace('-', '')}/{accession}-index-headers.html"
+    )
+
+
+def document_url(cik: str, accession: str, filename: str) -> str:
+    """URL of one document inside a filing directory.
+
+    ``cik`` is the issuer's CIK (digits, zero-padded), ``accession`` the filing's
+    ``NNNNNNNNNN-YY-NNNNNN`` number and ``filename`` the EDGAR file name from
+    the filing index (``aapl-20260730.htm``). The file name is percent-encoded,
+    so a space or a non-ASCII character cannot break the URL. Raises
+    :class:`ValueError` for an empty file name or one with a path separator.
+    """
+    if not filename or "/" in filename or "\\" in filename:
+        raise ValueError(f"invalid document file name {filename!r}")
+    quoted = quote(filename, safe="._-~")
+    return (
+        f"{ARCHIVES_HOST}/Archives/edgar/data/{int(_cik10(cik))}/"
+        f"{accession.replace('-', '')}/{quoted}"
+    )
+
+
+def classify(url: str) -> tuple[str, str, str]:
+    """Split a known SEC or Bank of Canada URL into ``(endpoint, cik10, key)``.
+
+    Keys are the page stem for ``submissions_page``, the accession for
+    ``headers`` and ``filing_index``, ``<accession>__<filename>`` for
+    ``documents`` (decision A-30) and the series id for ``fx`` (Valet); the main
+    documents and ``company_tickers`` use an empty key. The CIK of a
+    ``documents`` URL is the directory's, so a filing an agent submitted for an
+    issuer still caches under the issuer's CIK; the accession is rebuilt from the
+    directory's 18 digits. Raises :class:`ValueError` for URLs outside the
+    documented endpoints.
     """
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -144,7 +188,25 @@ def classify(url: str) -> tuple[str, str, str]:
             if no_dashes != accession.replace("-", ""):
                 raise ValueError(f"header URL accession does not match its directory: {url}")
             return ("headers", f"{int(cik_int):010d}", accession)
-    raise ValueError(f"cannot classify SEC URL: {url}")
+        match = _FILING_INDEX_RE.fullmatch(path)
+        if match:
+            cik_int, no_dashes, accession = match.groups()
+            if no_dashes != accession.replace("-", ""):
+                raise ValueError(f"filing index URL accession does not match its directory: {url}")
+            return ("filing_index", f"{int(cik_int):010d}", accession)
+        match = _DOCUMENT_RE.fullmatch(path)
+        if match:
+            cik_int, no_dashes, filename = match.groups()
+            accession_match = _ACCESSION_DIGITS_RE.fullmatch(no_dashes)
+            if accession_match is None:
+                raise ValueError(f"document URL has no accession directory: {url}")
+            accession = "-".join(accession_match.groups())
+            return ("documents", f"{int(cik_int):010d}", document_key(accession, unquote(filename)))
+    if host == "www.bankofcanada.ca":
+        match = _VALET_RE.fullmatch(path)
+        if match:
+            return ("fx", "", match.group(1))
+    raise ValueError(f"cannot classify URL: {url}")
 
 
 def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
