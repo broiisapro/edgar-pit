@@ -1,0 +1,32 @@
+[
+ {
+  "period_end": "2016-12-30",
+  "expected_rate_date": null,
+  "expected_rate": null
+ },
+ {
+  "period_end": "2017-01-03",
+  "expected_rate_date": "2017-01-03",
+  "expected_rate": 1.3435
+ },
+ {
+  "period_end": "2023-10-31",
+  "expected_rate_date": "2023-10-31",
+  "expected_rate": 1.3871
+ },
+ {
+  "period_end": "2024-03-24",
+  "expected_rate_date": "2024-03-22",
+  "expected_rate": 1.3593
+ },
+ {
+  "period_end": "2024-03-29",
+  "expected_rate_date": "2024-03-28",
+  "expected_rate": 1.355
+ },
+ {
+  "period_end": "2024-09-02",
+  "expected_rate_date": "2024-08-30",
+  "expected_rate": 1.3491
+ }
+]
