@@ -186,11 +186,11 @@ uv run python tools/build_universe_large.py --cache ./data --out config/universe
 - US issuers are ranked by the latest `dei:EntityPublicFloat` in the XBRL frames
   API, with the power-of-ten scale errors some filers introduced in 2022
   corrected.
-- Canadian issuers are those whose submissions business or mailing address is
-  in a Canadian province (EDGAR state codes `A0`–`A9`, `B0`, `Z4`), ranked by
-  their latest annual total assets in USD from `us-gaap:Assets` or
-  `ifrs-full:Assets` and the `FXUSDCAD` rate. A frame `loc` never decides
-  nationality.
+- Canadian issuers are those whose submissions business or mailing address
+  carries a Canadian province code (`A0`–`A9`, `B0`–`B2`, `Z4`) or a Canadian
+  place name, ranked by their latest annual total assets in USD from
+  `us-gaap:Assets` or `ifrs-full:Assets` and the `FXUSDCAD` rate. A frame `loc`
+  never decides nationality.
 - Every issuer of the 40-name Phase 1 universe stays in. Funds and blank-check
   companies are excluded, a second share class of the same CIK adds no row, and
   each issuer needs a 10-K, 40-F or 20-F within two years.

@@ -120,9 +120,9 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
 and Bank of Canada data only: the top ~125 US issuers by `dei:EntityPublicFloat`
 and the top ~125 Canadian issuers by latest total assets in USD, with every
 `config/universe.csv` issuer kept. A Canadian issuer is one whose submissions
-business or mailing address is in a Canadian province (EDGAR state codes
-`A0`–`A9`, `B0`, `Z4`), found from a submissions sweep — a frame `loc` never
-decides it. Total assets come from `companyconcept` `us-gaap:Assets` or
+business or mailing address carries a Canadian province code (`A0`–`A9`,
+`B0`–`B2`, `Z4`) or a Canadian place name, found from a submissions sweep — a
+frame `loc` never decides it. Total assets come from `companyconcept` `us-gaap:Assets` or
 `ifrs-full:Assets`, converted at the latest `FXUSDCAD` observation for ranking
 only. Funds and blank-check companies are excluded; an issuer needs an annual
 report (10-K, 40-F or 20-F) within two years. The file is a static issuer list
@@ -452,9 +452,11 @@ edgarpit export --db PATH --out DIR [--data DIR]
   point-in-time rule to `asof_ts` (decisions A-32, A-41); the human and JSON
   output show `USD`. A database without that model exits 1 with the query's
   message.
-- `qa` prints the Phase 2 section after the existing sections (text rows per
-  issuer, FX conversions, converted counts by reason) and still exits 1 only on
-  a key-uniqueness violation.
+- `qa` prints the Phase 2 sections after the existing sections: FX series
+  coverage and staleness, USD converted/unconverted counts by currency and
+  reason, `asof_ts` violations, and Item 2.02 text coverage (missing text,
+  unsegmented share, zero-length and duplicate sections). It still exits 1 only
+  on a key-uniqueness violation.
 - `export --data DIR` takes the SEC fetch range from the raw cache manifest;
   without it the `build-info.json` beside the database supplies it.
 
