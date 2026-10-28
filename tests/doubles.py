@@ -32,7 +32,8 @@ from edgarpit.schemas import FilingsTextSchema, FxDailySchema, duckdb_ddl
 TORONTO = ZoneInfo("America/Toronto")
 
 # ``main.fundamentals_pit_usd``: every ``fundamentals_pit`` column, then the
-# conversion columns of decision A-32 (docs/architecture.md section 7).
+# conversion columns of decision A-32 and the A-38 reason (section 7 of
+# docs/architecture.md).
 FUNDAMENTALS_PIT_USD_DDL = """
 CREATE TABLE main.fundamentals_pit_usd (
     cik VARCHAR(10),
@@ -61,7 +62,8 @@ CREATE TABLE main.fundamentals_pit_usd (
     fx_rate_date DATE,
     fx_known_at TIMESTAMPTZ,
     converted BOOLEAN,
-    asof_ts TIMESTAMPTZ
+    asof_ts TIMESTAMPTZ,
+    unconverted_reason VARCHAR
 )
 """
 
@@ -93,10 +95,18 @@ FUNDAMENTALS_PIT_USD_COLUMNS: list[str] = [
     "fx_known_at",
     "converted",
     "asof_ts",
+    "unconverted_reason",
 ]
 
 _US_DOLLAR = "USD"
 _CAD = "CAD"
+
+# The tickers of the three fixture issuers, used by the default builders.
+DEFAULT_TICKERS: dict[str, str | None] = {
+    "0000320193": "AAPL",
+    "0001000275": "RY",
+    "0001594805": "SHOP",
+}
 
 
 def sha256_of(text: str) -> str:
@@ -160,6 +170,10 @@ class FundamentalUsdRow:
     and ``asof_ts`` from those: a CAD value is divided by ``fx_rate``, a USD
     value is used as is with rate ``1.0`` and no observation, and a row with no
     usable rate keeps ``value_usd`` null with ``converted`` false.
+    ``unconverted_reason`` (decision A-38) is null for a converted row;
+    otherwise it follows ``currency`` — ``no_rate`` for a CAD row without a
+    usable observation and ``currency_out_of_scope`` for anything else — unless
+    the caller states the reason explicitly.
     """
 
     cik: str
@@ -186,6 +200,7 @@ class FundamentalUsdRow:
     fx_rate: float | None = None
     fx_rate_date: date | None = None
     fx_known_at: datetime | None = None
+    unconverted_reason: str | None = None
 
 
 def _filings_text_values(row: FilingsTextRow) -> tuple[object, ...]:
@@ -259,7 +274,13 @@ def _fundamentals_usd_schema() -> dict[str, Any]:
         "fx_known_at": pl.Datetime("us", "UTC"),
         "converted": pl.Boolean,
         "asof_ts": pl.Datetime("us", "UTC"),
+        "unconverted_reason": pl.String,
     }
+
+
+# ``main.filings_text``: the raw columns in contract order, then the ticker
+# joined from ``raw.universe`` (section 7 of docs/architecture.md).
+MAIN_FILINGS_TEXT_COLUMNS: list[str] = [*_filings_text_schema(), "ticker"]
 
 
 def default_filings_text() -> list[FilingsTextRow]:
@@ -308,6 +329,31 @@ def filings_text_frame(rows: Iterable[FilingsTextRow] | None = None) -> pl.DataF
     return frame
 
 
+def main_filings_text_frame(
+    rows: Iterable[FilingsTextRow] | None = None,
+    tickers: dict[str, str | None] | None = None,
+) -> pl.DataFrame:
+    """Return a ``main.filings_text`` frame: the raw columns plus ``ticker``.
+
+    ``rows`` defaults to :func:`default_filings_text`; ``tickers`` maps a CIK to
+    the issuer ticker (default: the three fixture issuers, so the default frame
+    carries ``AAPL``). A CIK missing from the mapping gets a null ticker, like
+    the dbt model's left join on ``raw.universe``. The frame is not validated by
+    Pandera — no schema is frozen for the dbt output models — but it carries the
+    documented dtypes.
+    """
+    selected = default_filings_text() if rows is None else list(rows)
+    mapping: dict[str, str | None] = DEFAULT_TICKERS if tickers is None else tickers
+    frame = pl.DataFrame(
+        [_filings_text_values(row) for row in selected],
+        schema=_filings_text_schema(),
+        orient="row",
+    )
+    return frame.with_columns(
+        pl.col("cik").replace_strict(mapping, default=None, return_dtype=pl.String).alias("ticker")
+    ).select(MAIN_FILINGS_TEXT_COLUMNS)
+
+
 def default_fx_daily() -> list[FxDailyRow]:
     """Three consecutive business days of ``FXUSDCAD``."""
     return [
@@ -343,21 +389,26 @@ def fx_daily_frame(rows: Iterable[FxDailyRow] | None = None) -> pl.DataFrame:
     return frame
 
 
-def _converted(row: FundamentalUsdRow) -> tuple[float | None, bool, datetime]:
-    """Return ``(value_usd, converted, asof_ts)`` for a row (decision A-32).
+def _converted(row: FundamentalUsdRow) -> tuple[float | None, bool, datetime, str | None]:
+    """Return ``(value_usd, converted, asof_ts, unconverted_reason)`` for a row.
 
     A USD row converts at 1.0 with no observation and is known at its
     ``acceptance_ts``. A row with a positive ``fx_rate`` converts its CAD value
     to USD and is known at the later of ``acceptance_ts`` and ``fx_known_at``, so
     it can never be returned before both the filing and the rate exist. Any
     other row stays unconverted (``value_usd`` null) and is known at its
-    ``acceptance_ts``.
+    ``acceptance_ts``; its reason is the one the row states, otherwise
+    ``no_rate`` for a CAD row and ``currency_out_of_scope`` for anything else
+    (decision A-38).
     """
     if row.currency == _US_DOLLAR:
-        return row.value, True, row.acceptance_ts
+        return row.value, True, row.acceptance_ts, None
     if row.fx_rate is not None and row.fx_rate > 0 and row.fx_known_at is not None:
-        return row.value / row.fx_rate, True, max(row.acceptance_ts, row.fx_known_at)
-    return None, False, row.acceptance_ts
+        return row.value / row.fx_rate, True, max(row.acceptance_ts, row.fx_known_at), None
+    reason = row.unconverted_reason
+    if reason is None:
+        reason = "no_rate" if row.currency == _CAD else "currency_out_of_scope"
+    return None, False, row.acceptance_ts, reason
 
 
 def default_fundamentals_usd() -> list[FundamentalUsdRow]:
@@ -393,15 +444,15 @@ def fundamentals_pit_usd_frame(
     """Return a ``main.fundamentals_pit_usd`` frame with the section 7 columns.
 
     ``rows`` defaults to :func:`default_fundamentals_usd`. ``value_usd``,
-    ``converted`` and ``asof_ts`` are derived by :func:`_converted`; the other
-    conversion columns are taken from the row. No Pandera schema is frozen for
-    this dbt output model, so the frame is built with the documented dtypes and
-    the caller checks the values.
+    ``converted``, ``asof_ts`` and ``unconverted_reason`` are derived by
+    :func:`_converted`; the other conversion columns are taken from the row. No
+    Pandera schema is frozen for this dbt output model, so the frame is built
+    with the documented dtypes and the caller checks the values.
     """
     selected = default_fundamentals_usd() if rows is None else list(rows)
     records: list[tuple[object, ...]] = []
     for row in selected:
-        value_usd, converted, asof_ts = _converted(row)
+        value_usd, converted, asof_ts, reason = _converted(row)
         records.append(
             (
                 row.cik,
@@ -431,6 +482,7 @@ def fundamentals_pit_usd_frame(
                 row.fx_known_at,
                 converted,
                 asof_ts,
+                reason,
             )
         )
     return pl.DataFrame(records, schema=_fundamentals_usd_schema(), orient="row").select(
@@ -445,11 +497,12 @@ def build_phase2_db(
     fundamentals_usd: pl.DataFrame | None = None,
     path: str | Path | None = None,
 ) -> duckdb.DuckDBPyConnection:
-    """Create the three Phase 2 tables, filled with the given frames.
+    """Create the Phase 2 tables, filled with the given frames.
 
     ``raw.filings_text`` and ``raw.fx_daily`` are created with
     :func:`edgarpit.schemas.duckdb_ddl`; ``main.fundamentals_pit_usd`` with
-    :data:`FUNDAMENTALS_PIT_USD_DDL`. A ``None`` frame uses the default rows of
+    :data:`FUNDAMENTALS_PIT_USD_DDL` and ``main.filings_text`` from
+    :func:`main_filings_text_frame`. A ``None`` frame uses the default rows of
     the matching builder, so ``build_phase2_db()`` returns a usable database.
     ``path`` selects the database file; without it the database is in memory.
     The session timezone is UTC (decision A-5) and the returned connection is
@@ -470,6 +523,16 @@ def build_phase2_db(
             con.execute(f"INSERT INTO raw.{table} SELECT * FROM _doubles_frame")
         finally:
             con.unregister("_doubles_frame")
+    text_main = frames["filings_text"].with_columns(
+        pl.col("cik")
+        .replace_strict(DEFAULT_TICKERS, default=None, return_dtype=pl.String)
+        .alias("ticker")
+    )
+    con.register("_doubles_text", text_main.select(MAIN_FILINGS_TEXT_COLUMNS))
+    try:
+        con.execute("CREATE TABLE main.filings_text AS SELECT * FROM _doubles_text")
+    finally:
+        con.unregister("_doubles_text")
     con.execute(FUNDAMENTALS_PIT_USD_DDL)
     usd = fundamentals_pit_usd_frame() if fundamentals_usd is None else fundamentals_usd
     con.register("_doubles_usd", usd)

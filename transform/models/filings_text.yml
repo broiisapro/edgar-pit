@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: filings_text
+    description: >-
+      raw.filings_text plus the issuer ticker from raw.universe, column order
+      unchanged. A section is known at its filing's acceptance_ts and at no
+      earlier time (decisions A-31, A-40).
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [accession, document, section, section_order]
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: ts_imputed
+        tests:
+          - not_null
+      - name: document
+        tests:
+          - not_null
+      - name: doc_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["primary", "EX-99.1"]
+      - name: section
+        tests:
+          - not_null
+      - name: section_order
+        tests:
+          - not_null
+      - name: text
+        tests:
+          - not_null
+      - name: sha256
+        tests:
+          - not_null
+      - name: char_count
+        tests:
+          - not_null
