@@ -11,7 +11,6 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-import polars as pl
 import pytest
 
 from edgarpit import concepts, fetch, load, query, ratios, rawcache, sec_client
@@ -149,26 +148,6 @@ def test_valet_client_has_the_sec_client_injection_points() -> None:
         "transport",
     ]
     assert signature.parameters["cache"].kind is inspect.Parameter.KEYWORD_ONLY
-
-
-def test_phase2_stubs_raise_not_implemented(tmp_path: Path) -> None:
-    filings = pl.DataFrame(
-        schema={
-            "cik": pl.String,
-            "accession": pl.String,
-            "acceptance_ts": pl.Datetime("us", "UTC"),
-            "ts_imputed": pl.Boolean,
-            "items": pl.String,
-        }
-    )
-    calls: list[Any] = [
-        lambda: clean.html_to_text("<html></html>"),
-        lambda: ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings),
-        lambda: valet.parse_valet({}),
-    ]
-    for call in calls:
-        with pytest.raises(NotImplementedError):
-            call()
 
 
 def test_incremental_fetch_accepts_the_keyword(tmp_path: Path) -> None:
