@@ -2,7 +2,7 @@
  "checked": {
   "checked_on": "2026-10-27",
   "method": [
-   "Each document below was read as stored from tests/fixtures/sec_text/raw/documents; the file is the unmodified SEC archive download recorded in tests/fixtures/sec_text/raw/manifest.jsonl.",
+   "Each document below was read as stored from tests/fixtures/sec/raw/documents; the file is the unmodified SEC archive download recorded in tests/fixtures/sec/raw/manifest.jsonl.",
    "Item headings were taken from the submission's SGML <ITEMS> list and confirmed by locating the heading line in the document's visible text (for example 'Item 2.02 Results of Operations and Financial Condition.'). Whitespace, including the non-breaking spaces that separate the item number from its caption, is collapsed to single spaces as decision A-31 requires.",
    "Each sentence was copied from the visible text with HTML entities decoded (curly quotes, registered mark, em dash) and then re-extracted with Python's html.parser, skipping hidden inline-XBRL blocks and scripts, to confirm the sentence is visible text and not markup.",
    "The EX-99.1 filenames were read from each filing's -index-headers.html <DOCUMENT> list and matched against the stored document directories; the submission's primaryDocument is the primary document in every case."

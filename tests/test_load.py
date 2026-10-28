@@ -38,6 +38,23 @@ RY_FY2023_ACCEPTANCE = datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
 APPLE_CIK = "0000320193"
 APPLE_8K = "0000320193-25-000071"
 
+# The endpoints a Phase 1 cache holds. The committed fixture cache also carries
+# the 8-K text and FX series (decision A-44), so the tests that need a cache
+# without them copy only these.
+PHASE1_ENDPOINTS = ("submissions", "submissions_page", "companyfacts", "headers")
+
+
+def phase1_cache(source: Path, target: Path) -> Path:
+    """Copy the Phase 1 endpoints of ``source`` into ``target`` and return it.
+
+    The result has the decision A-4 layout under ``target/raw`` and no filing
+    index, document or FX entry, which is what a cache built before the Phase 2
+    fetch commands look like.
+    """
+    for endpoint in PHASE1_ENDPOINTS:
+        shutil.copytree(source / "raw" / endpoint, target / "raw" / endpoint)
+    return target
+
 
 def polars_type(dtype: str) -> Any:
     return {
@@ -393,10 +410,13 @@ def test_a_phase1_cache_builds_with_the_phase2_tables_empty(tmp_path: Path) -> N
 
     Decision A-37: the database is a function of the cache, so the two Phase 2
     raw tables exist and are empty, their dbt models exist and are empty, and
-    the USD conversion model still covers every Phase 1 fundamental.
+    the USD conversion model still covers every Phase 1 fundamental. The cache
+    is the Phase 1 endpoints of the fixtures, which is what a cache written
+    before the Phase 2 fetch commands holds (the committed cache also carries
+    the 8-K text and the FX series).
     """
     out = tmp_path / "build"
-    db = build_from_raw(FIXTURE_RAW, out)
+    db = build_from_raw(phase1_cache(FIXTURE_RAW, tmp_path / "cache"), out)
 
     con = duckdb.connect(str(db))
     try:
@@ -428,8 +448,7 @@ def test_build_from_raw_ingests_cached_text_and_fx(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cache with a filing index and an FX series fills both tables (A-37)."""
-    cache = tmp_path / "cache"
-    shutil.copytree(FIXTURE_RAW, cache)
+    cache = phase1_cache(FIXTURE_RAW, tmp_path / "cache")
     index_dir = cache / "raw" / "filing_index" / APPLE_CIK / APPLE_8K
     index_dir.mkdir(parents=True)
     (index_dir / "20261028T000000000000Z.html").write_text("<html></html>", encoding="utf-8")

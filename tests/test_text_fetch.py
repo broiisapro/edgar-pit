@@ -1,9 +1,10 @@
 """Tests for fetching 8-K filing indexes and documents (decisions A-30, A-37).
 
 Every HTTP response is served from the committed real 8-K fixtures under
-``tests/fixtures/sec_text`` through respx, into a temporary raw cache, so these
-tests never touch the network. ``discover.exhibit_documents`` lands with its own
-issue and is replaced here by a double that reads the fixtures' own file list.
+``tests/fixtures/sec/raw`` (the merged SEC cache, decision A-44) through respx,
+into a temporary raw cache, so these tests never touch the network.
+``discover.exhibit_documents`` lands with its own issue and is replaced here by
+a double that reads the fixtures' own file list.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from edgarpit.sec_client import SecClient, classify, document_url, filing_index_
 from edgarpit.text import discover, fetch
 from edgarpit.text.discover import DocumentRef
 
-TEXT_ROOT = Path(__file__).resolve().parent / "fixtures" / "sec_text"
+TEXT_ROOT = Path(__file__).resolve().parent / "fixtures" / "sec"
 RAW = TEXT_ROOT / "raw"
 EXPECTED_PATH = Path(__file__).resolve().parent / "fixtures" / "text_expected.json"
 

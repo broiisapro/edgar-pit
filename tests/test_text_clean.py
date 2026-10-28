@@ -1,12 +1,12 @@
 """Tests for the EDGAR HTML-to-text cleaner (decision A-31, issue #108).
 
-The 27 real 8-K documents under ``tests/fixtures/sec_text`` are the primary
-test surface: every one must convert, the three hand-checked documents in
-``tests/fixtures/text_expected.json`` must contain every expected sentence and
-item heading, and no hidden inline-XBRL fact, script or submission metadata may
-leak.  Small inputs pin each conversion rule, and the Hypothesis properties
-check that output never contains markup, never has a run of blank lines and is
-stable when re-cleaned.
+The 27 real 8-K documents under ``tests/fixtures/sec/raw/documents`` (decisions
+A-30, A-44) are the primary test surface: every one must convert, the three
+hand-checked documents in ``tests/fixtures/text_expected.json`` must contain
+every expected sentence and item heading, and no hidden inline-XBRL fact,
+script or submission metadata may leak.  Small inputs pin each conversion rule,
+and the Hypothesis properties check that output never contains markup, never
+has a run of blank lines and is stable when re-cleaned.
 
 The fixture tree holds 27 ``.htm`` documents and no ``.txt`` document; the
 plain-text path is exercised by the synthetic ``.txt`` test below.
@@ -26,8 +26,8 @@ from hypothesis import strategies as st
 from edgarpit.text.clean import html_to_text
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
-TEXT_ROOT = FIXTURE_ROOT / "sec_text"
-DOCUMENTS_ROOT = TEXT_ROOT / "raw" / "documents"
+SEC_ROOT = FIXTURE_ROOT / "sec"
+DOCUMENTS_ROOT = SEC_ROOT / "raw" / "documents"
 EXPECTED_PATH = FIXTURE_ROOT / "text_expected.json"
 
 PROPERTY_SETTINGS = settings(deadline=None, max_examples=50)
