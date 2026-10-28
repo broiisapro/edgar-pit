@@ -24,6 +24,7 @@ from edgarpit.qa import (
     KeyViolation,
     MissingTextIssuer,
     NoRateIssuer,
+    QaReport,
     TextCoverage,
     format_phase2,
     run_qa,
@@ -299,7 +300,8 @@ def connect(db: Path) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(db), read_only=True)
 
 
-def report_of(db: Path):
+def report_of(db: Path) -> QaReport:
+    """Run the QA report against ``db`` and close the connection."""
     con = connect(db)
     try:
         return run_qa(con)
@@ -307,8 +309,8 @@ def report_of(db: Path):
         con.close()
 
 
-def insert(db: Path, table: str, sql: str, rows: list[tuple[object, ...]]) -> None:
-    """Insert ``rows`` into ``table`` through ``sql`` (an INSERT with placeholders)."""
+def insert(db: Path, sql: str, rows: list[tuple[object, ...]]) -> None:
+    """Insert ``rows`` through ``sql``, an INSERT statement with placeholders."""
     con = duckdb.connect(str(db))
     try:
         con.executemany(sql, rows)
@@ -345,7 +347,6 @@ def text_row(
 def insert_text(db: Path, rows: list[tuple[object, ...]]) -> None:
     insert(
         db,
-        "raw.filings_text",
         "INSERT INTO raw.filings_text VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
@@ -374,13 +375,11 @@ def insert_events(db: Path, rows: list[tuple[object, ...]]) -> None:
     """
     insert(
         db,
-        "raw.events_8k",
         "INSERT INTO raw.events_8k VALUES (?, ?, ?, ?, ?, ?, ?)",
         [(row[0], row[2], row[3], row[4], row[5], row[6], row[7]) for row in rows],
     )
     insert(
         db,
-        "main.events_8k",
         "INSERT INTO main.events_8k VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
@@ -393,7 +392,6 @@ def fx_row(rate_date: date, value: float = 1.35, series: str = "FXUSDCAD") -> tu
 def insert_fx(db: Path, rows: list[tuple[object, ...]]) -> None:
     insert(
         db,
-        "raw.fx_daily",
         "INSERT INTO raw.fx_daily VALUES (?, ?, ?, ?, ?)",
         rows,
     )
@@ -461,7 +459,6 @@ def insert_usd(db: Path, rows: list[dict[str, object]], *, with_reason: bool = T
     placeholders = ", ".join("?" * len(columns))
     insert(
         db,
-        "main.fundamentals_pit_usd",
         f"INSERT INTO main.fundamentals_pit_usd ({', '.join(columns)}) VALUES ({placeholders})",
         [tuple(row[column] for column in columns) for row in rows],
     )
