@@ -97,10 +97,16 @@ class IssuerFetchReport:
 
 @dataclass
 class FetchReport:
-    """The outcome of :func:`fetch_universe`, one entry per issuer in order."""
+    """The outcome of :func:`fetch_universe`, one entry per issuer in order.
+
+    ``skipped_unchanged`` counts the issuers an incremental run skipped because
+    their submissions document had not changed (decision A-34); it stays 0
+    until incremental fetch lands.
+    """
 
     issuers: list[IssuerFetchReport] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    skipped_unchanged: int = 0
 
     @property
     def requests(self) -> int:
@@ -309,12 +315,30 @@ def _fetch_issuer(
     return report
 
 
+def submissions_unchanged(cached: Mapping[str, Any] | None, fresh: Mapping[str, Any]) -> bool:
+    """Whether a freshly fetched submissions document shows no new filings.
+
+    ``cached`` is the previously stored submissions document (``None`` when
+    there is none) and ``fresh`` the document just fetched, both parsed JSON
+    objects. An issuer is unchanged when the newest accession and the filing
+    count of the two documents agree (decision A-34): ``data.sec.gov`` sends no
+    ``ETag`` or ``Last-Modified``, so the document itself is the only signal, and
+    a new filing always changes the newest accession or the count. A ``None``
+    cache is never unchanged. Raises :class:`ValueError` when either document
+    has no ``filings`` object with a ``recent`` list.
+
+    Returns ``True`` when the issuer can be skipped for this run.
+    """
+    raise NotImplementedError("incremental fetch (decision A-34) lands with its own issue")
+
+
 def fetch_universe(
     issuers: Sequence[Issuer],
     out_dir: Path | str,
     *,
     client: SecClient,
     refresh: bool = True,
+    incremental: bool = False,
 ) -> FetchReport:
     """Fetch ``issuers`` into the raw cache rooted at ``out_dir``.
 
@@ -326,7 +350,18 @@ def fetch_universe(
     when present, so a warm cache is untouched. Returns a :class:`FetchReport`
     whose ``ok`` is false when any issuer failed with a non-404 error; a header
     404 is counted but not fatal. Never raises for an issuer-level failure.
+
+    With ``incremental`` true an issuer whose submissions document is unchanged
+    would skip its pages, companyfacts and headers and be counted in
+    ``FetchReport.skipped_unchanged`` (decision A-34). That mode is not
+    implemented yet: passing ``incremental=True`` raises
+    :class:`NotImplementedError` rather than silently refetching everything.
     """
+    if incremental:
+        raise NotImplementedError(
+            "incremental fetch (decision A-34) lands with its own issue; "
+            "call fetch_universe with incremental=False"
+        )
     start = time.monotonic()
     cache = RawCache(out_dir)
     report = FetchReport()

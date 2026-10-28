@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,8 @@ import respx
 from tenacity import RetryCallState
 
 from edgarpit.config import ConfigError, Settings
-from edgarpit.rawcache import RawCache
+from edgarpit.fx.valet import valet_url
+from edgarpit.rawcache import RawCache, document_key
 from edgarpit.sec_client import (
     MAX_BACKOFF_SECONDS,
     MAX_RETRY_AFTER_SECONDS,
@@ -28,6 +29,8 @@ from edgarpit.sec_client import (
     classify,
     company_tickers_url,
     companyfacts_url,
+    document_url,
+    filing_index_url,
     header_url,
     submissions_page_url,
     submissions_url,
@@ -379,6 +382,128 @@ def test_get_json_rejects_non_object_payloads() -> None:
         client = SecClient(make_settings())
         with pytest.raises(SecClientError, match="expected a JSON object"):
             client.get_json(RY_SUBMISSIONS)
+
+
+# --- Phase 2 endpoints: filing index, documents and Valet (decisions A-30, A-32) ---
+
+RY_ACCESSION = "0001193125-23-285639"
+AAPL_ACCESSION = "0000320193-25-000080"
+
+
+def test_filing_index_url_and_classification() -> None:
+    url = filing_index_url("1000275", RY_ACCESSION)
+    assert url == (
+        "https://www.sec.gov/Archives/edgar/data/1000275/000119312523285639/"
+        "0001193125-23-285639-index-headers.html"
+    )
+    assert classify(url) == ("filing_index", "0001000275", RY_ACCESSION)
+
+
+def test_document_url_and_classification_keep_the_issuer_cik() -> None:
+    # The filing agent's CIK prefixes the accession; the cache still belongs to
+    # the issuer whose directory holds the document.
+    url = document_url("0001000275", RY_ACCESSION, "exhibit99-1.htm")
+    assert url == (
+        "https://www.sec.gov/Archives/edgar/data/1000275/000119312523285639/exhibit99-1.htm"
+    )
+    assert classify(url) == ("documents", "0001000275", f"{RY_ACCESSION}__exhibit99-1.htm")
+
+
+def test_document_url_percent_encodes_the_file_name() -> None:
+    url = document_url("320193", AAPL_ACCESSION, "a b&c.htm")
+    assert url.endswith("/a%20b%26c.htm")
+    assert classify(url) == ("documents", "0000320193", f"{AAPL_ACCESSION}__a b&c.htm")
+
+
+@pytest.mark.parametrize("filename", ["", "a/b.htm", "a\\b.htm"])
+def test_document_url_rejects_path_separators(filename: str) -> None:
+    with pytest.raises(ValueError, match="invalid document file name"):
+        document_url("320193", AAPL_ACCESSION, filename)
+
+
+def test_classify_rejects_a_document_directory_without_an_accession() -> None:
+    with pytest.raises(ValueError, match="cannot classify"):
+        classify("https://www.sec.gov/Archives/edgar/data/320193/not-an-accession/doc.htm")
+    with pytest.raises(ValueError, match="no accession directory"):
+        classify("https://www.sec.gov/Archives/edgar/data/320193/123456/doc.htm")
+    with pytest.raises(ValueError, match="cannot classify"):
+        classify("https://www.sec.gov/Archives/edgar/data/320193/000032019325000080/")
+
+
+def test_valet_url_shape_and_bounds() -> None:
+    assert valet_url("FXUSDCAD") == ("https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json")
+    assert valet_url("FXUSDCAD", date(2017, 1, 3)) == (
+        "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?start_date=2017-01-03"
+    )
+    assert valet_url("FXUSDCAD", end=date(2023, 10, 31)) == (
+        "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?end_date=2023-10-31"
+    )
+    assert valet_url("FXUSDCAD", date(2017, 1, 3), date(2023, 10, 31)) == (
+        "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json"
+        "?start_date=2017-01-03&end_date=2023-10-31"
+    )
+    assert classify(valet_url("FXUSDCAD", date(2017, 1, 3))) == ("fx", "", "FXUSDCAD")
+
+
+@pytest.mark.parametrize("series", ["", "FX USDCAD", "FX/USDCAD", "..", "a..b", ".hidden"])
+def test_valet_url_rejects_a_malformed_series(series: str) -> None:
+    with pytest.raises(ValueError, match="invalid Valet series id"):
+        valet_url(series)
+
+
+def test_classify_rejects_a_valet_path_traversal() -> None:
+    with pytest.raises(ValueError, match="invalid Valet series id"):
+        classify("https://www.bankofcanada.ca/valet/observations/../json")
+
+
+def test_valet_url_rejects_a_reversed_range() -> None:
+    with pytest.raises(ValueError, match="is after end"):
+        valet_url("FXUSDCAD", date(2023, 10, 31), date(2017, 1, 3))
+
+
+def test_documents_are_cached_under_the_issuer_with_their_extension(tmp_path: Path) -> None:
+    clock = FakeClock()
+    cache = RawCache(tmp_path)
+    client = SecClient(make_settings(), cache=cache, clock=clock.monotonic, sleep=clock.sleep)
+    url = document_url("1000275", RY_ACCESSION, "exhibit99-1.htm")
+    body = "<html><body>Royal Bank reports third quarter results</body></html>"
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(url).mock(return_value=httpx.Response(200, text=body))
+        assert client.get_text(url) == body
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "documents"
+    assert row["cik"] == "0001000275"
+    assert row["path"].startswith(f"raw/documents/0001000275/{RY_ACCESSION}__exhibit99-1.htm/")
+    assert row["path"].endswith(".htm.zst")
+    key = document_key(RY_ACCESSION, "exhibit99-1.htm")
+    assert cache.latest("documents", "0001000275", key) == body.encode("utf-8")
+    assert cache.keys("documents", "0001000275") == [key]
+    assert cache.verify().ok
+
+
+def test_filing_index_and_fx_are_cached_in_their_slots(tmp_path: Path) -> None:
+    clock = FakeClock()
+    cache = RawCache(tmp_path)
+    client = SecClient(make_settings(), cache=cache, clock=clock.monotonic, sleep=clock.sleep)
+    index_url = filing_index_url("0000320193", AAPL_ACCESSION)
+    fx_url = valet_url("FXUSDCAD")
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(index_url).mock(return_value=httpx.Response(200, text="<html>index</html>"))
+        mock.get(fx_url).mock(return_value=httpx.Response(200, json={"observations": []}))
+        assert client.get_text(index_url) == "<html>index</html>"
+        assert client.get_json(fx_url) == {"observations": []}
+    endpoints = {row["endpoint"]: row for row in cache.manifest_rows()}
+    assert endpoints["filing_index"]["path"].startswith(
+        f"raw/filing_index/0000320193/{AAPL_ACCESSION}/"
+    )
+    assert endpoints["filing_index"]["path"].endswith(".html.zst")
+    assert endpoints["fx"]["cik"] == ""
+    assert endpoints["fx"]["path"].startswith("raw/fx/_/FXUSDCAD/")
+    stored = cache.latest("fx", "", "FXUSDCAD")
+    assert stored is not None
+    assert json.loads(stored) == {"observations": []}
+    assert cache.latest("fx", "_", "FXUSDCAD") == stored
+    assert cache.verify().ok
 
 
 @pytest.mark.network

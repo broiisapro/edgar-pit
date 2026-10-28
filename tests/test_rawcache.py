@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from edgarpit.rawcache import RawCache, utc_stamp
+from edgarpit.rawcache import RawCache, document_key, utc_stamp
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sec"
 REPO_ROOT = Path(__file__).parent.parent
@@ -231,3 +231,130 @@ def test_manifest_is_jsonl(tmp_path: Path) -> None:
     assert len(lines) == 2
     assert [json.loads(line)["bytes"] for line in lines] == [1, 1]
     assert cache.latest("companyfacts", "0001000275") == b"b"
+
+
+# --- Phase 2 endpoints: filing index, documents and FX (decision A-30) -------
+
+RY = "0001000275"
+RY_ACCESSION = "0001193125-23-285639"
+INDEX_URL = (
+    "https://www.sec.gov/Archives/edgar/data/1000275/000119312523285639/"
+    "0001193125-23-285639-index-headers.html"
+)
+DOCUMENT_URL = "https://www.sec.gov/Archives/edgar/data/1000275/000119312523285639/exhibit99-1.htm"
+FX_URL = "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json"
+
+
+def test_filing_index_layout_and_latest(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b"<html><body>Document Format Files</body></html>"
+    path = cache.write("filing_index", RY, RY_ACCESSION, body, url=INDEX_URL, http_status=200)
+    assert path.parent == tmp_path / "raw" / "filing_index" / RY / RY_ACCESSION
+    assert path.name.endswith(".html.zst")
+    assert STAMP_RE.fullmatch(path.name.removesuffix(".html.zst"))
+    assert cache.latest("filing_index", RY, RY_ACCESSION) == body
+    assert cache.keys("filing_index", RY) == [RY_ACCESSION]
+    assert cache.latest("filing_index", RY, "0001193125-23-000001") is None
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "filing_index"
+    assert row["cik"] == RY
+    assert row["url"] == INDEX_URL
+
+
+def test_document_key_shape_and_validation() -> None:
+    assert document_key(RY_ACCESSION, "exhibit99-1.htm") == f"{RY_ACCESSION}__exhibit99-1.htm"
+    with pytest.raises(ValueError, match="invalid accession"):
+        document_key("0001193125-23-28563", "exhibit99-1.htm")
+    with pytest.raises(ValueError, match="invalid document file name"):
+        document_key(RY_ACCESSION, "")
+    with pytest.raises(ValueError, match="invalid document file name"):
+        document_key(RY_ACCESSION, "dir/exhibit.htm")
+    with pytest.raises(ValueError, match="has no extension"):
+        document_key(RY_ACCESSION, "exhibit")
+
+
+def test_documents_keep_the_document_extension(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    html_key = document_key(RY_ACCESSION, "exhibit99-1.htm")
+    text_key = document_key(RY_ACCESSION, "exhibit99-1.txt")
+    html = cache.write(
+        "documents", RY, html_key, b"<html>one</html>", url=DOCUMENT_URL, http_status=200
+    )
+    text = cache.write("documents", RY, text_key, b"plain", url=DOCUMENT_URL, http_status=200)
+    assert html.parent == tmp_path / "raw" / "documents" / RY / html_key
+    assert html.name.endswith(".htm.zst")
+    assert text.name.endswith(".txt.zst")
+    assert cache.latest("documents", RY, html_key) == b"<html>one</html>"
+    assert cache.latest("documents", RY, text_key) == b"plain"
+    assert cache.keys("documents", RY) == sorted([html_key, text_key])
+
+
+def test_documents_latest_ignores_files_of_another_extension(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A later plain file with the same stem but a different extension must not
+    # shadow the document the key names.
+    cache = RawCache(tmp_path)
+    key = document_key(RY_ACCESSION, "exhibit99-1.htm")
+    stamps = iter(["20260101T000000000001Z", "20260101T000000000002Z"])
+    monkeypatch.setattr("edgarpit.rawcache.utc_stamp", lambda: next(stamps))
+    cache.write("documents", RY, key, b"wanted", url=DOCUMENT_URL, http_status=200)
+    directory = tmp_path / "raw" / "documents" / RY / key
+    (directory / "20260101T000000000002Z.txt").write_bytes(b"stale")
+    assert cache.latest("documents", RY, key) == b"wanted"
+
+
+def test_documents_latest_needs_a_key_with_an_extension(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    with pytest.raises(ValueError, match="needs a key with a file extension"):
+        cache.latest("documents", RY, RY_ACCESSION)
+    with pytest.raises(ValueError, match="needs a key with a file extension"):
+        cache.path_for("documents", RY, RY_ACCESSION, "20260101T000000000000Z")
+
+
+def test_fx_uses_the_global_slot_and_verify_counts_it(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b'{"observations": [{"d": "2023-10-31", "FXUSDCAD": {"v": "1.3659"}}]}'
+    path = cache.write("fx", "", "FXUSDCAD", body, url=FX_URL, http_status=200)
+    assert path.parent == tmp_path / "raw" / "fx" / "_" / "FXUSDCAD"
+    assert path.name.endswith(".json.zst")
+    assert cache.latest("fx", "", "FXUSDCAD") == body
+    assert cache.latest("fx", "_", "FXUSDCAD") == body
+    assert cache.latest("fx", "0001000275", "FXUSDCAD") is None
+    assert cache.keys("fx", "") == ["FXUSDCAD"]
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "fx"
+    assert row["cik"] == ""
+    assert row["path"].startswith("raw/fx/_/FXUSDCAD/")
+    report = cache.verify()
+    assert report.ok
+    assert report.inventory == {"": {"fx": 1}}
+
+
+def test_verify_covers_the_phase2_endpoints(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    cache.write("filing_index", RY, RY_ACCESSION, b"<html/>", url=INDEX_URL, http_status=200)
+    cache.write(
+        "documents",
+        RY,
+        document_key(RY_ACCESSION, "exhibit99-1.htm"),
+        b"<html>exhibit</html>",
+        url=DOCUMENT_URL,
+        http_status=200,
+    )
+    cache.write("fx", "", "FXUSDCAD", b"{}", url=FX_URL, http_status=200)
+    report = cache.verify()
+    assert report.ok
+    assert report.checked == 3
+    assert report.inventory[RY] == {"filing_index": 1, "documents": 1}
+    assert report.inventory[""] == {"fx": 1}
+
+
+def test_phase2_documents_read_uncompressed_fixture_files(tmp_path: Path) -> None:
+    # The fixture tree stores the same layout uncompressed (decision A-4).
+    cache = RawCache(tmp_path)
+    key = document_key(RY_ACCESSION, "exhibit99-1.htm")
+    directory = tmp_path / "raw" / "documents" / RY / key
+    directory.mkdir(parents=True)
+    (directory / "20260101T000000000000Z.htm").write_bytes(b"<html>fixture</html>")
+    assert cache.latest("documents", RY, key) == b"<html>fixture</html>"

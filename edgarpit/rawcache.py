@@ -1,4 +1,4 @@
-"""Immutable raw cache for SEC responses (decision A-4).
+"""Immutable raw cache for SEC and Bank of Canada responses (decisions A-4, A-30).
 
 Layout under ``root``::
 
@@ -7,6 +7,9 @@ Layout under ``root``::
     raw/companyfacts/<cik10>/<fetched_at>.json.zst
     raw/headers/<cik10>/<accession>/<fetched_at>.hdr.sgml.zst
     raw/company_tickers/_/<fetched_at>.json.zst
+    raw/filing_index/<cik10>/<accession>/<fetched_at>.html.zst
+    raw/documents/<cik10>/<accession>__<filename>/<fetched_at>.<ext>.zst
+    raw/fx/_/<series>/<fetched_at>.json.zst
     raw/manifest.jsonl
 
 ``<fetched_at>`` is UTC ``YYYYMMDDTHHMMSSffffffZ`` (microseconds).  Bodies are
@@ -16,6 +19,11 @@ write appends a manifest row with the SHA-256 and size of the *uncompressed*
 body.  Readers take the latest ``<fetched_at>`` per key and accept compressed
 (``.zst``) and plain files, which is how the uncompressed fixture tree under
 ``tests/fixtures/sec`` is served as an offline cache.
+
+A ``documents`` key is ``<accession>__<filename>`` and the stored file keeps the
+document's own extension (``.htm``, ``.html``, ``.txt``), so the reader can tell
+a filing's documents apart without opening them. ``fx`` keys are Valet series
+ids (``FXUSDCAD``) and live in the global ``_`` slot, like ``company_tickers``.
 
 ``python -m edgarpit.rawcache verify DIR`` prints a per-issuer inventory and
 ``manifest OK``, or the mismatches and exit code 1.
@@ -38,20 +46,68 @@ import zstandard
 
 MANIFEST_NAME = "manifest.jsonl"
 
-ENDPOINT_SUFFIX: dict[str, str] = {
+# A ``None`` suffix means the stored file keeps the extension of the file name
+# in the key (the ``documents`` endpoint: ``<accession>__<filename>``).
+ENDPOINT_SUFFIX: dict[str, str | None] = {
     "submissions": ".json",
     "submissions_page": ".json",
     "companyfacts": ".json",
     "headers": ".hdr.sgml",
     "company_tickers": ".json",
+    "filing_index": ".html",
+    "documents": None,
+    "fx": ".json",
 }
+
+# Separates the accession from the file name in a ``documents`` key.
+DOCUMENT_SEPARATOR = "__"
 
 # Endpoints whose response is not tied to a CIK use ``_`` as the path segment
 # (an empty directory name is not addressable); their manifest ``cik`` is "".
 GLOBAL_CIK = "_"
 
 _STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
+_ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 _ENDPOINTS = tuple(ENDPOINT_SUFFIX)
+
+
+def document_key(accession: str, filename: str) -> str:
+    """Return the raw-cache key of a filing document: ``<accession>__<filename>``.
+
+    ``accession`` is ``NNNNNNNNNN-YY-NNNNNN`` and ``filename`` the EDGAR file
+    name of the document (``aapl-20260730.htm``); the extension of ``filename``
+    decides the stored file's extension. Raises :class:`ValueError` for a
+    malformed accession, an empty file name, a file name containing a path
+    separator, or a file name without an extension.
+    """
+    if not _ACCESSION_RE.fullmatch(accession):
+        raise ValueError(f"invalid accession {accession!r}")
+    if not filename or "/" in filename or "\\" in filename:
+        raise ValueError(f"invalid document file name {filename!r}")
+    if not Path(filename).suffix:
+        raise ValueError(f"document file name has no extension: {filename!r}")
+    return f"{accession}{DOCUMENT_SEPARATOR}{filename}"
+
+
+def _suffix_for(endpoint: str, key: str) -> str:
+    """Return the stored-file suffix for ``endpoint`` and ``key``.
+
+    Fixed-suffix endpoints ignore the key; ``documents`` takes the extension of
+    the file name after the last ``__`` in the key. Raises :class:`ValueError`
+    for an unknown endpoint or a ``documents`` key without a file extension.
+    """
+    if endpoint not in ENDPOINT_SUFFIX:
+        raise ValueError(f"unknown cache endpoint {endpoint!r}")
+    suffix = ENDPOINT_SUFFIX[endpoint]
+    if suffix is not None:
+        return suffix
+    filename = key.rpartition(DOCUMENT_SEPARATOR)[2]
+    extension = Path(filename).suffix
+    if not extension:
+        raise ValueError(
+            f"cache endpoint {endpoint!r} needs a key with a file extension, got {key!r}"
+        )
+    return extension
 
 
 def utc_stamp(moment: datetime | None = None) -> str:
@@ -134,12 +190,12 @@ class RawCache:
         """Return the compressed-cache path for a stamp (always ``.zst``).
 
         ``cik`` is the zero-padded CIK, or ``""`` for a global document such as
-        ``company_tickers``; the empty value is stored under ``_`` since an
-        empty path segment is not addressable.
+        ``company_tickers`` or an FX series; the empty value is stored under
+        ``_`` since an empty path segment is not addressable. ``key`` is the page
+        stem, the accession, a ``documents`` key (``<accession>__<filename>``,
+        whose extension decides the file's extension) or the FX series id.
         """
-        suffix = ENDPOINT_SUFFIX.get(endpoint)
-        if suffix is None:
-            raise ValueError(f"unknown cache endpoint {endpoint!r}")
+        suffix = _suffix_for(endpoint, key)
         parts: list[str] = ["raw", endpoint, cik or GLOBAL_CIK]
         if key:
             parts.append(key)
@@ -187,13 +243,15 @@ class RawCache:
     def latest(self, endpoint: str, cik: str, key: str | None = None) -> bytes | None:
         """Return the body stored under the newest stamp for this key, or ``None``.
 
-        ``key`` is the page stem or accession for the nested endpoints and
-        ``None`` for the main documents. ``cik`` is ``""`` for global
-        documents such as ``company_tickers``.
+        ``key`` is the page stem or accession for the nested endpoints, the
+        ``<accession>__<filename>`` key for ``documents``, the series id for
+        ``fx`` and ``None`` for the main documents. ``cik`` is ``""`` for global
+        documents such as ``company_tickers`` and FX series. Only files with the
+        endpoint's suffix (for ``documents``: the key's extension) are
+        considered, so a stale file of another type never shadows the newest
+        document.
         """
-        suffix = ENDPOINT_SUFFIX.get(endpoint)
-        if suffix is None:
-            raise ValueError(f"unknown cache endpoint {endpoint!r}")
+        suffix = _suffix_for(endpoint, key or "")
         directory = self.raw_dir / endpoint / (cik or GLOBAL_CIK)
         if key:
             directory = directory / key
@@ -203,7 +261,12 @@ class RawCache:
         return _read_body(path)
 
     def keys(self, endpoint: str, cik: str) -> list[str]:
-        """Return the sorted page/accession keys stored for a CIK and endpoint."""
+        """Return the sorted keys stored for a CIK and endpoint.
+
+        A key is a page stem, an accession, a ``documents`` key
+        (``<accession>__<filename>``) or an FX series id, depending on the
+        endpoint.
+        """
         directory = self.raw_dir / endpoint / (cik or GLOBAL_CIK)
         if not directory.is_dir():
             return []
