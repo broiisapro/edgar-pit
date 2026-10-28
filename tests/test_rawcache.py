@@ -148,6 +148,71 @@ def test_latest_reads_uncompressed_fixture_files(tmp_path: Path) -> None:
     assert cache.latest("submissions", "0001000275") == b'{"cik": "1000275"}'
 
 
+# --- XBRL frames and companyconcept (decision A-36) --------------------------
+
+FRAME_KEY = "dei__EntityPublicFloat__USD__CY2026Q3I"
+FRAME_URL = "https://data.sec.gov/api/xbrl/frames/dei/EntityPublicFloat/USD/CY2026Q3I.json"
+CONCEPT_KEY = "ifrs-full__Assets"
+CONCEPT_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK0001000275/ifrs-full/Assets.json"
+
+
+def test_frames_live_in_the_global_slot(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b'{"taxonomy": "dei", "tag": "EntityPublicFloat", "data": []}'
+    path = cache.write("frames", "", FRAME_KEY, body, url=FRAME_URL, http_status=200)
+    assert path.parent == tmp_path / "raw" / "frames" / "_" / FRAME_KEY
+    assert path.name.endswith(".json.zst")
+    assert STAMP_RE.fullmatch(path.name.removesuffix(".json.zst"))
+    assert cache.latest("frames", "", FRAME_KEY) == body
+    assert cache.latest("frames", "_", FRAME_KEY) == body
+    assert cache.keys("frames", "") == [FRAME_KEY]
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "frames"
+    assert row["cik"] == ""
+    assert row["path"].startswith(f"raw/frames/_/{FRAME_KEY}/")
+    assert row["url"] == FRAME_URL
+
+
+def test_companyconcept_lives_under_the_issuer(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    body = b'{"cik": 1000275, "taxonomy": "ifrs-full", "tag": "Assets", "units": {}}'
+    path = cache.write("companyconcept", RY, CONCEPT_KEY, body, url=CONCEPT_URL, http_status=200)
+    assert path.parent == tmp_path / "raw" / "companyconcept" / RY / CONCEPT_KEY
+    assert path.name.endswith(".json.zst")
+    assert cache.latest("companyconcept", RY, CONCEPT_KEY) == body
+    assert cache.latest("companyconcept", "0000320193", CONCEPT_KEY) is None
+    assert cache.keys("companyconcept", RY) == [CONCEPT_KEY]
+    row = cache.manifest_rows()[0]
+    assert row["endpoint"] == "companyconcept"
+    assert row["cik"] == RY
+    assert row["path"].startswith(f"raw/companyconcept/{RY}/{CONCEPT_KEY}/")
+
+
+def test_verify_covers_the_xbrl_endpoints(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path)
+    cache.write("frames", "", FRAME_KEY, b'{"data": []}', url=FRAME_URL, http_status=200)
+    cache.write(
+        "companyconcept", RY, CONCEPT_KEY, b'{"units": {}}', url=CONCEPT_URL, http_status=200
+    )
+    report = cache.verify()
+    assert report.ok
+    assert report.checked == 2
+    assert report.inventory == {"": {"frames": 1}, RY: {"companyconcept": 1}}
+
+
+def test_xbrl_documents_read_uncompressed_fixture_files(tmp_path: Path) -> None:
+    # The fixture tree stores the same layout uncompressed (decision A-4).
+    cache = RawCache(tmp_path)
+    frames = tmp_path / "raw" / "frames" / "_" / FRAME_KEY
+    concept = tmp_path / "raw" / "companyconcept" / RY / CONCEPT_KEY
+    frames.mkdir(parents=True)
+    concept.mkdir(parents=True)
+    (frames / "20260101T000000000000Z.json").write_bytes(b'{"data": []}')
+    (concept / "20260101T000000000000Z.json").write_bytes(b'{"units": {}}')
+    assert cache.latest("frames", "", FRAME_KEY) == b'{"data": []}'
+    assert cache.latest("companyconcept", RY, CONCEPT_KEY) == b'{"units": {}}'
+
+
 def test_verify_reports_bad_rows(tmp_path: Path) -> None:
     cache = RawCache(tmp_path)
     url = "https://data.sec.gov/submissions/CIK0001000275.json"
