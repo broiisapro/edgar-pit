@@ -83,8 +83,8 @@ One job, `refresh`, on `ubuntu-24.04` with a 360-minute timeout. In order:
 7. `edgarpit build --data data --out build` — rebuild, now with the new text
    and FX rows in the cache. The database is a pure function of the cache.
 8. `edgarpit qa --db build/edgarpit.duckdb | tee build/qa.txt` — the report is
-   stored as an artifact, and `set -o pipefail` makes a key-uniqueness
-   violation fail the job.
+   stored as an artifact, and `set -o pipefail` makes a duplicated key or a
+   late `asof_ts` fail the job.
 9. **Save the raw cache** (always, even when an earlier step failed — the
    files already fetched are immutable and save the next run the repeat).
    If the run fetched nothing at all, the step is skipped rather than failing
