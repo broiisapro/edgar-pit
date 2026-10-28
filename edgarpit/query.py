@@ -2,15 +2,18 @@
 
 Every function decides what was known from ``acceptance_ts`` alone: a value is
 known at ``asof_ts`` if and only if its filing's ``acceptance_ts <= asof_ts``.
-Connections opened here are read-only and always run ``SET TimeZone='UTC'``
-(decision A-5); a connection passed in is used as given and left open.
+The one exception is USD conversion (decision A-32): a converted row is known at
+its ``asof_ts`` column, ``max(acceptance_ts, fx_known_at)``, because the value
+in USD also depends on the FX rate. Connections opened here are read-only and
+always run ``SET TimeZone='UTC'`` (decision A-5); a connection passed in is used
+as given and left open.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -27,11 +30,37 @@ _ASOF_COLUMNS = (
     "restatement_kind"
 )
 
+# ``main.fundamentals_pit_usd`` (decision A-32) has the same columns as
+# ``fundamentals_pit`` plus the conversion columns; ``value`` is the converted
+# ``value_usd``. ``unit`` and ``currency`` are mapped to USD in Python.
+_USD_ASOF_COLUMNS = (
+    "cik, ticker, field, value_usd AS value, unit, currency, period_start, period_end, "
+    "period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, "
+    "restatement_kind"
+)
+
 _EVENT_COLUMNS = "cik, ticker, accession, form, acceptance_ts, ts_imputed, item_code, item_label"
+
+_TEXT_COLUMNS = (
+    "cik, ticker, accession, acceptance_ts, ts_imputed, document, doc_type, section, "
+    "section_order, text, sha256, char_count"
+)
+
+_USD_TABLE = "main.fundamentals_pit_usd"
+_TEXT_TABLE = "main.filings_text"
 
 _ISSUER_UNION = (
     "SELECT cik, ticker FROM main.fundamentals_pit UNION SELECT cik, ticker FROM main.events_8k"
 )
+
+
+class MissingTableError(RuntimeError):
+    """The database lacks a table the requested mode needs.
+
+    Raised instead of a raw DuckDB catalog error so the caller (and the REST
+    service) can say which model is missing and why: a 1.0.0 release predates
+    the Phase 2 read surface (decisions A-32, A-38).
+    """
 
 
 @dataclass(frozen=True)
@@ -82,6 +111,36 @@ class EventResult:
     ts_imputed: bool
     item_code: str
     item_label: str
+
+
+@dataclass(frozen=True)
+class TextResult:
+    """One section of one 8-K document as stored in ``main.filings_text``.
+
+    ``acceptance_ts`` is the timezone-aware UTC acceptance time of the filing
+    that carried the text, and the only thing that decides when the text was
+    known; ``ts_imputed`` says that time was imputed (decision A-23).
+    ``document`` is the EDGAR file name, ``doc_type`` is ``primary`` (the
+    8-K/8-K/A document) or ``EX-99.1`` (an exhibit), ``section`` is an EDGAR
+    item code (``2.02``) or ``unsegmented`` when the document was not split
+    confidently (decision A-40), and ``section_order`` is the 1-based position
+    of the section in the document. ``text`` is the cleaned plain text,
+    ``sha256`` its lowercase hex SHA-256 and ``char_count`` its length in
+    characters.
+    """
+
+    cik: str
+    ticker: str | None
+    accession: str
+    acceptance_ts: datetime
+    ts_imputed: bool
+    document: str
+    doc_type: str
+    section: str
+    section_order: int
+    text: str
+    sha256: str
+    char_count: int
 
 
 def _parse_timestamp(value: datetime | str, name: str) -> datetime:
@@ -136,6 +195,22 @@ def _connect(
     finally:
         if owned:
             con.close()
+
+
+def _require_table(con: duckdb.DuckDBPyConnection, name: str, hint: str) -> None:
+    """Raise :class:`MissingTableError` unless ``con`` has the table ``name``.
+
+    ``name`` is schema-qualified (``main.fundamentals_pit_usd``); ``hint`` says
+    what the table serves so the error can name the mode and the fix.
+    """
+    schema, _, table = name.partition(".")
+    found = con.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_catalog = current_database() AND table_schema = ? AND table_name = ?",
+        [schema, table],
+    ).fetchone()
+    if found is None:
+        raise MissingTableError(f"{name} is missing from the database; {hint}")
 
 
 def _resolve_cik(con: duckdb.DuckDBPyConnection, identifier: str) -> str:
@@ -210,6 +285,46 @@ def _event_result(row: tuple[Any, ...]) -> EventResult:
     )
 
 
+def _usd_unit(unit: str, currency: str | None) -> str:
+    """Return ``unit`` with its reported currency replaced by ``USD``.
+
+    Conversion changes the currency and nothing else, so ``CAD`` becomes
+    ``USD`` and ``CAD/shares`` becomes ``USD/shares``; a unit that does not
+    carry the reported currency (``shares``, ``pure``) is returned unchanged.
+    """
+    if currency is None:
+        return unit
+    if unit == currency:
+        return "USD"
+    prefix = f"{currency}/"
+    if unit.startswith(prefix):
+        return f"USD/{unit[len(prefix) :]}"
+    return unit
+
+
+def _usd_result(row: tuple[Any, ...]) -> AsOfResult:
+    """Build the USD view of a ``fundamentals_pit_usd`` row (decision A-32)."""
+    result = _asof_result(row)
+    return replace(result, unit=_usd_unit(result.unit, result.currency), currency="USD")
+
+
+def _text_result(row: tuple[Any, ...]) -> TextResult:
+    return TextResult(
+        cik=row[0],
+        ticker=row[1],
+        accession=row[2],
+        acceptance_ts=_utc(row[3]),
+        ts_imputed=row[4],
+        document=row[5],
+        doc_type=row[6],
+        section=row[7],
+        section_order=row[8],
+        text=row[9],
+        sha256=row[10],
+        char_count=row[11],
+    )
+
+
 def asof(
     identifier: str,
     field: str,
@@ -231,26 +346,52 @@ def asof(
     the row's ``unit`` and timestamps are timezone-aware UTC. ``asof_ts`` accepts
     an aware datetime or an ISO-8601 string with ``Z`` or an offset. Raises
     :class:`LookupError` for an unknown or ambiguous identifier and
-    :class:`ValueError` for ``n < 1``, an unsupported ``period``, malformed
-    timestamps or naive timestamps (no timezone). Opens a read-only connection
-    unless a connection is passed.
+    :class:`ValueError` for ``n < 1``, an unsupported ``period`` or
+    ``currency``, malformed timestamps or naive timestamps (no timezone). Opens a
+    read-only connection unless a connection is passed.
 
-    ``currency="USD"`` would read ``main.fundamentals_pit_usd`` instead
-    (decision A-32), converting CAD values at the FX rate known at the time;
-    that model does not exist yet, so passing it raises
-    :class:`NotImplementedError` and the default ``None`` keeps the row's own
-    currency.
+    ``currency="USD"`` reads ``main.fundamentals_pit_usd`` instead (decision
+    A-32): only converted rows are candidates and the point-in-time rule applies
+    to the row's ``asof_ts`` (``max(acceptance_ts, fx_known_at)``) rather than
+    ``acceptance_ts``, so a CAD value is not returned before the FX rate that
+    produced its USD amount was published. ``value`` is ``value_usd``,
+    ``currency`` is ``"USD"`` and ``unit`` carries the reported unit with its
+    currency replaced (``CAD`` → ``USD``, ``CAD/shares`` → ``USD/shares``);
+    ``acceptance_ts`` stays the filing's own acceptance time. Raises
+    :class:`MissingTableError` when the database has no
+    ``main.fundamentals_pit_usd`` (a 1.0.0 release predates FX conversion).
     """
-    if currency is not None:
-        raise NotImplementedError(
-            "currency conversion (decision A-32) lands with main.fundamentals_pit_usd; "
-            "call asof without currency"
-        )
+    if currency is not None and currency != "USD":
+        raise ValueError(f"currency must be 'USD' or None; got {currency!r}")
     _validate_period(period, "period")
     if n < 1:
         raise ValueError(f"n must be at least 1; got {n}")
     asof_utc = _parse_timestamp(asof_ts, "asof_ts")
     with _connect(db) as con:
+        if currency == "USD":
+            _require_table(
+                con,
+                _USD_TABLE,
+                "currency='USD' reads the Phase 2 FX model of decision A-32, which a "
+                "1.0.0 release does not have; rebuild the database with `edgarpit build` "
+                "or call asof without currency",
+            )
+            cik = _resolve_cik(con, identifier)
+            rows = con.execute(
+                f"""
+                SELECT {_USD_ASOF_COLUMNS}
+                FROM main.fundamentals_pit_usd
+                WHERE cik = ? AND field = ? AND period_type = ? AND converted AND asof_ts <= ?
+                QUALIFY row_number() OVER (
+                    PARTITION BY period_start, period_end
+                    ORDER BY asof_ts DESC, version DESC, accession ASC
+                ) = 1
+                ORDER BY period_end DESC, period_start DESC NULLS LAST, accession ASC
+                LIMIT ?
+                """,
+                [cik, field, period, asof_utc, n],
+            ).fetchall()
+            return [_usd_result(row) for row in rows]
         cik = _resolve_cik(con, identifier)
         rows = con.execute(
             f"""
@@ -284,25 +425,47 @@ def history(
     given. ``identifier`` is a ticker or a CIK (digits, zero-padded), matched
     case-insensitively for tickers; values are in the row's ``unit`` and
     timestamps are timezone-aware UTC. Raises :class:`LookupError` for an unknown
-    or ambiguous identifier and :class:`ValueError` for an unsupported ``period``.
-    Opens a read-only connection unless a connection is passed.
+    or ambiguous identifier and :class:`ValueError` for an unsupported ``period``
+    or ``currency``. Opens a read-only connection unless a connection is passed.
 
-    ``currency="USD"`` would read ``main.fundamentals_pit_usd`` instead
-    (decision A-32); that model does not exist yet, so passing it raises
-    :class:`NotImplementedError` and the default ``None`` keeps the row's own
-    currency.
+    ``currency="USD"`` reads ``main.fundamentals_pit_usd`` instead (decision
+    A-32) and returns only converted rows, in the same order; ``value`` is
+    ``value_usd``, ``currency`` is ``"USD"`` and ``unit`` carries the reported
+    unit with its currency replaced (``CAD`` → ``USD``, ``CAD/shares`` →
+    ``USD/shares``). Rows without an FX rate are absent rather than returned
+    with a null value. Raises :class:`MissingTableError` when the database has
+    no ``main.fundamentals_pit_usd`` (a 1.0.0 release predates FX conversion).
     """
-    if currency is not None:
-        raise NotImplementedError(
-            "currency conversion (decision A-32) lands with main.fundamentals_pit_usd; "
-            "call history without currency"
-        )
+    if currency is not None and currency != "USD":
+        raise ValueError(f"currency must be 'USD' or None; got {currency!r}")
     if period is not None:
         _validate_period(period, "period")
     with _connect(db) as con:
+        if currency == "USD":
+            _require_table(
+                con,
+                _USD_TABLE,
+                "currency='USD' reads the Phase 2 FX model of decision A-32, which a "
+                "1.0.0 release does not have; rebuild the database with `edgarpit build` "
+                "or call history without currency",
+            )
+            cik = _resolve_cik(con, identifier)
+            sql = (
+                f"SELECT {_USD_ASOF_COLUMNS} FROM main.fundamentals_pit_usd "
+                "WHERE cik = ? AND field = ? AND converted"
+            )
+            params: list[Any] = [cik, field]
+            if period is not None:
+                sql += " AND period_type = ?"
+                params.append(period)
+            sql += (
+                " ORDER BY period_end ASC, period_start ASC NULLS FIRST, version ASC, accession ASC"
+            )
+            rows = con.execute(sql, params).fetchall()
+            return [_usd_result(row) for row in rows]
         cik = _resolve_cik(con, identifier)
         sql = f"SELECT {_ASOF_COLUMNS} FROM main.fundamentals_pit WHERE cik = ? AND field = ?"
-        params: list[Any] = [cik, field]
+        params = [cik, field]
         if period is not None:
             sql += " AND period_type = ?"
             params.append(period)
@@ -347,6 +510,66 @@ def events(
         sql += " ORDER BY acceptance_ts ASC, accession ASC, item_code ASC"
         rows = con.execute(sql, params).fetchall()
     return [_event_result(row) for row in rows]
+
+
+def filing_text(
+    identifier: str,
+    *,
+    item: str | None = None,
+    start: datetime | str | None = None,
+    end: datetime | str | None = None,
+    db: str | Path | duckdb.DuckDBPyConnection | None = None,
+) -> list[TextResult]:
+    """Return the stored 8-K text of ``identifier`` ordered by acceptance time.
+
+    Rows come from ``main.filings_text`` (decision A-31): every section of the
+    primary 8-K/8-K/A document plus one ``unsegmented`` row per ``EX-99.1``
+    exhibit. ``identifier`` is a ticker or a CIK (digits, zero-padded), matched
+    case-insensitively for tickers against the issuers of
+    ``main.fundamentals_pit`` and ``main.events_8k``. ``item`` keeps only the
+    filings whose ``main.events_8k`` rows contain that item code (``"2.02"``)
+    and returns all sections and exhibits of those filings (decision A-40), so
+    Item 2.02 text is found by joining the text to the event on the accession.
+    ``start`` and ``end`` bound ``acceptance_ts`` inclusively and, like the
+    other timestamps, accept aware datetimes or ISO-8601 strings with ``Z`` or
+    an offset (naive inputs raise :class:`ValueError`). Rows are ordered by
+    ``acceptance_ts``, then ``accession``, ``document`` and ``section_order``;
+    timestamps are timezone-aware UTC.
+
+    Raises :class:`LookupError` for an unknown or ambiguous identifier,
+    :class:`ValueError` for malformed or naive timestamps and
+    :class:`MissingTableError` when the database has no ``main.filings_text``
+    (a 1.0.0 release predates 8-K text). Opens a read-only connection unless a
+    connection is passed.
+    """
+    start_utc = _parse_timestamp(start, "start") if start is not None else None
+    end_utc = _parse_timestamp(end, "end") if end is not None else None
+    with _connect(db) as con:
+        _require_table(
+            con,
+            _TEXT_TABLE,
+            "filing_text reads the Phase 2 8-K text model of decision A-31, which a "
+            "1.0.0 release does not have; rebuild the database with `edgarpit build`",
+        )
+        cik = _resolve_cik(con, identifier)
+        sql = f"SELECT {_TEXT_COLUMNS} FROM main.filings_text WHERE cik = ?"
+        params: list[Any] = [cik]
+        if item is not None:
+            sql += (
+                " AND accession IN ("
+                "SELECT accession FROM main.events_8k WHERE cik = ? AND item_code = ?"
+                ")"
+            )
+            params.extend([cik, item])
+        if start_utc is not None:
+            sql += " AND acceptance_ts >= ?"
+            params.append(start_utc)
+        if end_utc is not None:
+            sql += " AND acceptance_ts <= ?"
+            params.append(end_utc)
+        sql += " ORDER BY acceptance_ts ASC, accession ASC, document ASC, section_order ASC"
+        rows = con.execute(sql, params).fetchall()
+    return [_text_result(row) for row in rows]
 
 
 def issuers(

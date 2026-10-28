@@ -55,6 +55,9 @@ RATE_EPSILON_SECONDS = 1e-6
 _SUBMISSIONS_RE = re.compile(r"/submissions/CIK(\d{10})\.json")
 _SUBMISSIONS_PAGE_RE = re.compile(r"/submissions/(CIK(\d{10})-submissions-\d+)\.json")
 _COMPANYFACTS_RE = re.compile(r"/api/xbrl/companyfacts/CIK(\d{10})\.json")
+_FRAMES_RE = re.compile(r"/api/xbrl/frames/([^/]+)/([^/]+)/([^/]+)/([^/]+)\.json")
+_COMPANYCONCEPT_RE = re.compile(r"/api/xbrl/companyconcept/CIK(\d{10})/([^/]+)/([^/]+)\.json")
+_XBRL_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _HEADER_RE = re.compile(r"/Archives/edgar/data/(\d+)/(\d+)/(\d{10}-\d{2}-\d{6})\.hdr\.sgml")
 _FILING_INDEX_RE = re.compile(
     r"/Archives/edgar/data/(\d+)/(\d+)/(\d{10}-\d{2}-\d{6})-index-headers\.html"
@@ -109,6 +112,22 @@ def _cik10(cik: str) -> str:
     return digits.zfill(10)
 
 
+def _xbrl_component(value: str, label: str) -> str:
+    """Validate one XBRL path component (taxonomy, tag, unit or period).
+
+    ``value`` is a component of a frames or companyconcept URL: a taxonomy
+    (``us-gaap``, ``ifrs-full``, ``dei``), a tag (``Assets``), a unit
+    (``USD``, ``shares``, ``USD-per-shares``) or a frame period (``CY2026Q2I``).
+    Only letters, digits, ``_``, ``.`` and ``-`` are allowed, the first
+    character must be alphanumeric, and ``__`` (the raw-cache key separator) and
+    ``..`` (a path segment) are rejected, so a component can never change the
+    URL's path or the cache key's shape. Raises :class:`ValueError` otherwise.
+    """
+    if not _XBRL_COMPONENT_RE.fullmatch(value) or "__" in value or ".." in value:
+        raise ValueError(f"invalid XBRL {label} {value!r}")
+    return value
+
+
 def submissions_url(cik: str) -> str:
     """URL of the submissions document for a CIK."""
     return f"{DATA_HOST}/submissions/CIK{_cik10(cik)}.json"
@@ -122,6 +141,38 @@ def submissions_page_url(name: str) -> str:
 def companyfacts_url(cik: str) -> str:
     """URL of the companyfacts document for a CIK."""
     return f"{DATA_HOST}/api/xbrl/companyfacts/CIK{_cik10(cik)}.json"
+
+
+def frames_url(taxonomy: str, tag: str, unit: str, period: str) -> str:
+    """URL of one XBRL frame: every issuer's value of a tag in a period.
+
+    ``taxonomy`` is ``us-gaap``, ``ifrs-full`` or ``dei``; ``tag`` an element
+    name such as ``EntityPublicFloat``; ``unit`` a unit id such as ``USD``,
+    ``shares`` or ``USD-per-shares``; and ``period`` an instant or duration
+    frame such as ``CY2026Q2I``. Frames are static snapshots of one calendar
+    period, so they are cached globally (decision A-36). Raises
+    :class:`ValueError` for a malformed component.
+    """
+    return (
+        f"{DATA_HOST}/api/xbrl/frames/{_xbrl_component(taxonomy, 'taxonomy')}/"
+        f"{_xbrl_component(tag, 'tag')}/{_xbrl_component(unit, 'unit')}/"
+        f"{_xbrl_component(period, 'period')}.json"
+    )
+
+
+def companyconcept_url(cik: str, taxonomy: str, tag: str) -> str:
+    """URL of one issuer's facts for one concept.
+
+    ``cik`` is the issuer's CIK (digits, zero-padded), ``taxonomy`` e.g.
+    ``us-gaap`` or ``ifrs-full`` and ``tag`` the element name (``Assets``).
+    The document holds every unit and period the issuer ever tagged, so it is
+    cached under the issuer's CIK (decision A-36). Raises :class:`ValueError`
+    for a malformed CIK or component.
+    """
+    return (
+        f"{DATA_HOST}/api/xbrl/companyconcept/CIK{_cik10(cik)}/"
+        f"{_xbrl_component(taxonomy, 'taxonomy')}/{_xbrl_component(tag, 'tag')}.json"
+    )
 
 
 def header_url(cik: str, accession: str) -> str:
@@ -174,12 +225,14 @@ def classify(url: str) -> tuple[str, str, str]:
 
     Keys are the page stem for ``submissions_page``, the accession for
     ``headers`` and ``filing_index``, ``<accession>__<filename>`` for
-    ``documents`` (decision A-30) and the series id for ``fx`` (Valet); the main
-    documents and ``company_tickers`` use an empty key. The CIK of a
-    ``documents`` URL is the directory's, so a filing an agent submitted for an
-    issuer still caches under the issuer's CIK; the accession is rebuilt from the
-    directory's 18 digits. Raises :class:`ValueError` for URLs outside the
-    documented endpoints.
+    ``documents`` (decision A-30), the series id for ``fx`` (Valet),
+    ``<taxonomy>__<tag>__<unit>__<period>`` for a global ``frames`` document and
+    ``<taxonomy>__<tag>`` for an issuer's ``companyconcept`` document (decision
+    A-36); the main documents and ``company_tickers`` use an empty key. The CIK
+    of a ``documents`` URL is the directory's, so a filing an agent submitted for
+    an issuer still caches under the issuer's CIK; the accession is rebuilt from
+    the directory's 18 digits. Raises :class:`ValueError` for URLs outside the
+    documented endpoints or with a malformed XBRL path component.
     """
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -194,6 +247,26 @@ def classify(url: str) -> tuple[str, str, str]:
         match = _COMPANYFACTS_RE.fullmatch(path)
         if match:
             return ("companyfacts", match.group(1), "")
+        match = _FRAMES_RE.fullmatch(path)
+        if match:
+            taxonomy, tag, unit, period = match.groups()
+            key = "__".join(
+                _xbrl_component(part, label)
+                for part, label in zip(
+                    (taxonomy, tag, unit, period),
+                    ("taxonomy", "tag", "unit", "period"),
+                    strict=True,
+                )
+            )
+            return ("frames", "", key)
+        match = _COMPANYCONCEPT_RE.fullmatch(path)
+        if match:
+            cik, taxonomy, tag = match.groups()
+            key = "__".join(
+                _xbrl_component(part, label)
+                for part, label in zip((taxonomy, tag), ("taxonomy", "tag"), strict=True)
+            )
+            return ("companyconcept", cik, key)
     if host == "www.sec.gov":
         if path == "/files/company_tickers.json":
             return ("company_tickers", "", "")

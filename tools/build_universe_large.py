@@ -1,70 +1,79 @@
 #!/usr/bin/env python3
-"""Build ``config/universe_large.csv`` from SEC sources (decision A-33).
+"""Build ``config/universe_large.csv`` from SEC sources (decisions A-33, A-36).
 
-The file holds the large Phase 2 universe: every Canadian issuer that the SEC
-frames API exposes and that can be resolved to a US ticker, plus a US
-large-cap list ranked by public float. It is produced from SEC data only:
+The file holds the large Phase 2 universe: about 125 US and 125 Canadian
+issuers, ranked by size from SEC data only. It is produced from SEC and Bank of
+Canada data only:
 
 - ``https://www.sec.gov/files/company_tickers.json`` resolves a CIK to its
   tickers (the same document ``edgarpit universe resolve`` uses).
 - ``https://data.sec.gov/api/xbrl/frames/dei/EntityPublicFloat/USD/<period>.json``
   ranks US issuers by public float in US dollars.
-- ``https://data.sec.gov/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/<period>.json``
-  and the float frames above list the Canadian issuers, whose entries carry
-  ``loc`` ``CA-*``. The ``ifrs-full`` ``Assets`` frames named by decision A-33
-  are probed too; the SEC currently serves none (404 for every period), so they
-  contribute nothing but are retried on each run.
+- ``https://data.sec.gov/submissions/CIK<10 digits>.json`` supplies the entity
+  name, the business and mailing addresses (which decide whether an issuer is
+  Canadian), the filing history that proves the issuer filed a 10-K, 40-F or
+  20-F in the last two years, and its SIC code.
+- ``https://data.sec.gov/api/xbrl/companyconcept/CIK<10 digits>/<taxonomy>/Assets.json``
+  supplies each Canadian candidate's total-assets history; the newest annual
+  value ranks the Canadian list. ``us-gaap:Assets`` is read first and
+  ``ifrs-full:Assets`` when the issuer tags no US-GAAP assets.
 - ``https://data.sec.gov/api/xbrl/companyconcept/CIK<10 digits>/dei/EntityPublicFloat.json``
   supplies each top US candidate's float history, which is how the builder
   detects and undoes the power-of-ten scale errors some filers started
   reporting in 2022 (see :func:`adjusted_float`).
-- ``https://data.sec.gov/submissions/CIK<10 digits>.json`` supplies the entity
-  name, the listing and address, and the filing history that proves the issuer
-  filed a 10-K, 40-F or 20-F in the last two years.
+- ``https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json`` supplies the
+  CAD-per-USD rate that converts a Canadian issuer's assets to US dollars
+  (decision A-32 series, read through :class:`edgarpit.fx.valet.ValetClient`).
+  Assets reported in any currency other than CAD or USD cannot be ranked and
+  the issuer is dropped, counted in the report.
 
 Frames are calendar-quarter snapshots. A single quarter is a partial list (a
-float fact is tagged once a year, a cover fact once a year for 40-F filers), so
-the builder reads the :data:`FRAME_QUARTERS` quarters ending with the quarter
-that contains ``--as-of`` and keeps each issuer's newest value. Frames carry no
-acceptance time, so nothing here decides what was known when: this is a static
-issuer list for a fetch run, not a point-in-time table.
+float fact is tagged once a year), so the builder reads the
+:data:`FRAME_QUARTERS` quarters ending with the quarter that contains
+``--as-of`` and keeps each issuer's newest value. Frames carry no acceptance
+time, so nothing here decides what was known when: this is a static issuer list
+for a fetch run, not a point-in-time table.
 
-Selection rules, in order:
+Selection rules, in order (decision A-36):
 
-1. Seed: every row of ``config/universe.csv`` is kept unchanged, so the large
-   universe is always a superset of the Phase 1 universe.
-2. Canadian: every issuer with ``loc`` ``CA-*`` in a cover or float frame whose
-   submissions address is Canadian (or unknown, falling back to the frame
-   location), that resolves to a US ticker, and that filed a 10-K, 40-F or 20-F
-   in the last :data:`ANNUAL_WINDOW_DAYS` days at ``--as-of``.
+1. Seed: every row of ``config/universe.csv`` is kept unchanged and counts
+   toward its country's slots, so the large universe is always a superset of
+   the Phase 1 universe.
+2. Canadian: an issuer is Canadian when its submissions business or mailing
+   address carries a Canadian province code (``A0``-``A9``, ``B0``-``B2``,
+   ``Z4``) or a Canadian place name; a frame ``loc`` never decides it. The
+   candidate set is every CIK of ``company_tickers.json`` plus every CIK seen in
+   the float frames, so a sweep of the submissions documents finds Canadian
+   issuers that tag no ``dei`` cover fact. Candidates are filtered by ticker,
+   annual report, SIC code and a usable total-assets value, then ranked by the
+   newest annual total assets in USD (ties broken by CIK) and the top
+   ``--per-country`` minus the seeded Canadian rows are kept.
 3. US: issuers with ``loc`` ``US-*`` in the float frames, ranked by the newest
-   float value (ties broken by accession then CIK), filtered by the same annual
-   report rule, added until the file holds ``--target-total`` rows. When the
-   Canadian set already reaches that target, at least :data:`MIN_US` US issuers
-   are kept so the US large-cap list is never empty.
+   float value after the scale-error correction (ties broken by CIK), filtered
+   by the same ticker, annual-report and SIC rules and by a US submissions
+   address, and added until the file holds ``--per-country`` US rows including
+   the seeded ones.
 4. Excluded everywhere: funds, commodity trusts and blank-check companies
    (:data:`EXCLUDED_SIC`), issuers without a plain ticker in
-   ``company_tickers.json``, and one row per CIK (a second share class of the
-   same CIK never adds a row).
+   ``company_tickers.json``, issuers without an annual report in the window and
+   one row per CIK (a second share class of the same CIK never adds a row).
 
-The SEC serves no ``ifrs-full`` frames (every taxonomy/tag/unit/period probed
-returns 404), and many MJDS filers tag no ``dei`` cover fact at all, so a
-40-F filer that neither tags ``dei`` nor appears in ``config/universe.csv``
-cannot be discovered from frames; neither can a Canadian issuer whose XBRL
-``loc`` is a US address. The build reports how many candidates it sees and
-drops; a per-CIK submissions sweep is the documented follow-up.
+The output is deterministic for a given cache and ``--as-of``: every list is
+sorted before it is truncated.
 
-Responses are cached immutably under ``--cache`` (never committed): frames and
-submissions at <= 5 requests/second through
-:class:`edgarpit.sec_client.SecClient`, stamped files plus ``raw/manifest.jsonl``
-rows. Re-running with the same cache and ``--as-of`` writes the same file;
-``--offline`` reads the cache only and needs no User-Agent.
+Responses are cached immutably under ``--cache`` (never committed) in the
+layout of :class:`edgarpit.rawcache.RawCache`, at <= 5 requests per second
+through :class:`edgarpit.sec_client.SecClient`. A document already in the cache
+is read before any request is made, so a re-run - including the long
+submissions sweep - makes no requests and writes the same file; ``--offline``
+additionally guarantees that no request can happen at all and needs no
+User-Agent.
 
 Usage::
 
     export SEC_USER_AGENT='Name email@example.com'
-    uv run python tools/build_universe_large.py --cache /tmp/ep-d/universe
-    uv run python tools/build_universe_large.py --cache /tmp/ep-d/universe --offline
+    uv run python tools/build_universe_large.py --cache /tmp/ep-i/universe
+    uv run python tools/build_universe_large.py --cache /tmp/ep-i/universe --offline
 
 Exit codes: ``0`` on success, ``2`` on a configuration, cache or SEC data
 error (the message names the issuer or URL).
@@ -73,7 +82,6 @@ error (the message names the issuer or URL).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -88,13 +96,16 @@ from pathlib import Path
 from typing import Any
 
 from edgarpit.config import ConfigError, Settings
-from edgarpit.rawcache import GLOBAL_CIK, MANIFEST_NAME, RawCache, utc_stamp
+from edgarpit.fx.valet import ValetClient, valet_url
+from edgarpit.rawcache import RawCache
 from edgarpit.sec_client import (
-    DATA_HOST,
     SecClient,
     SecClientError,
     SecNotFound,
+    classify,
     company_tickers_url,
+    companyconcept_url,
+    frames_url,
     submissions_page_url,
     submissions_url,
 )
@@ -110,19 +121,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "config" / "universe_large.csv"
 SMALL_UNIVERSE = REPO_ROOT / "config" / "universe.csv"
 
-FRAMES_PATH = "/api/xbrl/frames"
-CONCEPTS_PATH = "/api/xbrl/companyconcept"
-FLOAT_SPEC = ("dei", "EntityPublicFloat", "USD")
-COVER_SPEC = ("dei", "EntityCommonStockSharesOutstanding", "shares")
-# A-33 also names ifrs-full balance-sheet frames as a Canadian source. The SEC
-# frames API serves no ifrs-full frames today (every period returns 404), so
-# these are probed on every run and simply contribute nothing until it does.
-IFRS_SPECS = (("ifrs-full", "Assets", "CAD"), ("ifrs-full", "Assets", "USD"))
-CANADIAN_SPECS = (COVER_SPEC, FLOAT_SPEC, *IFRS_SPECS)
-
+TARGET_PER_COUNTRY = 125
 FRAME_QUARTERS = 8
-TARGET_TOTAL = 250
-MIN_US = 25
+FLOAT_SPEC = ("dei", "EntityPublicFloat", "USD")
+# A-36 ranks Canadian issuers by total assets in USD. US-GAAP filers tag
+# `us-gaap:Assets`; MJDS 40-F filers tag `ifrs-full:Assets`. Other taxonomies
+# (e.g. `srt`) never carry an issuer's balance sheet.
+ASSET_SPECS = (("us-gaap", "Assets"), ("ifrs-full", "Assets"))
+FX_SERIES = "FXUSDCAD"
+
 ANNUAL_FORMS = ("10-K", "40-F", "20-F")
 ANNUAL_WINDOW_DAYS = 730
 
@@ -133,10 +140,12 @@ ANNUAL_WINDOW_DAYS = 730
 # MAX_FLOAT_USD after the correction is treated as unusable.
 SCALE_JUMP_RATIO = 100.0
 MAX_FLOAT_USD = 5_000_000_000_000.0
-US_PROBE_FLOOR = 60
+US_PROBE_FLOOR = 300
 
-# EDGAR state/country codes for the Canadian provinces and territories plus
-# the federal code; the address text ("Ontario, Canada") is checked first.
+# EDGAR address codes for the Canadian provinces and territories plus the
+# federal code: Alberta to Saskatchewan are A0-A9, Yukon B0, the Northwest
+# Territories B1, Nunavut B2 and "Canada" Z4. The address text ("Ontario,
+# Canada") is checked as well, because older submissions omit the code.
 CANADIAN_CODES = frozenset(
     {"A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "B0", "B1", "B2", "Z4"}
 )
@@ -146,7 +155,6 @@ CANADIAN_CODES = frozenset(
 EXCLUDED_SIC = frozenset({"6221", "6722", "6726", "6733", "6770"})
 
 TICKER_RE = re.compile(r"[A-Z][A-Z0-9.]*")
-STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
 STATE_RE = re.compile(r"[A-Z]{2}")
 
 
@@ -159,121 +167,55 @@ class UniverseBuildError(RuntimeError):
 # --------------------------------------------------------------------------
 
 
-def frames_url(taxonomy: str, tag: str, unit: str, period: str) -> str:
-    """URL of one XBRL frame document.
+class DocumentReader:
+    """Read raw-cache documents, fetching a miss through the SEC client.
 
-    ``taxonomy`` is e.g. ``dei``, ``tag`` e.g. ``EntityPublicFloat``, ``unit``
-    e.g. ``USD`` or ``shares``, and ``period`` an instant frame such as
-    ``CY2026Q2I``.
-    """
-    return f"{DATA_HOST}{FRAMES_PATH}/{taxonomy}/{tag}/{unit}/{period}.json"
+    ``cache`` is the immutable raw cache, ``client`` the online client whose
+    ``get_json`` writes new bodies (``None`` in offline mode) and ``counter`` a
+    one-element list counting network requests. A stored body is always used
+    before any request, so a re-run against a warm cache issues no requests and
+    ``--offline`` never touches the network. A document the SEC does not have
+    (HTTP 404) is absent from the cache too, so both modes return ``None``.
 
-
-def frame_key(taxonomy: str, tag: str, unit: str, period: str) -> str:
-    """Cache key of a frame: ``<taxonomy>__<tag>__<unit>__<period>``."""
-    return f"{taxonomy}__{tag}__{unit}__{period}"
-
-
-class DocumentStore:
-    """Immutable store for tool documents under ``<root>/raw/universe/_/``.
-
-    :class:`edgarpit.rawcache.RawCache` classifies URLs by endpoint and has no
-    ``frames`` or ``companyconcept`` endpoint yet, so the documents this tool
-    needs are stored here in the same shape it would write:
-    ``raw/universe/_/<key>/<stamp>.json`` with a ``raw/manifest.jsonl`` row
-    (``endpoint='universe'``, ``cik=''``, SHA-256 and byte size of the stored
-    body, ``http_status``) and an exclusive create that never overwrites.
-    Bodies are stored byte-for-byte as received after HTTP content decoding;
-    readers take the newest stamp per key.
+    Raises :class:`UniverseBuildError` for a stored or fetched body that is not
+    a JSON object, and :class:`edgarpit.sec_client.SecClientError` for a request
+    failure other than 404.
     """
 
-    def __init__(self, root: Path | str) -> None:
-        self.root = Path(root)
+    def __init__(self, cache: RawCache, client: SecClient | None, counter: list[int]) -> None:
+        self._cache = cache
+        self._client = client
+        self._counter = counter
 
-    def _directory(self, key: str) -> Path:
-        return self.root / "raw" / "universe" / GLOBAL_CIK / key
-
-    def latest(self, key: str) -> dict[str, Any] | None:
-        """Return the newest stored document for ``key``, or ``None``."""
-        directory = self._directory(key)
-        if not directory.is_dir():
+    def json(self, url: str) -> dict[str, Any] | None:
+        """Return the JSON object at ``url``, or ``None`` when the SEC has none."""
+        endpoint, cik, key = classify(url)
+        body = self._cache.latest(endpoint, cik, key)
+        if body is not None:
+            return _json_object(body, url)
+        if self._client is None:
             return None
-        files = sorted(path for path in directory.glob("*.json") if STAMP_RE.fullmatch(path.stem))
-        if not files:
-            return None
-        payload = json.loads(files[-1].read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise UniverseBuildError(f"cached document {files[-1]} is not a JSON object")
-        return payload
-
-    def write(self, key: str, body: bytes, *, url: str, http_status: int) -> Path:
-        """Store ``body`` under a fresh stamp and append the manifest row."""
-        stamp = utc_stamp()
-        final = self._directory(key) / f"{stamp}.json"
-        final.parent.mkdir(parents=True, exist_ok=True)
-        tmp = final.with_name(f"{final.name}.tmp")
-        tmp.write_bytes(body)
+        self._counter[0] += 1
         try:
-            os.link(tmp, final)
-        except FileExistsError:
-            raise FileExistsError(f"refusing to overwrite cached document {final}") from None
-        finally:
-            tmp.unlink(missing_ok=True)
-        row = {
-            "path": final.relative_to(self.root).as_posix(),
-            "url": url,
-            "endpoint": "universe",
-            "cik": "",
-            "sha256": hashlib.sha256(body).hexdigest(),
-            "bytes": len(body),
-            "fetched_at": stamp,
-            "http_status": http_status,
-        }
-        manifest = self.root / "raw" / MANIFEST_NAME
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        with manifest.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        return final
+            return self._client.get_json(url)
+        except SecNotFound:
+            return None
+
+
+def _json_object(body: bytes, source: str) -> dict[str, Any]:
+    """Parse ``body`` as a JSON object, naming ``source`` on failure."""
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise UniverseBuildError(f"cached document {source} is not JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise UniverseBuildError(f"document {source} is not a JSON object")
+    return payload
 
 
 # --------------------------------------------------------------------------
 # Frames and companyconcept documents
 # --------------------------------------------------------------------------
-
-
-def companyconcept_url(cik: str, taxonomy: str, tag: str) -> str:
-    """URL of a company-concept document (all facts of one tag for one CIK)."""
-    return f"{DATA_HOST}{CONCEPTS_PATH}/CIK{cik}/{taxonomy}/{tag}.json"
-
-
-def read_document(
-    client: SecClient,
-    store: DocumentStore,
-    key: str,
-    url: str,
-    *,
-    offline: bool,
-    counter: list[int],
-) -> dict[str, Any] | None:
-    """Read one JSON document from the cache or SEC; ``None`` on HTTP 404.
-
-    Online mode fetches through ``client`` and stores the body in ``store``;
-    offline mode reads the cache only. ``counter`` is incremented once per
-    network request (never for cache reads). Raises
-    :class:`UniverseBuildError` when a body is not a JSON object.
-    """
-    if offline:
-        return store.latest(key)
-    counter[0] += 1
-    try:
-        text = client.get_text(url)
-    except SecNotFound:
-        return None
-    payload = json.loads(text)
-    if not isinstance(payload, dict):
-        raise UniverseBuildError(f"document {url} is not a JSON object")
-    store.write(key, text.encode("utf-8"), url=url, http_status=200)
-    return payload
 
 
 def frame_periods(as_of: date, count: int = FRAME_QUARTERS) -> list[str]:
@@ -369,6 +311,19 @@ def latest_by_cik(rows: Iterable[FrameRow]) -> dict[str, FrameRow]:
     return latest
 
 
+def read_frame(reader: DocumentReader, spec: tuple[str, str, str], period: str) -> list[FrameRow]:
+    """Read one frame from the cache or SEC; ``[]`` when the frame is absent.
+
+    ``spec`` is ``(taxonomy, tag, unit)`` and ``period`` an instant frame such
+    as ``CY2026Q2I``. A quarter the SEC has not published returns ``[]``; a
+    malformed frame raises :class:`UniverseBuildError`.
+    """
+    payload = reader.json(frames_url(*spec, period))
+    if payload is None:
+        return []
+    return parse_frame(payload, period)
+
+
 def float_history(document: Mapping[str, Any], source: str) -> list[tuple[date, float]]:
     """The USD ``dei:EntityPublicFloat`` observations of a companyconcept doc.
 
@@ -382,6 +337,9 @@ def float_history(document: Mapping[str, Any], source: str) -> list[tuple[date, 
         raise UniverseBuildError(f"{source} has no units object")
     rows = units.get("USD")
     if rows is None:
+        return []
+    if isinstance(rows, Mapping) and not rows:
+        # The endpoint renders a unit with no facts as an empty object.
         return []
     if not isinstance(rows, list):
         raise UniverseBuildError(f"{source} has a non-array USD unit")
@@ -436,35 +394,188 @@ def adjusted_float(value: float, history: Sequence[tuple[date, float]]) -> float
     return value
 
 
-def read_frame(
-    client: SecClient,
-    store: DocumentStore,
-    spec: tuple[str, str, str],
-    period: str,
+@dataclass(frozen=True)
+class AssetFact:
+    """One total-assets observation of an issuer.
+
+    Attributes:
+        end: balance-sheet date (``DATE``).
+        value: total assets in ``unit``.
+        unit: reporting currency, ``CAD`` or ``USD`` (others are parsed but
+            never ranked).
+        accession: accession of the filing that carried the fact.
+        form: the filing's form as tagged in the fact.
+    """
+
+    end: date
+    value: float
+    unit: str
+    accession: str
+    form: str
+
+
+def annual_assets(document: Mapping[str, Any], source: str) -> AssetFact | None:
+    """Newest total-assets value of a companyconcept document, annual first.
+
+    ``document`` is the parsed ``companyconcept`` JSON of one ``Assets`` tag and
+    ``source`` labels it in error messages. Every unit is considered; the
+    newest row whose ``form`` is an annual report (:data:`ANNUAL_FORMS`) is
+    returned, and when the issuer tagged assets in no annual report at all the
+    newest row of any form is returned instead. A tie on ``end`` is broken by
+    the larger accession, so the choice never depends on row order. Returns
+    ``None`` when the document holds no usable fact. Raises
+    :class:`UniverseBuildError` on a malformed row rather than silently ranking
+    an issuer on a partial history.
+    """
+    units = document.get("units")
+    if not isinstance(units, Mapping):
+        raise UniverseBuildError(f"{source} has no units object")
+    annual: list[AssetFact] = []
+    other: list[AssetFact] = []
+    for unit in sorted(units):
+        rows = units[unit]
+        if isinstance(unit, str) and isinstance(rows, Mapping) and not rows:
+            # The endpoint renders a unit with no facts as an empty object; a
+            # filer that tags the concept in no unit must not fail the build.
+            continue
+        if not isinstance(unit, str) or not isinstance(rows, list):
+            raise UniverseBuildError(f"{source} has a malformed unit {unit!r}")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise UniverseBuildError(f"{source} has a non-object fact")
+            end = row.get("end")
+            value = row.get("val")
+            accession = row.get("accn")
+            form = row.get("form")
+            if not isinstance(end, str) or not end:
+                raise UniverseBuildError(f"{source} has a fact without an end date")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise UniverseBuildError(f"{source} has a fact without a numeric val")
+            try:
+                when = date.fromisoformat(end)
+            except ValueError as error:
+                raise UniverseBuildError(f"{source} has a malformed end date {end!r}") from error
+            fact = AssetFact(
+                end=when,
+                value=float(value),
+                unit=unit,
+                accession=accession if isinstance(accession, str) else "",
+                form=form if isinstance(form, str) else "",
+            )
+            (annual if fact.form in ANNUAL_FORMS else other).append(fact)
+    pool = annual or other
+    if not pool:
+        return None
+    return max(pool, key=lambda fact: (fact.end, fact.accession))
+
+
+def read_assets(reader: DocumentReader, cik: str) -> AssetFact | None:
+    """Read an issuer's newest total assets from the cache or SEC.
+
+    Every tag of :data:`ASSET_SPECS` is tried in order and the first one with a
+    usable value wins: a US-GAAP filer is ranked by ``us-gaap:Assets`` and a
+    MJDS filer, which tags no US-GAAP assets, by ``ifrs-full:Assets``. Returns
+    ``None`` when neither document exists or holds a fact.
+    """
+    for taxonomy, tag in ASSET_SPECS:
+        document = reader.json(companyconcept_url(cik, taxonomy, tag))
+        if document is None:
+            continue
+        fact = annual_assets(document, f"CIK{cik} {taxonomy}:{tag}")
+        if fact is not None:
+            return fact
+    return None
+
+
+def assets_in_usd(fact: AssetFact, cad_per_usd: float | None) -> float | None:
+    """Convert a total-assets fact to US dollars.
+
+    ``fact`` carries the reporting currency; ``cad_per_usd`` is the latest
+    ``FXUSDCAD`` observation (Canadian dollars per US dollar). A USD fact is
+    returned unchanged, a CAD fact is divided by the rate, and any other
+    currency returns ``None`` because it is out of scope (decision A-32) and
+    must not be guessed. A CAD fact without a rate also returns ``None``.
+    """
+    if fact.unit == "USD":
+        return fact.value
+    if fact.unit == "CAD" and cad_per_usd is not None and cad_per_usd > 0:
+        return fact.value / cad_per_usd
+    return None
+
+
+# --------------------------------------------------------------------------
+# FX
+# --------------------------------------------------------------------------
+
+
+def latest_fx_rate(
+    document: Mapping[str, Any], series: str = FX_SERIES
+) -> tuple[date, float] | None:
+    """Latest observation of a Valet series document as ``(date, rate)``.
+
+    ``document`` is the parsed JSON of ``valet_url(series)``; ``series`` is the
+    Valet id (``FXUSDCAD``: Canadian dollars per US dollar). Observations
+    without a value for the series (Valet's empty string on a holiday) are
+    skipped; the newest date wins regardless of document order. Returns
+    ``None`` when no observation carries a value. Raises
+    :class:`UniverseBuildError` for a malformed observation or a non-positive
+    rate, because a wrong rate would silently mis-rank every Canadian issuer.
+    """
+    observations = document.get("observations")
+    if not isinstance(observations, list):
+        raise UniverseBuildError("FX document has no observations array")
+    best: tuple[date, float] | None = None
+    for entry in observations:
+        if not isinstance(entry, Mapping):
+            raise UniverseBuildError("FX document has a non-object observation")
+        day = entry.get("d")
+        if not isinstance(day, str) or not day:
+            raise UniverseBuildError("FX observation has no date")
+        try:
+            when = date.fromisoformat(day)
+        except ValueError as error:
+            raise UniverseBuildError(f"FX observation has a malformed date {day!r}") from error
+        value = entry.get(series)
+        if not isinstance(value, Mapping):
+            continue
+        raw = value.get("v")
+        if raw is None or raw == "":
+            continue
+        try:
+            rate = float(raw)
+        except (TypeError, ValueError) as error:
+            raise UniverseBuildError(f"FX observation {day} has a non-numeric value") from error
+        if not rate > 0 or not math.isfinite(rate):
+            raise UniverseBuildError(f"FX observation {day} has a non-positive value {rate!r}")
+        if best is None or when > best[0]:
+            best = (when, rate)
+    return best
+
+
+def read_fx_rate(
+    cache: RawCache,
     *,
     offline: bool,
     counter: list[int],
-) -> list[FrameRow]:
-    """Read one frame from the cache or SEC; ``[]`` when the frame is absent.
+    settings: Settings | None,
+) -> tuple[date, float] | None:
+    """Latest ``FXUSDCAD`` observation from the cache or the Bank of Canada.
 
-    Online mode fetches through ``client`` (rate limiter, retries, User-Agent)
-    and stores the body in ``store``; a 404 means the quarter has no frame and
-    is not an error. Offline mode reads the cache only and returns ``[]`` for a
-    frame that was never stored. ``counter`` is incremented once per network
-    request, so the caller can report the run's request count.
+    The series is read from the raw cache first; only a cache miss in online
+    mode fetches it through :class:`edgarpit.fx.valet.ValetClient` (counted in
+    ``counter``) and stores it in the ``fx`` slot. Returns ``(date, CAD per
+    USD)`` or ``None`` when the series is neither cached nor fetchable. Raises
+    :class:`UniverseBuildError` for a malformed cached or fetched document.
     """
-    taxonomy, tag, unit = spec
-    payload = read_document(
-        client,
-        store,
-        frame_key(taxonomy, tag, unit, period),
-        frames_url(taxonomy, tag, unit, period),
-        offline=offline,
-        counter=counter,
-    )
-    if payload is None:
-        return []
-    return parse_frame(payload, period)
+    body = cache.latest("fx", "", FX_SERIES)
+    if body is not None:
+        return latest_fx_rate(_json_object(body, valet_url(FX_SERIES)))
+    if offline or settings is None:
+        return None
+    counter[0] += 1
+    with ValetClient(settings, cache=cache) as valet:
+        document = valet.get_json(valet_url(FX_SERIES))
+    return latest_fx_rate(document)
 
 
 # --------------------------------------------------------------------------
@@ -472,32 +583,43 @@ def read_frame(
 # --------------------------------------------------------------------------
 
 
-def address_country(addresses: Mapping[str, Any] | None) -> str | None:
-    """Classify a submissions address as ``CA``, ``US`` or ``None``.
+def _section_country(block: Any) -> str | None:
+    """Classify one submissions address block as ``CA``, ``US`` or ``None``.
 
-    Checks the business address first and the mailing address second. A
-    description or country mentioning Canada (or an EDGAR Canadian province
-    code ``A0``-``A9``/``B0``-``B2``/``Z4``) is ``CA``; a non-foreign
-    two-letter state code is ``US``; any other foreign address (including a
-    missing one) is ``None``.
+    A description or country naming Canada, or a Canadian province code, is
+    ``CA``; a non-foreign two-letter state code is ``US``; anything else
+    (including a missing block) is ``None``.
+    """
+    if not isinstance(block, Mapping):
+        return None
+    code = block.get("stateOrCountry") or block.get("countryCode")
+    description = " ".join(
+        str(block.get(key) or "") for key in ("stateOrCountryDescription", "country")
+    ).lower()
+    if "canada" in description:
+        return "CA"
+    if isinstance(code, str) and code in CANADIAN_CODES:
+        return "CA"
+    if isinstance(code, str) and STATE_RE.fullmatch(code) and block.get("isForeignLocation") != 1:
+        return "US"
+    return None
+
+
+def address_country(addresses: Mapping[str, Any] | None) -> str | None:
+    """Classify a submissions ``addresses`` object as ``CA``, ``US`` or ``None``.
+
+    ``addresses`` is the document's ``addresses`` value. A Canadian business
+    *or* mailing address makes the issuer Canadian (decision A-36); otherwise a
+    US state code in either address makes it US; otherwise the address is
+    foreign or missing and the result is ``None``.
     """
     if not isinstance(addresses, Mapping):
         return None
-    for section in ("business", "mailing"):
-        block = addresses.get(section)
-        if not isinstance(block, Mapping):
-            continue
-        code = block.get("stateOrCountry") or block.get("countryCode")
-        description = " ".join(
-            str(block.get(key) or "") for key in ("stateOrCountryDescription", "country")
-        ).lower()
-        if "canada" in description:
-            return "CA"
-        if isinstance(code, str) and code in CANADIAN_CODES:
-            return "CA"
-        is_state = isinstance(code, str) and STATE_RE.fullmatch(code) is not None
-        if is_state and block.get("isForeignLocation") != 1:
-            return "US"
+    countries = [_section_country(addresses.get(section)) for section in ("business", "mailing")]
+    if "CA" in countries:
+        return "CA"
+    if "US" in countries:
+        return "US"
     return None
 
 
@@ -596,13 +718,10 @@ def _page_urls(document: Mapping[str, Any]) -> list[str]:
 
 
 def read_filings(
-    client: SecClient,
+    reader: DocumentReader,
     document: Mapping[str, Any],
     cik: str,
     cutoff: date,
-    *,
-    offline: bool,
-    counter: list[int],
 ) -> list[tuple[str, date]]:
     """Every filing of one issuer down to ``cutoff``, from recent plus pages.
 
@@ -610,17 +729,17 @@ def read_filings(
     enough for two years for almost every issuer. When its oldest row is newer
     than ``cutoff`` and the document lists pages, the pages are read in order
     until one reaches ``cutoff`` (or they run out), because a missing annual
-    report would silently drop the issuer. ``counter`` counts network requests
-    (never cache reads in offline mode).
+    report would silently drop the issuer. A page the SEC does not serve ends
+    the walk.
     """
     pairs = _filing_rows(document, f"CIK{cik}")
     if pairs and min(filed for _, filed in pairs) <= cutoff:
         return pairs
     known = {(form, filed) for form, filed in pairs}
     for url in _page_urls(document):
-        if not offline:
-            counter[0] += 1
-        page = client.get_json(url)
+        page = reader.json(url)
+        if page is None:
+            break
         for pair in _filing_rows(page, url):
             if pair not in known:
                 known.add(pair)
@@ -652,13 +771,10 @@ class SubmissionFacts:
 
 
 def submission_facts(
-    client: SecClient,
+    reader: DocumentReader,
     document: Mapping[str, Any],
     cik: str,
     cutoff: date,
-    *,
-    offline: bool,
-    counter: list[int],
 ) -> SubmissionFacts:
     """Extract name, tickers, country, annual form and SIC for one CIK."""
     name = document.get("name")
@@ -669,7 +785,7 @@ def submission_facts(
     if isinstance(raw_tickers, list):
         tickers = tuple(ticker for ticker in raw_tickers if isinstance(ticker, str) and ticker)
     sic = document.get("sic")
-    pairs = read_filings(client, document, cik, cutoff, offline=offline, counter=counter)
+    pairs = read_filings(reader, document, cik, cutoff)
     return SubmissionFacts(
         cik=cik,
         name=name.strip(),
@@ -680,6 +796,28 @@ def submission_facts(
     )
 
 
+def sweep_submissions(
+    reader: DocumentReader, ciks: Iterable[str], cutoff: date
+) -> tuple[dict[str, SubmissionFacts], int]:
+    """Read every candidate's submissions document; return facts and misses.
+
+    ``ciks`` is the candidate CIK set (every ticker CIK plus every float-frame
+    CIK) and ``cutoff`` the start of the annual-report window. An issuer whose
+    document the SEC does not serve is counted as a miss and skipped. The
+    result maps 10-character CIK to facts; its order never matters because
+    every selection sorts explicitly.
+    """
+    facts: dict[str, SubmissionFacts] = {}
+    missing = 0
+    for cik in sorted(ciks):
+        document = reader.json(submissions_url(cik))
+        if document is None:
+            missing += 1
+            continue
+        facts[cik] = submission_facts(reader, document, cik, cutoff)
+    return facts, missing
+
+
 # --------------------------------------------------------------------------
 # Selection
 # --------------------------------------------------------------------------
@@ -688,50 +826,46 @@ def submission_facts(
 def merge_universe(
     seeded: Sequence[Issuer],
     canadian: Sequence[Issuer],
-    us_ranked: Sequence[Issuer],
+    us: Sequence[Issuer],
     *,
-    target_total: int,
-    min_us: int,
+    per_country: int,
 ) -> list[Issuer]:
     """Combine seeded, Canadian and US rows into the sorted file.
 
-    Seeded rows always win and keep their fields verbatim. Every Canadian row
-    whose CIK is not seeded is added. US rows are added in the given order
-    until the file holds ``target_total`` rows, but always at least ``min_us``
-    US rows, so the US large-cap list is never empty. A duplicate ticker or CIK
-    raises :class:`UniverseError`; the result is sorted by
-    ``(country, ticker)``, so the file order never depends on input order.
+    Seeded rows always win, keep their fields verbatim and are never dropped;
+    every ranked row is taken in the order given until its country holds
+    ``per_country`` rows including the seeded ones. A duplicate CIK is skipped
+    (the first row wins) and a duplicate ticker raises :class:`UniverseError`.
+    The result is sorted by ``(country, ticker)``, so the file order never
+    depends on input order.
     """
     rows: list[Issuer] = []
-    by_cik: dict[str, Issuer] = {}
-    by_ticker: dict[str, Issuer] = {}
+    by_cik: set[str] = set()
+    by_ticker: dict[str, str] = {}
+    counts: dict[str, int] = defaultdict(int)
 
-    def add(issuer: Issuer) -> bool:
+    def add(issuer: Issuer, *, capped: bool) -> bool:
         if issuer.cik is None:
             raise UniverseError(f"issuer {issuer.ticker} has no CIK")
         if issuer.cik in by_cik:
             return False
-        existing = by_ticker.get(issuer.ticker)
-        if existing is not None:
-            raise UniverseError(
-                f"ticker {issuer.ticker} is used by both {existing.cik} and {issuer.cik}"
-            )
+        owner = by_ticker.get(issuer.ticker)
+        if owner is not None:
+            raise UniverseError(f"ticker {issuer.ticker} is used by both {owner} and {issuer.cik}")
+        if capped and counts[issuer.country] >= per_country:
+            return False
         rows.append(issuer)
-        by_cik[issuer.cik] = issuer
-        by_ticker[issuer.ticker] = issuer
+        by_cik.add(issuer.cik)
+        by_ticker[issuer.ticker] = issuer.cik
+        counts[issuer.country] += 1
         return True
 
     for issuer in seeded:
-        add(issuer)
+        add(issuer, capped=False)
     for issuer in canadian:
-        add(issuer)
-    slots = max(target_total - len(rows), min_us)
-    added = 0
-    for issuer in us_ranked:
-        if added >= slots:
-            break
-        if add(issuer):
-            added += 1
+        add(issuer, capped=True)
+    for issuer in us:
+        add(issuer, capped=True)
     return sorted(rows, key=lambda issuer: (issuer.country, issuer.ticker))
 
 
@@ -745,19 +879,29 @@ class BuildReport:
     """Counts and timings the CLI prints and the PR body quotes."""
 
     periods: list[str] = field(default_factory=list)
+    per_country: int = TARGET_PER_COUNTRY
     requests: int = 0
+    submissions_read: int = 0
+    submissions_missing: int = 0
+    sweep_candidates: int = 0
     frames_read: int = 0
     frames_missing: int = 0
     seeded: int = 0
     canadian_candidates: int = 0
-    canadian_rows: int = 0
     us_candidates: int = 0
+    canadian_rows: int = 0
     us_rows: int = 0
     rejected_no_ticker: int = 0
     rejected_no_annual: int = 0
     rejected_fund: int = 0
-    rejected_not_canadian: int = 0
+    rejected_no_assets: int = 0
+    rejected_currency: int = 0
+    rejected_no_facts: int = 0
+    rejected_not_us: int = 0
     rejected_implausible_float: int = 0
+    fx_date: date | None = None
+    fx_rate: float | None = None
+    assets_usd: dict[str, float] = field(default_factory=dict)
     rows: list[Issuer] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
@@ -774,6 +918,25 @@ class BuildReport:
         for issuer in self.rows:
             counts[issuer.filer_type] += 1
         return dict(sorted(counts.items()))
+
+    def largest_canadian(self, count: int) -> list[tuple[str, str, float | None]]:
+        """The ``count`` largest Canadian rows as ``(ticker, name, USD assets)``.
+
+        Rows without a ranked asset value (the seeded Phase 1 issuers when their
+        assets could not be read) come last, ordered by ticker. Sorting is
+        deterministic because the asset map is keyed by CIK.
+        """
+        canadian = [issuer for issuer in self.rows if issuer.country == "CA"]
+        canadian.sort(
+            key=lambda issuer: (
+                -(self.assets_usd.get(issuer.cik or "", -1.0)),
+                issuer.ticker,
+            )
+        )
+        return [
+            (issuer.ticker, issuer.name, self.assets_usd.get(issuer.cik or ""))
+            for issuer in canadian[:count]
+        ]
 
 
 def find_user_agent() -> str:
@@ -798,18 +961,6 @@ def find_user_agent() -> str:
                 if found:
                     return found
     return ""
-
-
-def _reject(report: BuildReport, reason: str) -> None:
-    """Increment the rejection counter named by ``reason``."""
-    if reason == "no_ticker":
-        report.rejected_no_ticker += 1
-    elif reason == "no_annual":
-        report.rejected_no_annual += 1
-    elif reason == "fund":
-        report.rejected_fund += 1
-    else:  # pragma: no cover - internal invariant
-        raise UniverseBuildError(f"unknown rejection reason {reason!r}")
 
 
 def _tickers_by_cik(tickers: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
@@ -843,165 +994,223 @@ def _issuer(facts: SubmissionFacts, ticker: str, country: str) -> Issuer:
     )
 
 
+def _reject(report: BuildReport, reason: str) -> None:
+    """Increment the rejection counter named by ``reason``."""
+    counters = {
+        "no_ticker": "rejected_no_ticker",
+        "no_annual": "rejected_no_annual",
+        "fund": "rejected_fund",
+        "no_assets": "rejected_no_assets",
+        "currency": "rejected_currency",
+        "no_facts": "rejected_no_facts",
+        "not_us": "rejected_not_us",
+        "float": "rejected_implausible_float",
+    }
+    attribute = counters.get(reason)
+    if attribute is None:  # pragma: no cover - internal invariant
+        raise UniverseBuildError(f"unknown rejection reason {reason!r}")
+    setattr(report, attribute, getattr(report, attribute) + 1)
+
+
 def build(
     cache_dir: Path,
     *,
     as_of: date,
     offline: bool,
-    target_total: int,
-    min_us: int,
+    per_country: int,
 ) -> BuildReport:
     """Build the universe from the cache or SEC.
 
     ``cache_dir`` holds the immutable raw cache (frames, companyconcept,
-    submissions, ``company_tickers``). ``as_of`` is the calendar date whose quarter ends the
-    frame window and whose two-year annual-report window is applied; it is a
-    date, not a timestamp. Raises :class:`ConfigError` for a missing
-    User-Agent, :class:`UniverseBuildError` for malformed SEC data and
-    :class:`edgarpit.sec_client.SecClientError` for HTTP failures.
+    submissions, ``company_tickers`` and the FX series). ``as_of`` is the
+    calendar date whose quarter ends the frame window and whose two-year
+    annual-report window is applied; it is a date, not a timestamp.
+    ``per_country`` caps each country's rows. Raises :class:`ConfigError` for a
+    missing User-Agent in online mode, :class:`UniverseBuildError` for
+    malformed SEC data and :class:`edgarpit.sec_client.SecClientError` for HTTP
+    failures.
     """
     started = time.monotonic()
-    report = BuildReport(periods=frame_periods(as_of))
+    report = BuildReport(periods=frame_periods(as_of), per_country=per_country)
     counter = [0]
-    store = DocumentStore(cache_dir)
-    if offline:
-        client = SecClient(Settings(), offline_dir=cache_dir)
-        frame_client: SecClient | None = None
-    else:
-        settings = Settings(sec_user_agent=find_user_agent())
-        client = SecClient(settings, cache=RawCache(cache_dir))
-        # The shared cache classifies URLs by endpoint and has no `frames`
-        # endpoint yet, so frames and companyconcept documents are stored by
-        # DocumentStore and fetched through a client without the shared cache.
-        # The two clients are never used concurrently, so the 5 req/s cap still
-        # holds in every request window.
-        frame_client = SecClient(settings)
-    cutoff = as_of - timedelta(days=ANNUAL_WINDOW_DAYS)
-    seeded = sorted(
-        (issuer for issuer in load_universe(SMALL_UNIVERSE) if issuer.cik is not None),
-        key=lambda issuer: (issuer.country, issuer.ticker),
-    )
-    report.seeded = len(seeded)
-    seeded_ciks = {issuer.cik for issuer in seeded}
+    cache = RawCache(cache_dir)
+    settings: Settings | None = None
+    client: SecClient | None = None
     try:
         if not offline:
-            counter[0] += 1
-        tickers_doc = client.get_json(company_tickers_url())
+            settings = Settings(sec_user_agent=find_user_agent())
+            client = SecClient(settings, cache=cache)
+        reader = DocumentReader(cache, client, counter)
+        cutoff = as_of - timedelta(days=ANNUAL_WINDOW_DAYS)
+
+        tickers_doc = reader.json(company_tickers_url())
+        if tickers_doc is None:
+            raise UniverseBuildError(
+                f"no company_tickers.json in the cache and none fetched for {cache_dir}"
+            )
         tickers = ticker_map(tickers_doc)
         tickers_by_cik = _tickers_by_cik(tickers)
+
+        seeded = sorted(
+            (issuer for issuer in load_universe(SMALL_UNIVERSE) if issuer.cik is not None),
+            key=lambda issuer: (issuer.country, issuer.ticker),
+        )
+        report.seeded = len(seeded)
+        seeded_ciks = {issuer.cik for issuer in seeded}
+        seeded_ca = [issuer for issuer in seeded if issuer.country == "CA"]
+
         float_rows: list[FrameRow] = []
-        canadian_rows: list[FrameRow] = []
         for period in report.periods:
-            for spec in CANADIAN_SPECS:
-                rows = read_frame(
-                    frame_client or client,
-                    store,
-                    spec,
-                    period,
-                    offline=offline,
-                    counter=counter,
-                )
-                report.frames_read += 1
-                report.frames_missing += int(not rows)
-                canadian_rows.extend(rows)
-                if spec == FLOAT_SPEC:
-                    float_rows.extend(rows)
+            rows = read_frame(reader, FLOAT_SPEC, period)
+            report.frames_read += 1
+            report.frames_missing += int(not rows)
+            float_rows.extend(rows)
+
+        sweep_ciks = set(tickers_by_cik) | {row.cik for row in float_rows}
+        report.sweep_candidates = len(sweep_ciks)
+        facts_by_cik, report.submissions_missing = sweep_submissions(reader, sweep_ciks, cutoff)
+        report.submissions_read = len(facts_by_cik)
+
+        report.fx_date, report.fx_rate = read_fx_rate(
+            cache, offline=offline, counter=counter, settings=settings
+        ) or (None, None)
+        assets: dict[str, AssetFact | None] = {}
+
+        def asset_of(cik: str) -> AssetFact | None:
+            """Read (once) the newest total assets of one issuer."""
+            if cik not in assets:
+                assets[cik] = read_assets(reader, cik)
+            return assets[cik]
+
+        def ranked_assets(cik: str) -> float | None:
+            """The issuer's total assets in USD, or ``None`` when unrankable."""
+            fact = asset_of(cik)
+            if fact is None:
+                return None
+            value = assets_in_usd(fact, report.fx_rate)
+            if value is None or not math.isfinite(value) or value <= 0:
+                return None
+            return value
+
+        canadian_pool: list[tuple[float, SubmissionFacts, str]] = []
+        for cik, facts in sorted(facts_by_cik.items()):
+            if cik in seeded_ciks or facts.country != "CA":
+                continue
+            report.canadian_candidates += 1
+            ticker = _ticker_for(facts, tickers, tickers_by_cik)
+            if ticker is None:
+                _reject(report, "no_ticker")
+                continue
+            if facts.filer_type is None:
+                _reject(report, "no_annual")
+                continue
+            if sic_excluded(facts.sic):
+                _reject(report, "fund")
+                continue
+            fact = asset_of(cik)
+            if fact is None:
+                _reject(report, "no_assets")
+                continue
+            value = ranked_assets(cik)
+            if value is None:
+                _reject(report, "currency")
+                continue
+            canadian_pool.append((value, facts, ticker))
+        canadian_pool.sort(key=lambda item: (-item[0], item[1].cik))
+        canadian = [_issuer(facts, ticker, "CA") for _, facts, ticker in canadian_pool]
+
+        # The seeded issuers keep their rows verbatim, but their assets are
+        # read too so the report and the PR can quote the largest Canadian
+        # names without a second pass.
+        for issuer in seeded_ca:
+            if issuer.cik in facts_by_cik:
+                asset_of(issuer.cik)
 
         latest_float = latest_by_cik(float_rows)
-        canadian_ciks = {row.cik for row in canadian_rows if row.loc.startswith("CA-")}
-        us_ranked_rows = sorted(
+        us_pool = sorted(
             (row for row in latest_float.values() if row.loc.startswith("US-") and row.value > 0),
             key=lambda row: (-row.value, row.cik),
         )
-        report.canadian_candidates = len(canadian_ciks)
-        report.us_candidates = len(us_ranked_rows)
-
-        def read_facts(cik: str) -> SubmissionFacts:
-            if not offline:
-                counter[0] += 1
-            document = client.get_json(submissions_url(cik))
-            return submission_facts(client, document, cik, cutoff, offline=offline, counter=counter)
-
-        def check(facts: SubmissionFacts, ticker: str | None) -> bool:
-            """True when the issuer belongs in the file."""
-            if ticker is None:
-                _reject(report, "no_ticker")
-            elif facts.filer_type is None:
-                _reject(report, "no_annual")
-            elif sic_excluded(facts.sic):
-                _reject(report, "fund")
-            else:
-                return True
-            return False
-
-        canadian: list[Issuer] = []
-        chosen_ciks: set[str] = set()
-        for cik in sorted(canadian_ciks - seeded_ciks):
-            facts = read_facts(cik)
-            ticker = _ticker_for(facts, tickers, tickers_by_cik)
-            if not check(facts, ticker) or ticker is None:
-                continue
-            country = facts.country or "CA"
-            if country != "CA":
-                report.rejected_not_canadian += 1
-                continue
-            canadian.append(_issuer(facts, ticker, "CA"))
-            chosen_ciks.add(cik)
-
-        us_needed = max(target_total - report.seeded - len(canadian), min_us)
+        report.us_candidates = len(us_pool)
+        us_slots = max(per_country - sum(1 for i in seeded if i.country == "US"), 0)
         # The raw float frame contains power-of-ten scale errors, so the top
         # candidates by raw value are validated against their own history
-        # before ranking. The probe is wider than the slots so a corrected
-        # issuer can still enter the list.
-        probe = min(len(us_ranked_rows), max(3 * us_needed, US_PROBE_FLOOR))
+        # before ranking.
         corrected: list[tuple[float, FrameRow]] = []
-        for row in us_ranked_rows[:probe]:
-            if row.cik in seeded_ciks:
-                continue
-            key = f"companyconcept__{row.cik}__{FLOAT_SPEC[0]}__{FLOAT_SPEC[1]}"
-            document = read_document(
-                frame_client or client,
-                store,
-                key,
-                companyconcept_url(row.cik, FLOAT_SPEC[0], FLOAT_SPEC[1]),
-                offline=offline,
-                counter=counter,
-            )
-            history = float_history(document, key) if document is not None else []
-            value = adjusted_float(row.value, history)
-            if not 0 < value <= MAX_FLOAT_USD:
-                report.rejected_implausible_float += 1
-                continue
-            corrected.append((value, row))
-        corrected.sort(key=lambda item: (-item[0], item[1].cik))
-
+        probed = 0
         us: list[Issuer] = []
-        for _, row in corrected:
-            if len(us) >= us_needed:
-                break
-            if row.cik in seeded_ciks or row.cik in chosen_ciks:
-                continue
-            facts = read_facts(row.cik)
-            ticker = _ticker_for(facts, tickers, tickers_by_cik)
-            if not check(facts, ticker) or ticker is None:
-                continue
-            if facts.country == "CA":
-                # A Canadian-domiciled issuer can appear in the US float frame
-                # when its tagged location is a US address; it is a Canadian
-                # row, not a US one.
-                canadian.append(_issuer(facts, ticker, "CA"))
-                chosen_ciks.add(row.cik)
-                continue
-            us.append(_issuer(facts, ticker, "US"))
-            chosen_ciks.add(row.cik)
+        us_chosen: set[str] = set()
+        # Rank in passes: probe a batch of candidates, rank the corrected
+        # values, and probe further only when the batch cannot fill the slots,
+        # so the run never reads a float history it does not need.
+        while probed < len(us_pool) and len(us) < us_slots:
+            limit = min(len(us_pool), max(probed + US_PROBE_FLOOR, 2 * us_slots))
+            for row in us_pool[probed:limit]:
+                probed += 1
+                if row.cik in seeded_ciks:
+                    continue
+                document = reader.json(companyconcept_url(row.cik, FLOAT_SPEC[0], FLOAT_SPEC[1]))
+                history = (
+                    float_history(document, f"CIK{row.cik} {FLOAT_SPEC[0]}:{FLOAT_SPEC[1]}")
+                    if document is not None
+                    else []
+                )
+                value = adjusted_float(row.value, history)
+                if not 0 < value <= MAX_FLOAT_USD:
+                    _reject(report, "float")
+                    continue
+                corrected.append((value, row))
+            corrected.sort(key=lambda item: (-item[0], item[1].cik))
+            for _, row in corrected:
+                if len(us) >= us_slots:
+                    break
+                if row.cik in seeded_ciks or row.cik in us_chosen:
+                    continue
+                us_facts = facts_by_cik.get(row.cik)
+                if us_facts is None:
+                    # The float frame lists a CIK the ticker file does not map
+                    # to an issuer with a submissions document.
+                    _reject(report, "no_facts")
+                    continue
+                ticker = _ticker_for(us_facts, tickers, tickers_by_cik)
+                if ticker is None:
+                    _reject(report, "no_ticker")
+                    continue
+                if us_facts.filer_type is None:
+                    _reject(report, "no_annual")
+                    continue
+                if sic_excluded(us_facts.sic):
+                    _reject(report, "fund")
+                    continue
+                if us_facts.country != "US":
+                    # The float frame's `loc` can disagree with the address;
+                    # the submissions address decides, and a Canadian issuer is
+                    # either in the Canadian list or not in the universe at all.
+                    _reject(report, "not_us")
+                    continue
+                us.append(_issuer(us_facts, ticker, "US"))
+                us_chosen.add(row.cik)
 
-        report.canadian_rows = len(canadian)
-        report.us_rows = len(us)
-        report.rows = merge_universe(seeded, canadian, us, target_total=target_total, min_us=min_us)
+        report.rows = merge_universe(seeded, canadian, us, per_country=per_country)
+        report.canadian_rows = sum(
+            1 for issuer in report.rows if issuer.country == "CA" and issuer.cik not in seeded_ciks
+        )
+        report.us_rows = sum(
+            1 for issuer in report.rows if issuer.country == "US" and issuer.cik not in seeded_ciks
+        )
+        report.assets_usd = {}
+        for issuer in report.rows:
+            if issuer.country != "CA" or issuer.cik is None:
+                # Only the Canadian ranking needs assets in the report; a US
+                # issuer's size is its float and reading its balance sheet
+                # would cost a request per row for nothing.
+                continue
+            value = ranked_assets(issuer.cik)
+            if value is not None:
+                report.assets_usd[issuer.cik] = value
     finally:
-        client.close()
-        if frame_client is not None:
-            frame_client.close()
+        if client is not None:
+            client.close()
         report.requests = counter[0]
         report.elapsed_seconds = time.monotonic() - started
     return report
@@ -1013,27 +1222,44 @@ def build(
 
 
 def render_summary(report: BuildReport, output: Path) -> str:
-    """Human-readable build summary (counts, frames, requests, seconds)."""
+    """Human-readable build summary: counts, assets, requests and seconds."""
+    fx = "none"
+    if report.fx_date is not None and report.fx_rate is not None:
+        fx = f"{report.fx_rate:.4f} CAD/USD on {report.fx_date.isoformat()}"
     lines = [
         f"wrote {output} ({len(report.rows)} rows)",
         f"countries: {report.counts_by_country()}",
         f"filer types: {report.counts_by_filer_type()}",
         f"frames: {report.frames_read} read, {report.frames_missing} empty; "
         f"periods {', '.join(report.periods)}",
-        f"candidates: {report.canadian_candidates} Canadian, {report.us_candidates} US floats",
+        f"submissions: {report.submissions_read} read, {report.submissions_missing} missing "
+        f"of {report.sweep_candidates} candidates",
+        f"selected: {report.canadian_rows} Canadian and {report.us_rows} US ranked rows "
+        f"on top of {report.seeded} seeded",
+        f"candidates: {report.canadian_candidates} Canadian addresses, "
+        f"{report.us_candidates} US floats",
         f"rejected: no ticker {report.rejected_no_ticker}, no annual report "
-        f"{report.rejected_no_annual}, fund/trust {report.rejected_fund}, "
-        f"not Canadian {report.rejected_not_canadian}, implausible float "
+        f"{report.rejected_no_annual}, fund/trust {report.rejected_fund}, no assets "
+        f"{report.rejected_no_assets}, currency {report.rejected_currency}, no facts "
+        f"{report.rejected_no_facts}, not US {report.rejected_not_us}, implausible float "
         f"{report.rejected_implausible_float}",
-        f"requests: {report.requests}; elapsed: {report.elapsed_seconds:.1f} s",
+        f"fx: {fx}",
     ]
+    lines.extend(
+        f"largest Canadian: {ticker} {name} {assets:,.0f} USD"
+        if assets is not None
+        else f"largest Canadian: {ticker} {name} (seeded, no ranked assets)"
+        for ticker, name, assets in report.largest_canadian(20)
+    )
+    lines.append(f"requests: {report.requests}; elapsed: {report.elapsed_seconds:.1f} s")
     return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point; returns the process exit code."""
     parser = argparse.ArgumentParser(
-        description="Build config/universe_large.csv from SEC frames and submissions."
+        description="Build config/universe_large.csv from SEC frames, companyconcept "
+        "documents and submissions."
     )
     parser.add_argument(
         "--cache",
@@ -1055,10 +1281,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "window (default: today, YYYY-MM-DD)",
     )
     parser.add_argument(
-        "--target-total",
+        "--per-country",
         type=int,
-        default=TARGET_TOTAL,
-        help=f"target number of rows (default {TARGET_TOTAL})",
+        default=TARGET_PER_COUNTRY,
+        help=f"maximum rows per country (default {TARGET_PER_COUNTRY})",
     )
     parser.add_argument(
         "--offline",
@@ -1071,8 +1297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.cache,
             as_of=args.as_of,
             offline=args.offline,
-            target_total=args.target_total,
-            min_us=MIN_US,
+            per_country=args.per_country,
         )
         write_universe(args.out, report.rows)
     except (ConfigError, SecClientError, UniverseError, UniverseBuildError) as error:

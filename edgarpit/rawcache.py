@@ -10,6 +10,8 @@ Layout under ``root``::
     raw/filing_index/<cik10>/<accession>/<fetched_at>.html.zst
     raw/documents/<cik10>/<accession>__<filename>/<fetched_at>.<ext>.zst
     raw/fx/_/<series>/<fetched_at>.json.zst
+    raw/frames/_/<taxonomy>__<tag>__<unit>__<period>/<fetched_at>.json.zst
+    raw/companyconcept/<cik10>/<taxonomy>__<tag>/<fetched_at>.json.zst
     raw/manifest.jsonl
 
 ``<fetched_at>`` is UTC ``YYYYMMDDTHHMMSSffffffZ`` (microseconds).  Bodies are
@@ -24,6 +26,10 @@ A ``documents`` key is ``<accession>__<filename>`` and the stored file keeps the
 document's own extension (``.htm``, ``.html``, ``.txt``), so the reader can tell
 a filing's documents apart without opening them. ``fx`` keys are Valet series
 ids (``FXUSDCAD``) and live in the global ``_`` slot, like ``company_tickers``.
+``frames`` are global XBRL snapshots keyed
+``<taxonomy>__<tag>__<unit>__<period>``; ``companyconcept`` documents are one
+tag of one issuer, keyed ``<taxonomy>__<tag>`` under the issuer's CIK (decision
+A-36).
 
 ``python -m edgarpit.rawcache verify DIR`` prints a per-issuer inventory and
 ``manifest OK``, or the mismatches and exit code 1.
@@ -57,6 +63,8 @@ ENDPOINT_SUFFIX: dict[str, str | None] = {
     "filing_index": ".html",
     "documents": None,
     "fx": ".json",
+    "frames": ".json",
+    "companyconcept": ".json",
 }
 
 # Separates the accession from the file name in a ``documents`` key.

@@ -1,10 +1,12 @@
-"""Offline checks for ``config/universe_large.csv`` and its builder (issue #102).
+"""Offline checks for ``config/universe_large.csv`` and its builder (issue #115).
 
 The CSV is committed data, so these tests keep it well-formed without touching
 the network: columns, unique 10-digit CIKs, country and filer-type domains,
 sort order, size, and that it is a superset of ``config/universe.csv``. The
-builder's selection rules are exercised on small in-memory fixtures, including
-an end-to-end ``build(..., offline=True)`` over a temporary raw cache.
+builder's rules are exercised on small in-memory fixtures, including an
+end-to-end ``build(..., offline=True)`` over a temporary raw cache: Canadian
+issuers come from the submissions address, US issuers from the public-float
+frame, and every seeded row survives.
 """
 
 from __future__ import annotations
@@ -17,9 +19,12 @@ import sys
 from datetime import date
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
+from edgarpit.rawcache import RawCache
+from edgarpit.sec_client import SecNotFound, frames_url
 from edgarpit.universe import Issuer, UniverseError, load_universe, write_universe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +37,8 @@ TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.]*$")
 ANNUAL_FORMS = {"10-K", "40-F", "20-F"}
 COUNTRIES = {"CA", "US"}
 STAMP = "20260101T000000000000Z"
+AS_OF = date(2026, 10, 27)
+PER_COUNTRY = 25
 
 
 def load_builder() -> ModuleType:
@@ -50,9 +57,11 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+def write_doc(root: Path | RawCache, parts: list[str], payload: Any) -> None:
+    """Write one uncompressed cache document under ``raw/<parts>/<stamp>.json``."""
+    directory = (root.root if isinstance(root, RawCache) else root).joinpath("raw", *parts)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{STAMP}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -60,15 +69,16 @@ def write_json(path: Path, payload: object) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_header_size_and_country_mix() -> None:
+def test_header_and_country_balance() -> None:
     rows = read_csv(LARGE_PATH)
     assert rows, "universe_large.csv is empty"
     assert list(rows[0]) == COLUMNS
-    assert 230 <= len(rows) <= 300, len(rows)
+    assert 240 <= len(rows) <= 260, len(rows)
     canada = [row for row in rows if row["country"] == "CA"]
     united_states = [row for row in rows if row["country"] == "US"]
-    assert len(canada) >= 40
-    assert len(united_states) >= 25
+    assert len(canada) >= 115, len(canada)
+    assert len(united_states) >= 115, len(united_states)
+    assert len(canada) + len(united_states) == len(rows)
 
 
 def test_sorted_by_country_then_ticker() -> None:
@@ -115,7 +125,7 @@ def test_file_loads_with_the_shared_universe_loader() -> None:
 
 
 # --------------------------------------------------------------------------
-# Frame and submissions helpers
+# Frames and companyconcept helpers
 # --------------------------------------------------------------------------
 
 
@@ -178,6 +188,155 @@ def test_latest_by_cik_uses_newest_period_then_accession() -> None:
     assert latest["0000000002"].value == 5.0
 
 
+def test_float_history_reads_usd_observations() -> None:
+    builder = load_builder()
+    document = {
+        "units": {
+            "USD": [
+                {"end": "2024-06-30", "val": 100},
+                {"end": "2025-06-30", "val": 200},
+            ]
+        }
+    }
+    assert builder.float_history(document, "CIK0000000001") == [
+        (date(2024, 6, 30), 100.0),
+        (date(2025, 6, 30), 200.0),
+    ]
+    assert builder.float_history({"units": {}}, "CIK0000000001") == []
+    # The live endpoint renders a unit with no facts as an empty object.
+    assert builder.float_history({"units": {"USD": {}}}, "CIK0000000001") == []
+    with pytest.raises(builder.UniverseBuildError):
+        builder.float_history({"units": {"USD": [{"val": 1}]}}, "CIK0000000001")
+
+
+def test_adjusted_float_undoes_power_of_ten_scale_errors() -> None:
+    builder = load_builder()
+    # Universal Display: the 2022 filing jumped from 9.59e9 to 4.38e12.
+    history = [
+        (date(2021, 6, 30), 9_594_897_936.0),
+        (date(2022, 6, 30), 4_384_120_131_000.0),
+        (date(2025, 6, 30), 6_792_425_456_000.0),
+    ]
+    assert builder.adjusted_float(6_792_425_456_000.0, history) == pytest.approx(6_792_425_456.0)
+    # Cabot: a million-fold jump between 2024 and 2025.
+    history = [(date(2024, 3, 31), 5_052_810_968.0), (date(2025, 3, 31), 4_429_047_299_000_000.0)]
+    assert builder.adjusted_float(4_429_047_299_000_000.0, history) == pytest.approx(
+        4_429_047_299.0
+    )
+    # HIVE: the error appears in the only pair of observations on file.
+    history = [(date(2025, 9, 30), 950_740_231.0), (date(2026, 3, 31), 950_740_231_000.0)]
+    assert builder.adjusted_float(950_740_231_000.0, history) == pytest.approx(950_740_231.0)
+    # Real growth below the jump threshold is never rescaled.
+    history = [(date(2021, 6, 30), 500_000_000_000.0), (date(2025, 6, 30), 4_000_000_000_000.0)]
+    assert builder.adjusted_float(4_000_000_000_000.0, history) == 4_000_000_000_000.0
+    assert builder.adjusted_float(5.0, []) == 5.0
+
+
+def test_annual_assets_prefers_the_newest_annual_report() -> None:
+    builder = load_builder()
+    document = {
+        "units": {
+            "CAD": [
+                {"end": "2024-10-31", "val": 100, "accn": "a-1", "form": "40-F"},
+                {"end": "2025-01-31", "val": 120, "accn": "b-1", "form": "6-K"},
+                {"end": "2025-10-31", "val": 200, "accn": "c-1", "form": "40-F"},
+                {"end": "2025-10-31", "val": 210, "accn": "d-1", "form": "6-K"},
+            ]
+        }
+    }
+    fact = builder.annual_assets(document, "CIK0000000003")
+    assert fact == builder.AssetFact(
+        end=date(2025, 10, 31),
+        value=200.0,
+        unit="CAD",
+        accession="c-1",
+        form="40-F",
+    )
+
+
+def test_annual_assets_falls_back_to_an_interim_value() -> None:
+    builder = load_builder()
+    document = {
+        "units": {
+            "USD": [
+                {"end": "2026-03-31", "val": 90, "accn": "a-1", "form": "10-Q"},
+                {"end": "2026-06-30", "val": 95, "accn": "b-1", "form": "10-Q"},
+            ]
+        }
+    }
+    fact = builder.annual_assets(document, "CIK0000000004")
+    assert fact is not None
+    assert (fact.end, fact.value, fact.unit) == (date(2026, 6, 30), 95.0, "USD")
+
+
+def test_annual_assets_reads_the_newest_row_across_units() -> None:
+    builder = load_builder()
+    document = {
+        "units": {
+            "CAD": [{"end": "2025-10-31", "val": 200, "accn": "cad-1", "form": "40-F"}],
+            "USD": [{"end": "2024-10-31", "val": 150, "accn": "usd-1", "form": "40-F"}],
+        }
+    }
+    fact = builder.annual_assets(document, "CIK0000000005")
+    assert fact is not None
+    assert (fact.end, fact.unit) == (date(2025, 10, 31), "CAD")
+
+
+def test_annual_assets_rejects_malformed_documents() -> None:
+    builder = load_builder()
+    assert builder.annual_assets({"units": {}}, "CIK") is None
+    # The live endpoint renders a unit with no facts as an empty object.
+    assert builder.annual_assets({"units": {"USD": {}}}, "CIK") is None
+    assert builder.annual_assets({"units": {"CAD": [], "USD": {}}}, "CIK") is None
+    with pytest.raises(builder.UniverseBuildError):
+        builder.annual_assets({"units": {"CAD": [{"val": 1, "form": "40-F"}]}}, "CIK")
+    with pytest.raises(builder.UniverseBuildError):
+        builder.annual_assets({"units": {"CAD": [{"end": "2025-10-31", "val": None}]}}, "CIK")
+    with pytest.raises(builder.UniverseBuildError):
+        builder.annual_assets({"units": {"CAD": [{"end": "31/10/2025", "val": 1}]}}, "CIK")
+    with pytest.raises(builder.UniverseBuildError):
+        builder.annual_assets({"no_units": True}, "CIK")
+
+
+def test_assets_in_usd_converts_only_cad_and_usd() -> None:
+    builder = load_builder()
+    usd = builder.AssetFact(date(2025, 10, 31), 100.0, "USD", "a-1", "10-K")
+    cad = builder.AssetFact(date(2025, 10, 31), 140.0, "CAD", "a-1", "40-F")
+    eur = builder.AssetFact(date(2025, 10, 31), 100.0, "EUR", "a-1", "20-F")
+    assert builder.assets_in_usd(usd, 1.4) == 100.0
+    assert builder.assets_in_usd(cad, 1.4) == pytest.approx(100.0)
+    assert builder.assets_in_usd(usd, None) == 100.0
+    assert builder.assets_in_usd(cad, None) is None
+    assert builder.assets_in_usd(eur, 1.4) is None
+
+
+def test_latest_fx_rate_takes_the_newest_observation() -> None:
+    builder = load_builder()
+    document = {
+        "observations": [
+            {"d": "2026-10-23", "FXUSDCAD": {"v": "1.3993"}},
+            {"d": "2026-10-26"},
+            {"d": "2026-10-27", "FXUSDCAD": {"v": "1.4038"}},
+        ]
+    }
+    assert builder.latest_fx_rate(document) == (date(2026, 10, 27), 1.4038)
+    assert builder.latest_fx_rate({"observations": []}) is None
+    assert builder.latest_fx_rate({"observations": [{"d": "2026-10-27"}]}) is None
+    with pytest.raises(builder.UniverseBuildError):
+        builder.latest_fx_rate({"no_observations": True})
+    with pytest.raises(builder.UniverseBuildError):
+        builder.latest_fx_rate({"observations": [{"d": "2026-13-01", "FXUSDCAD": {"v": "1.4"}}]})
+    with pytest.raises(builder.UniverseBuildError):
+        builder.latest_fx_rate({"observations": [{"d": "2026-10-27", "FXUSDCAD": {"v": "zero"}}]})
+    with pytest.raises(builder.UniverseBuildError):
+        builder.latest_fx_rate({"observations": [{"d": "2026-10-27", "FXUSDCAD": {"v": "0"}}]})
+
+
+# --------------------------------------------------------------------------
+# Submissions helpers
+# --------------------------------------------------------------------------
+
+
 def test_address_country_reads_canadian_provinces_and_us_states() -> None:
     builder = load_builder()
     canada = {"business": {"stateOrCountry": "A6", "isForeignLocation": 0}}
@@ -198,6 +357,26 @@ def test_address_country_reads_canadian_provinces_and_us_states() -> None:
         is None
     )
     assert builder.address_country(None) is None
+
+
+def test_address_country_lets_a_canadian_mailing_address_win() -> None:
+    builder = load_builder()
+    both = {
+        "business": {"stateOrCountry": "NY", "isForeignLocation": 0},
+        "mailing": {"stateOrCountry": "A8", "isForeignLocation": 1},
+    }
+    assert builder.address_country(both) == "CA"
+    foreign = {
+        "business": {"countryCode": "E9", "country": "Cayman Islands", "isForeignLocation": 1},
+        "mailing": {"stateOrCountry": "CA", "isForeignLocation": 0},
+    }
+    assert builder.address_country(foreign) == "US"
+
+
+def test_every_canadian_address_code_is_recognised() -> None:
+    builder = load_builder()
+    for code in ("A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "B0", "Z4"):
+        assert builder.address_country({"business": {"stateOrCountry": code}}) == "CA", code
 
 
 def test_annual_filer_type_takes_latest_annual_form_after_cutoff() -> None:
@@ -233,50 +412,8 @@ def test_sic_excluded_covers_funds_trusts_and_blank_checks() -> None:
     assert not builder.sic_excluded(None)
 
 
-def test_adjusted_float_undoes_power_of_ten_scale_errors() -> None:
-    builder = load_builder()
-    # Universal Display: the 2022 filing jumped from 9.59e9 to 4.38e12.
-    history = [
-        (date(2021, 6, 30), 9_594_897_936.0),
-        (date(2022, 6, 30), 4_384_120_131_000.0),
-        (date(2025, 6, 30), 6_792_425_456_000.0),
-    ]
-    assert builder.adjusted_float(6_792_425_456_000.0, history) == pytest.approx(6_792_425_456.0)
-    # Cabot: a million-fold jump between 2024 and 2025.
-    history = [(date(2024, 3, 31), 5_052_810_968.0), (date(2025, 3, 31), 4_429_047_299_000_000.0)]
-    assert builder.adjusted_float(4_429_047_299_000_000.0, history) == pytest.approx(
-        4_429_047_299.0
-    )
-    # HIVE: the error appears in the only pair of observations on file.
-    history = [(date(2025, 9, 30), 950_740_231.0), (date(2026, 3, 31), 950_740_231_000.0)]
-    assert builder.adjusted_float(950_740_231_000.0, history) == pytest.approx(950_740_231.0)
-    # Real growth below the jump threshold is never rescaled.
-    history = [(date(2021, 6, 30), 500_000_000_000.0), (date(2025, 6, 30), 4_000_000_000_000.0)]
-    assert builder.adjusted_float(4_000_000_000_000.0, history) == 4_000_000_000_000.0
-    assert builder.adjusted_float(5.0, []) == 5.0
-
-
-def test_float_history_reads_usd_observations() -> None:
-    builder = load_builder()
-    document = {
-        "units": {
-            "USD": [
-                {"end": "2024-06-30", "val": 100},
-                {"end": "2025-06-30", "val": 200},
-            ]
-        }
-    }
-    assert builder.float_history(document, "CIK0000000001") == [
-        (date(2024, 6, 30), 100.0),
-        (date(2025, 6, 30), 200.0),
-    ]
-    assert builder.float_history({"units": {}}, "CIK0000000001") == []
-    with pytest.raises(builder.UniverseBuildError):
-        builder.float_history({"units": {"USD": [{"val": 1}]}}, "CIK0000000001")
-
-
 # --------------------------------------------------------------------------
-# Selection and the end-to-end offline build
+# Selection
 # --------------------------------------------------------------------------
 
 
@@ -284,194 +421,414 @@ def issuer(ticker: str, cik: str, country: str = "CA", form: str = "40-F") -> Is
     return Issuer(ticker=ticker, cik=cik, name=f"{ticker} Inc.", country=country, filer_type=form)
 
 
-def test_merge_universe_keeps_seeded_rows_and_adds_all_canadian_rows() -> None:
+def test_merge_universe_caps_each_country_and_keeps_seeded_rows() -> None:
     builder = load_builder()
-    seeded = [issuer("AAA", "0000000001", "CA"), issuer("BBB", "0000000002", "US", "10-K")]
-    canadian = [
-        issuer("DDD", "0000000004"),
-        issuer("CCC", "0000000003"),
-        issuer("CCC", "0000000003"),
+    seeded = [
+        issuer("AAA", "0000000001", "CA"),
+        issuer("BBB", "0000000002", "US", "10-K"),
+        issuer("CCC", "0000000003", "CA"),
     ]
-    us = [issuer("EEE", "0000000005", "US", "10-K"), issuer("FFF", "0000000006", "US", "10-K")]
-    rows = builder.merge_universe(seeded, canadian, us, target_total=5, min_us=1)
-    assert [row.ticker for row in rows] == ["AAA", "CCC", "DDD", "BBB", "EEE"]
-    assert rows[0] == seeded[0]
+    canadian = [issuer("EEE", "0000000005", "CA"), issuer("FFF", "0000000006", "CA")]
+    us = [issuer("GGG", "0000000007", "US", "10-K")]
+    rows = builder.merge_universe(seeded, canadian, us, per_country=3)
+    # Canada keeps both seeded rows and one ranked row; a duplicate CIK or a
+    # ticker clash never reaches the file twice.
+    assert [row.ticker for row in rows] == ["AAA", "CCC", "EEE", "BBB", "GGG"]
 
 
-def test_merge_universe_keeps_a_us_floor_when_canada_reaches_the_target() -> None:
+def test_merge_universe_never_drops_a_seeded_row_at_the_cap() -> None:
     builder = load_builder()
-    seeded = [issuer("AAA", "0000000001")]
-    canadian = [issuer("CCC", "0000000003"), issuer("DDD", "0000000004")]
-    us = [issuer("EEE", "0000000005", "US", "10-K"), issuer("FFF", "0000000006", "US", "10-K")]
-    rows = builder.merge_universe(seeded, canadian, us, target_total=2, min_us=2)
-    assert {"EEE", "FFF"} <= {row.ticker for row in rows}
+    seeded = [issuer("AAA", "0000000001"), issuer("BBB", "0000000002")]
+    rows = builder.merge_universe(seeded, [], [], per_country=1)
+    assert [row.ticker for row in rows] == ["AAA", "BBB"]
+    assert rows == seeded
 
 
-def test_merge_universe_rejects_a_duplicate_ticker() -> None:
+def test_merge_universe_skips_a_duplicate_cik_and_rejects_a_duplicate_ticker() -> None:
     builder = load_builder()
+    rows = builder.merge_universe(
+        [issuer("AAA", "0000000001")],
+        [issuer("AAA", "0000000001"), issuer("CCC", "0000000003")],
+        [],
+        per_country=10,
+    )
+    assert [row.ticker for row in rows] == ["AAA", "CCC"]
     with pytest.raises(UniverseError):
         builder.merge_universe(
             [issuer("AAA", "0000000001")],
             [issuer("AAA", "0000000009")],
             [],
-            target_total=10,
-            min_us=1,
+            per_country=10,
         )
+
+
+def test_document_reader_serves_the_cache_and_reports_a_miss(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = RawCache(tmp_path)
+    url = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
+    key = "dei__EntityPublicFloat__USD__CY2026Q3I"
+    cache.write("frames", "", key, b'{"data": []}', url=url, http_status=200)
+    reader = builder.DocumentReader(cache, None, [0])
+    assert reader.json(url) == {"data": []}
+    assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")) is None
+
+
+def test_read_filings_follows_a_page_to_reach_the_cutoff(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = RawCache(tmp_path)
+    page_name = "CIK0000320193-submissions-001"
+    write_doc(
+        cache,
+        ["submissions_page", "0000320193", page_name],
+        {
+            "form": ["40-F", "8-K"],
+            "filingDate": ["2025-02-01", "2024-11-01"],
+        },
+    )
+    document = {
+        "filings": {
+            "recent": {"form": ["8-K"], "filingDate": ["2026-09-01"]},
+            "files": [{"name": f"{page_name}.json"}],
+        }
+    }
+    reader = builder.DocumentReader(cache, None, [0])
+    cutoff = date(2024, 10, 29)
+    pairs = builder.read_filings(reader, document, "0000320193", cutoff)
+    assert ("40-F", date(2025, 2, 1)) in pairs
+    assert builder.annual_filer_type(pairs, cutoff) == "40-F"
+
+
+class RecordingClient:
+    """A ``SecClient`` stand-in that records the URLs it is asked for."""
+
+    def __init__(self, payload: dict[str, Any] | None) -> None:
+        self.payload = payload
+        self.calls: list[str] = []
+
+    def get_json(self, url: str) -> dict[str, Any]:
+        self.calls.append(url)
+        if self.payload is None:
+            raise SecNotFound(f"SEC returned 404 for {url}")
+        return self.payload
+
+
+def test_document_reader_reads_the_cache_before_any_request(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = RawCache(tmp_path)
+    url = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
+    cache.write(
+        "frames",
+        "",
+        "dei__EntityPublicFloat__USD__CY2026Q3I",
+        b'{"data": []}',
+        url=url,
+        http_status=200,
+    )
+    client: Any = RecordingClient({"data": [{"cik": 1}]})
+    counter = [0]
+    reader = builder.DocumentReader(cache, client, counter)
+    assert reader.json(url) == {"data": []}
+    assert client.calls == [], "a cached document must never be fetched again"
+    assert counter == [0]
+
+    missing = frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")
+    assert reader.json(missing) == {"data": [{"cik": 1}]}
+    assert client.calls == [missing]
+    assert counter == [1]
+
+    not_found: Any = RecordingClient(None)
+    reader = builder.DocumentReader(cache, not_found, counter)
+    assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2019Q1I")) is None
+    assert counter == [2]
+
+
+# --------------------------------------------------------------------------
+# The end-to-end offline build
+# --------------------------------------------------------------------------
+
+
+# Canadian issuers by submissions address, with their assets in the reporting
+# currency: CIK -> (ticker, name, state code, SIC, form, total assets CAD|USD).
+CANADIAN = {
+    "0000000003": ("ZZC", "Canadian Bank", "A6", "6029", "40-F", 500_000_000_000),
+    "0000000012": ("ZZM", "Canadian Mid", "A8", "6029", "40-F", 300_000_000_000),
+    "0000000013": ("ZZO", "Canadian Large", "A1", "6029", "40-F", 400_000_000_000),
+    "0000000014": ("ZZP", "Canadian Small", "A2", "6029", "40-F", 50_000_000_000),
+    "0000000011": ("ZZN", "Canadian Tiny", "A3", "6029", "40-F", 1_000_000_000),
+}
+US = {
+    "0000000001": ("ZZA", "US Big", "NY", 100_000_000_000),
+    "0000000002": ("ZZB", "US Small", "CA", 1_000_000_000),
+    "0000000005": ("ZZG", "US No Annual", "TX", 2_000_000_000),
+    "0000000009": ("ZZK", "US Float Only", "WA", 3_000_000_000),
+}
+# The float frame also lists a Canadian issuer with no ticker (rejected) and one
+# whose frame location says Canada while its submissions address says New York
+# (it must not become a Canadian row).
+FLOAT_EXTRAS = {
+    "0000000020": ("Unlisted Canadian", "CA-BC", 4_000_000_000),
+    "0000000010": ("Frame Canadian US Address", "CA-ON", 5_000_000_000),
+}
+# Issuers that fail one Canadian selection rule each: a fund, a euro reporter
+# and a filer that tags no assets.
+CANADIAN_EXTRAS = {
+    "0000000004": ("ZZD", "Canadian Trust", "A6", "6221", "Canadian Trust"),
+    "0000000006": ("ZZH", "Canadian Euro", "A8", "6029", "Canadian Euro"),
+    "0000000007": ("ZZI", "Canadian No Assets", "A6", "6029", "Canadian No Assets"),
+}
 
 
 def build_cache(tmp_path: Path) -> Path:
-    """Write a tiny offline raw cache: tickers, two frames, four submissions."""
-    builder = load_builder()
+    """Write a tiny offline raw cache exercising every selection rule."""
     cache = tmp_path / "cache"
-    write_json(
-        cache / "raw" / "company_tickers" / "_" / f"{STAMP}.json",
+    tickers = [(cik, spec[0], spec[1]) for cik, spec in CANADIAN.items()] + [
+        (cik, spec[0], spec[1]) for cik, spec in US.items()
+    ]
+    tickers += [(cik, spec[0], spec[1]) for cik, spec in CANADIAN_EXTRAS.items()]
+    tickers += [
+        ("0000000008", "ZZJ", "Canadian Interim Only"),
+        ("0000000010", "ZZL", "Frame Canadian US Address"),
+    ]
+    write_doc(
+        cache,
+        ["company_tickers", "_"],
         {
-            "0": {"cik_str": 1, "ticker": "ZZA", "title": "US Big"},
-            "1": {"cik_str": 2, "ticker": "ZZB", "title": "US Small"},
-            "2": {"cik_str": 3, "ticker": "ZZC", "title": "Canadian"},
-            "3": {"cik_str": 4, "ticker": "ZZD", "title": "Canadian Trust"},
+            str(index): {"cik_str": int(cik), "ticker": ticker, "title": name}
+            for index, (cik, ticker, name) in enumerate(tickers)
         },
     )
-    store = builder.DocumentStore(cache)
-    periods = builder.frame_periods(date(2026, 10, 27))
-    float_period = periods[2]
-    store.write(
-        builder.frame_key(*builder.FLOAT_SPEC, float_period),
-        json.dumps(
-            {
-                "taxonomy": "dei",
-                "tag": "EntityPublicFloat",
-                "uom": "USD",
-                "data": [
-                    {
-                        "cik": 1,
-                        "entityName": "US Big",
-                        "loc": "US-NY",
-                        "end": "2026-06-30",
-                        "val": 100_000_000_000,
-                        "accn": "acc-1",
-                    },
-                    {
-                        "cik": 2,
-                        "entityName": "US Small",
-                        "loc": "US-CA",
-                        "end": "2026-06-30",
-                        "val": 1_000_000_000,
-                        "accn": "acc-2",
-                    },
-                    {
-                        "cik": 3,
-                        "entityName": "Canadian",
-                        "loc": "CA-ON",
-                        "end": "2026-06-30",
-                        "val": 5_000_000_000,
-                        "accn": "acc-3",
-                    },
-                ],
-            }
-        ).encode(),
-        url="https://data.sec.gov/api/xbrl/frames/test",
-        http_status=200,
+
+    float_data = [
+        {
+            "cik": int(cik),
+            "entityName": spec[1],
+            "loc": f"US-{spec[2]}",
+            "end": "2026-06-30",
+            "val": spec[3],
+            "accn": f"acc-{cik}",
+        }
+        for cik, spec in US.items()
+    ] + [
+        {
+            "cik": int(cik),
+            "entityName": spec[0],
+            "loc": spec[1],
+            "end": "2026-06-30",
+            "val": spec[2],
+            "accn": f"acc-{cik}",
+        }
+        for cik, spec in FLOAT_EXTRAS.items()
+    ]
+    write_doc(
+        cache,
+        ["frames", "_", "dei__EntityPublicFloat__USD__CY2026Q3I"],
+        {"taxonomy": "dei", "tag": "EntityPublicFloat", "uom": "USD", "data": float_data},
     )
-    store.write(
-        builder.frame_key(*builder.COVER_SPEC, float_period),
-        json.dumps(
-            {
-                "taxonomy": "dei",
-                "tag": "EntityCommonStockSharesOutstanding",
-                "uom": "shares",
-                "data": [
-                    {
-                        "cik": 4,
-                        "entityName": "Canadian Trust",
-                        "loc": "CA-ON",
-                        "end": "2026-06-30",
-                        "val": 25_000_000,
-                        "accn": "acc-4",
-                    },
-                    {
-                        "cik": 5,
-                        "entityName": "Unlisted Canadian",
-                        "loc": "CA-BC",
-                        "end": "2026-06-30",
-                        "val": 15_000_000,
-                        "accn": "acc-5",
-                    },
-                ],
-            }
-        ).encode(),
-        url="https://data.sec.gov/api/xbrl/frames/test",
-        http_status=200,
-    )
-    submissions = {
-        1: {"name": "US Big", "ticker": "ZZA", "state": "NY", "sic": "7372", "form": "10-K"},
-        2: {"name": "US Small", "ticker": "ZZB", "state": "CA", "sic": "7372", "form": "10-K"},
-        3: {"name": "Canadian", "ticker": "ZZC", "state": "A6", "sic": "6029", "form": "40-F"},
-        4: {"name": "Trust", "ticker": "ZZD", "state": "A6", "sic": "6221", "form": "40-F"},
-        5: {"name": "Unlisted", "ticker": "ZZE", "state": "A6", "sic": "6029", "form": "40-F"},
-    }
-    for cik, spec in submissions.items():
-        address = {"business": {"stateOrCountry": spec["state"], "isForeignLocation": 0}}
-        write_json(
-            cache / "raw" / "submissions" / f"{cik:010d}" / f"{STAMP}.json",
-            {
-                "cik": str(cik),
-                "name": spec["name"],
-                "tickers": [spec["ticker"]],
-                "addresses": address,
-                "sic": spec["sic"],
-                "filings": {
-                    "recent": {
-                        "form": ["8-K", spec["form"]],
-                        "filingDate": ["2026-09-01", "2026-02-01"],
-                    }
-                },
-            },
+
+    def submission(
+        name: str, ticker: str, addresses: dict[str, dict[str, Any]], sic: str, forms: list[str]
+    ) -> dict[str, Any]:
+        filed = ["2026-09-01"] if len(forms) == 1 else ["2026-09-01", "2026-02-01"]
+        return {
+            "name": name,
+            "tickers": [ticker],
+            "addresses": addresses,
+            "sic": sic,
+            "filings": {"recent": {"form": forms, "filingDate": filed}},
+        }
+
+    for cik, (ticker, name, state, sic, form, _) in CANADIAN.items():
+        write_doc(
+            cache,
+            ["submissions", cik],
+            submission(
+                name,
+                ticker,
+                {"business": {"stateOrCountry": state, "isForeignLocation": 1}},
+                sic,
+                ["8-K", form],
+            ),
         )
+    for cik, (ticker, name, state, _assets) in US.items():
+        forms = ["8-K"] if cik == "0000000005" else ["8-K", "10-K"]
+        write_doc(
+            cache,
+            ["submissions", cik],
+            submission(
+                name,
+                ticker,
+                {"business": {"stateOrCountry": state, "isForeignLocation": 0}},
+                "7372",
+                forms,
+            ),
+        )
+    for cik, (ticker, name, state, sic, _label) in CANADIAN_EXTRAS.items():
+        write_doc(
+            cache,
+            ["submissions", cik],
+            submission(
+                name,
+                ticker,
+                {"business": {"stateOrCountry": state, "isForeignLocation": 1}},
+                sic,
+                ["40-F"],
+            ),
+        )
+    write_doc(
+        cache,
+        ["submissions", "0000000008"],
+        submission(
+            "Canadian Interim Only",
+            "ZZJ",
+            {"mailing": {"stateOrCountryDescription": "Quebec, Canada"}},
+            "6029",
+            ["40-F"],
+        ),
+    )
+    write_doc(
+        cache,
+        ["submissions", "0000000010"],
+        submission(
+            "Frame Canadian US Address",
+            "ZZL",
+            {"business": {"stateOrCountry": "NY", "isForeignLocation": 0}},
+            "7372",
+            ["10-K"],
+        ),
+    )
+    write_doc(
+        cache,
+        ["submissions", "0000000020"],
+        submission(
+            "Unlisted Canadian",
+            "ZZU",
+            {"business": {"stateOrCountry": "A1", "isForeignLocation": 1}},
+            "6029",
+            ["40-F"],
+        ),
+    )
+
+    def assets(unit: str, value: float, form: str = "40-F") -> dict[str, Any]:
+        return {
+            "units": {
+                unit: [{"end": "2025-10-31", "val": value, "accn": f"asset-{value}", "form": form}]
+            }
+        }
+
+    for cik, (_, _, _, _, _, value) in CANADIAN.items():
+        write_doc(cache, ["companyconcept", cik, "ifrs-full__Assets"], assets("CAD", float(value)))
+    write_doc(
+        cache,
+        ["companyconcept", "0000000008", "us-gaap__Assets"],
+        assets("USD", 100_000_000_000.0, form="10-Q"),
+    )
+    write_doc(
+        cache,
+        ["companyconcept", "0000000006", "us-gaap__Assets"],
+        assets("EUR", 90_000_000_000.0),
+    )
+    # A US-address issuer the float frame places in Canada: with assets on file
+    # it would enter a loc-based Canadian list, so its absence proves the
+    # submissions address decides.
+    write_doc(
+        cache,
+        ["companyconcept", "0000000010", "us-gaap__Assets"],
+        assets("USD", 800_000_000_000.0),
+    )
+    write_doc(
+        cache,
+        ["fx", "_", "FXUSDCAD"],
+        {"observations": [{"d": "2026-10-27", "FXUSDCAD": {"v": "1.4"}}]},
+    )
     return cache
 
 
 def test_offline_build_applies_every_selection_rule(tmp_path: Path) -> None:
     builder = load_builder()
     cache = build_cache(tmp_path)
-    report = builder.build(
-        cache,
-        as_of=date(2026, 10, 27),
-        offline=True,
-        target_total=45,
-        min_us=2,
-    )
+    report = builder.build(cache, as_of=AS_OF, offline=True, per_country=PER_COUNTRY)
     rows = {issuer.cik: issuer for issuer in report.rows}
-    assert "0000000003" in rows
+
+    # The five largest Canadian candidates by assets in USD fill the slots; the
+    # smallest (ZZN, 1e9 CAD) is left out by the cap.
     assert rows["0000000003"].country == "CA"
     assert rows["0000000003"].filer_type == "40-F"
-    assert "0000000001" in rows
+    assert {"0000000003", "0000000012", "0000000013", "0000000014", "0000000008"} <= set(rows)
+    assert "0000000011" not in rows, "the sixth-largest Canadian candidate misses the cap"
+    # The euro reporter, the trust, the asset-less filer and the ticker-less
+    # issuer never enter the file; the frame-located Canadian with a US address
+    # is not Canadian either.
+    assert "0000000006" not in rows
+    assert "0000000004" not in rows
+    assert "0000000007" not in rows
+    assert "0000000020" not in rows
+    assert "0000000010" not in rows
+
     assert rows["0000000001"].country == "US"
-    assert "0000000004" not in rows, "a commodity trust must be excluded"
-    assert "0000000005" not in rows, "an issuer without a mapped ticker must be excluded"
+    assert rows["0000000001"].filer_type == "10-K"
+    assert "0000000005" not in rows, "an issuer without an annual report is excluded"
+    assert "0000000009" in rows
+
     seeded = {issuer.cik for issuer in load_universe(SMALL_PATH)}
     assert seeded <= set(rows), "every seeded issuer must survive selection"
-    assert report.canadian_rows == 1
-    assert report.us_rows == 2
-    assert report.rejected_no_ticker == 1
+    assert report.canadian_candidates == 10
+    assert report.canadian_rows == 5
+    assert report.us_rows == 3
     assert report.rejected_fund == 1
+    assert report.rejected_currency == 1
+    assert report.rejected_no_assets == 1
+    assert report.rejected_no_ticker == 1
+    assert report.rejected_no_annual == 1
     assert report.requests == 0
-    keys = [(row.country, row.ticker) for row in report.rows]
-    assert keys == sorted(keys)
+    assert report.fx_rate == pytest.approx(1.4)
+    assert [(row.country, row.ticker) for row in report.rows] == sorted(
+        (row.country, row.ticker) for row in report.rows
+    )
 
 
-def test_offline_build_writes_the_same_bytes_twice(tmp_path: Path) -> None:
+def test_offline_build_ranks_canadian_rows_by_total_assets(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = build_cache(tmp_path)
+    report = builder.build(cache, as_of=AS_OF, offline=True, per_country=PER_COUNTRY)
+    largest = [ticker for ticker, _, _ in report.largest_canadian(5)]
+    ranked = [ticker for ticker in largest if ticker in {"ZZC", "ZZM", "ZZO", "ZZP", "ZZJ"}]
+    assert ranked == ["ZZC", "ZZO", "ZZM", "ZZJ", "ZZP"]
+
+
+def test_offline_build_keeps_only_issuers_with_canadian_addresses(tmp_path: Path) -> None:
+    # The acceptance criterion for the committed CSV, checked against the
+    # evidence the offline build reads: every non-seeded Canadian row's cached
+    # submissions document carries a Canadian province.
+    builder = load_builder()
+    cache = build_cache(tmp_path)
+    report = builder.build(cache, as_of=AS_OF, offline=True, per_country=PER_COUNTRY)
+    seeded = {issuer.cik for issuer in load_universe(SMALL_PATH)}
+    canadian = [issuer for issuer in report.rows if issuer.country == "CA" and issuer.cik]
+    assert canadian
+    for issuer in canadian:
+        if issuer.cik in seeded:
+            continue
+        document = json.loads(
+            (cache / "raw" / "submissions" / str(issuer.cik) / f"{STAMP}.json").read_text()
+        )
+        assert builder.address_country(document["addresses"]) == "CA"
+        code = document["addresses"].get("business", {}).get("stateOrCountry")
+        if code is not None:
+            assert code in builder.CANADIAN_CODES
+
+
+def test_offline_build_is_deterministic(tmp_path: Path) -> None:
     builder = load_builder()
     cache = build_cache(tmp_path)
     first = tmp_path / "first.csv"
     second = tmp_path / "second.csv"
     for path in (first, second):
-        report = builder.build(
-            cache,
-            as_of=date(2026, 10, 27),
-            offline=True,
-            target_total=45,
-            min_us=2,
-        )
+        report = builder.build(cache, as_of=AS_OF, offline=True, per_country=PER_COUNTRY)
         write_universe(path, report.rows)
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_offline_build_reports_a_cache_without_company_tickers(tmp_path: Path) -> None:
+    builder = load_builder()
+    with pytest.raises(builder.UniverseBuildError, match="company_tickers"):
+        builder.build(tmp_path / "empty", as_of=AS_OF, offline=True, per_country=PER_COUNTRY)

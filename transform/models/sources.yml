@@ -82,6 +82,44 @@ sources:
             data_type: VARCHAR
           - name: item_label
             data_type: VARCHAR
+      - name: filings_text
+        description: One row per (8-K document, section) of extracted text (decision A-31).
+        columns:
+          - name: cik
+            data_type: VARCHAR(10)
+          - name: accession
+            data_type: VARCHAR
+          - name: acceptance_ts
+            data_type: TIMESTAMPTZ
+          - name: ts_imputed
+            data_type: BOOLEAN
+          - name: document
+            data_type: VARCHAR
+          - name: doc_type
+            data_type: VARCHAR
+          - name: section
+            data_type: VARCHAR
+          - name: section_order
+            data_type: INTEGER
+          - name: text
+            data_type: VARCHAR
+          - name: sha256
+            data_type: VARCHAR
+          - name: char_count
+            data_type: INTEGER
+      - name: fx_daily
+        description: One row per (series, rate date) of a Bank of Canada Valet series (decision A-32).
+        columns:
+          - name: series
+            data_type: VARCHAR
+          - name: rate_date
+            data_type: DATE
+          - name: value
+            data_type: DOUBLE
+          - name: known_at
+            data_type: TIMESTAMPTZ
+          - name: source
+            data_type: VARCHAR
       - name: concept_map
         description: Canonical field map loaded from config/concept_map.yaml (decision A-20).
         columns:

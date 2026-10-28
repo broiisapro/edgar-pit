@@ -1,0 +1,11 @@
+cik,accession,acceptance_ts,ts_imputed,document,doc_type,section,section_order,text,sha256,char_count
+0000320193,0000320193-25-000071,2025-07-31T20:30:25Z,false,aapl-20250731.htm,primary,2.02,1,"Item 2.02 Results of Operations and Financial Condition
+
+On July 31, 2025, Apple Inc. issued a press release announcing its financial results for the fiscal quarter ended June 28, 2025.",0ae3d34892004b6947a8473da62738ad2b81de49bc3f3388db352fe0a0c1b04d,185
+0000320193,0000320193-25-000071,2025-07-31T20:30:25Z,false,aapl-20250731.htm,primary,9.01,2,"Item 9.01 Financial Statements and Exhibits
+
+(d) Exhibits
+99.1 Press release dated July 31, 2025.",e3a5fa754c30f4f9f23da9b66a01e75dfb9c17805950cdd1307226b1c58a712b,97
+0000320193,0000320193-25-000071,2025-07-31T20:30:25Z,false,aapl-20250731ex991.htm,EX-99.1,unsegmented,1,"Apple reports third quarter results
+
+Revenue of $94.0 billion, up 10 percent year over year.",1b22e7303dc637edc0f9da07435156f2b3411ed242aadba783582dc5432192d6,92

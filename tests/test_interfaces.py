@@ -11,7 +11,6 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-import polars as pl
 import pytest
 
 from edgarpit import concepts, fetch, load, query, ratios, rawcache, sec_client
@@ -34,7 +33,8 @@ EXPECTED_SIGNATURES = {
     companyfacts.parse_companyfacts: "(doc: 'Mapping[str, Any]') -> 'pl.DataFrame'",
     load.load_tables: (
         "(con: 'duckdb.DuckDBPyConnection', *, filings: 'pl.DataFrame', "
-        "events_8k: 'pl.DataFrame', facts_raw: 'pl.DataFrame') -> 'None'"
+        "events_8k: 'pl.DataFrame', facts_raw: 'pl.DataFrame', "
+        "filings_text: 'pl.DataFrame', fx_daily: 'pl.DataFrame') -> 'None'"
     ),
     load.build_from_raw: "(raw_dir: 'Path', out_dir: 'Path') -> 'Path'",
     ratios.compute_ratio: "(numerator: 'RatioInput', denominator: 'RatioInput') -> 'RatioValue'",
@@ -150,36 +150,18 @@ def test_valet_client_has_the_sec_client_injection_points() -> None:
     assert signature.parameters["cache"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_phase2_stubs_raise_not_implemented(tmp_path: Path) -> None:
-    filings = pl.DataFrame(
-        schema={
-            "cik": pl.String,
-            "accession": pl.String,
-            "acceptance_ts": pl.Datetime("us", "UTC"),
-            "ts_imputed": pl.Boolean,
-            "items": pl.String,
-        }
-    )
-    calls: list[Any] = [
-        lambda: discover.exhibit_documents("<html></html>"),
-        lambda: segment.segment_items("text", ["2.02"]),
-        lambda: ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings),
-        lambda: valet.parse_valet({}),
-        lambda: fetch.submissions_unchanged(None, {}),
-    ]
-    for call in calls:
-        with pytest.raises(NotImplementedError):
-            call()
-
-
-def test_incremental_fetch_is_refused_rather_than_silently_full(tmp_path: Path) -> None:
+def test_incremental_fetch_accepts_the_keyword(tmp_path: Path) -> None:
     client = sec_client.SecClient(Settings(sec_user_agent="Test User test@example.com"))
-    with pytest.raises(NotImplementedError, match="incremental"):
-        fetch.fetch_universe([], tmp_path, client=client, incremental=True)
+    report = fetch.fetch_universe([], tmp_path, client=client, incremental=True)
+    assert report.skipped_unchanged == 0
+    assert report.requests == 0
 
 
-def test_currency_is_refused_until_the_usd_model_exists() -> None:
-    with pytest.raises(NotImplementedError, match="currency"):
-        query.asof("AAPL", "revenue", "2024-01-01T00:00:00Z", currency="USD")
-    with pytest.raises(NotImplementedError, match="currency"):
-        query.history("AAPL", "revenue", currency="USD")
+def test_currency_is_part_of_the_usd_read_surface() -> None:
+    """The USD read replaced the stub; an unsupported currency is still refused."""
+    # A currency outside the Literal reaches the runtime guard.
+    unsupported: Any = "CAD"
+    with pytest.raises(ValueError, match="currency"):
+        query.asof("AAPL", "revenue", "2024-01-01T00:00:00Z", currency=unsupported)
+    with pytest.raises(ValueError, match="currency"):
+        query.history("AAPL", "revenue", currency=unsupported)

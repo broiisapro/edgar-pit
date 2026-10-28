@@ -5,11 +5,43 @@ from the SGML index page at
 ``https://www.sec.gov/Archives/edgar/data/<cik-int>/<accession-no-dashes>/<accession>-index-headers.html``:
 each document row carries a ``<TYPE>`` and a ``<FILENAME>``. Only the primary
 8-K/8-K/A document and the ``EX-99.1`` exhibits are in scope.
+
+Survey of exhibit ``<TYPE>`` spellings (2026-10-28). Besides the 15 fixture pages
+under ``tests/fixtures/sec_text``, 93 live pages were read from SEC EDGAR: 49
+``-index-headers.html`` pages of 8-K/8-K/A filings from 2015 to 2025, and 44
+legacy ``-index.htm`` pages from 2003 to 2013 for the same issuers (the
+``-index-headers.html`` endpoint does not exist for filings before 2014, checked
+on Apple, Pfizer, Walmart and Microsoft). The issuers were Apple, Shopify,
+Berkshire Hathaway, Microsoft, Tesla, JPMorgan, Pfizer, Coca-Cola and Walmart;
+the documents came from in-house filers and from DFIN
+(``d*``, ``ef*``), RR Donnelley (``rrd*``), Toppan Merrill (``a*``, ``tm*``)
+and Broadridge (``e*``). The exhibit types seen were ``EX-99.1`` (62), ``EX-99.2``
+(9) and ``EX-99`` (1); no other spelling occurred in the sample. The rule is
+therefore: a type counts as ``EX-99.1`` when it names exhibit 99.1 exactly, after
+normalising case, surrounding whitespace, the separator after ``99`` (``.``,
+``-``, ``_`` or a space), an optional pair of parentheses and zero padding
+of the number. That accepts ``EX-99.01``, ``EX-99.(1)``, ``EX-99-1`` and
+``EX-99_1`` without accepting a different exhibit; bare ``EX-99`` is ambiguous
+with the whole exhibit-99 series and ``EX-99.2`` is a separate exhibit, so both
+are ignored. ``doc_type`` is always the normalised ``EX-99.1``.
 """
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass
+
+_ACCESSION = r"\d{10}-\d{2}-\d{6}"
+_ACCESSION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"<ACCESSION-NUMBER>\s*({_ACCESSION})"),
+    re.compile(rf"ACCESSION NUMBER:\s*({_ACCESSION})"),
+)
+_DOCUMENT_RE = re.compile(r"<DOCUMENT>(.*?)</DOCUMENT>", re.IGNORECASE | re.DOTALL)
+_DOCUMENT_OPEN_RE = re.compile(r"<DOCUMENT>", re.IGNORECASE)
+_DOCUMENT_CLOSE_RE = re.compile(r"</DOCUMENT>", re.IGNORECASE)
+_PRIMARY_TYPES = frozenset({"8-K", "8-K/A"})
+_EXHIBIT_TYPE_RE = re.compile(r"EX\s*-?\s*99\s*[._\- ]\s*\(?0*1\)?", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -28,21 +60,123 @@ class DocumentRef:
     doc_type: str
 
 
+def _accession(body: str) -> str:
+    """Return the page's accession number, or raise for a missing/conflicting one."""
+    found = {match.group(1) for pattern in _ACCESSION_PATTERNS for match in pattern.finditer(body)}
+    if not found:
+        raise ValueError("filing index page has no accession number")
+    if len(found) > 1:
+        listed = ", ".join(sorted(found))
+        raise ValueError(f"filing index page has conflicting accession numbers: {listed}")
+    return found.pop()
+
+
+def _field(block: str, tag: str) -> str:
+    """Return the text of one SGML ``<tag>`` field of a document block, or ``""``."""
+    match = re.search(rf"<{tag}>([^\r\n<]*)", block, re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _blocks(body: str, accession: str) -> list[tuple[int, int, str, str]]:
+    """Return ``(sequence, page_position, doc_type, filename)`` for every document.
+
+    ``page_position`` is the zero-based position of the block on the page, used
+    only as a stable tie-breaker. Raises :class:`ValueError` naming the
+    ``accession`` when the page has no document block, an unbalanced
+    ``<DOCUMENT>`` tag, or a block without a usable ``<SEQUENCE>``, ``<TYPE>`` or
+    ``<FILENAME>``.
+    """
+    starts = len(_DOCUMENT_OPEN_RE.findall(body))
+    ends = len(_DOCUMENT_CLOSE_RE.findall(body))
+    if starts != ends:
+        raise ValueError(
+            f"filing {accession} index page has unbalanced <DOCUMENT> tags: "
+            f"{starts} opening, {ends} closing"
+        )
+    matches = list(_DOCUMENT_RE.finditer(body))
+    if not matches:
+        raise ValueError(f"filing {accession} index page has no <DOCUMENT> block")
+    if len(matches) != starts:
+        raise ValueError(f"filing {accession} index page has an unclosed <DOCUMENT> block")
+
+    blocks: list[tuple[int, int, str, str]] = []
+    for position, match in enumerate(matches):
+        block = match.group(1)
+        sequence_text = _field(block, "SEQUENCE")
+        if not sequence_text:
+            raise ValueError(f"filing {accession} document block {position + 1} has no <SEQUENCE>")
+        if not sequence_text.isdigit():
+            raise ValueError(
+                f"filing {accession} document block {position + 1} has a non-numeric "
+                f"<SEQUENCE> {sequence_text!r}"
+            )
+        doc_type = _field(block, "TYPE")
+        if not doc_type:
+            raise ValueError(f"filing {accession} document block {position + 1} has no <TYPE>")
+        filename = _field(block, "FILENAME")
+        if not filename:
+            raise ValueError(
+                f"filing {accession} document block {position + 1} (<TYPE> {doc_type}) "
+                "has no <FILENAME>"
+            )
+        blocks.append((int(sequence_text), position, doc_type, filename))
+    return blocks
+
+
+def _is_exhibit_99_1(doc_type: str) -> bool:
+    """True when ``doc_type`` names exhibit 99.1 in one of its accepted spellings."""
+    return _EXHIBIT_TYPE_RE.fullmatch(doc_type.strip()) is not None
+
+
 def exhibit_documents(index_headers_html: str) -> list[DocumentRef]:
     """Return the primary document and the ``EX-99.1`` exhibits of a filing.
 
     ``index_headers_html`` is the text of the filing's
-    ``-index-headers.html`` page. The result lists, in page order, the one
-    document whose ``<TYPE>`` is ``8-K`` or ``8-K/A`` (``doc_type='primary'``)
-    followed by every document whose ``<TYPE>`` is ``EX-99.1``
-    (``doc_type='EX-99.1'``); the ``accession`` of every reference is the page's
-    ``<ACCESSION NUMBER>``. Documents outside those types are ignored: the index
-    page itself, the ``.hdr.sgml`` header, the XBRL instance, schema, linkbase
-    and rendering files, ``R*.htm`` viewer pages, graphics and any other exhibit
+    ``-index-headers.html`` page (escaped SGML inside its ``<PRE>`` block; the
+    function unescapes it first). The result lists the one document whose
+    ``<TYPE>`` is ``8-K`` or ``8-K/A`` (``doc_type='primary'``) first, then every
+    document whose ``<TYPE>`` names exhibit 99.1 (``doc_type='EX-99.1'``), in
+    ``<SEQUENCE>`` order; EDGAR numbers the primary document first, so the two
+    orders coincide. The ``accession`` of every reference is the page's
+    accession number. Documents outside those types are ignored: the index page
+    itself, the ``.hdr.sgml`` header, the XBRL instance, schema, linkbase and
+    rendering files, ``R*.htm`` viewer pages, graphics and any other exhibit
     type.
 
-    Raises :class:`ValueError` when the page carries no ``<ACCESSION NUMBER>``,
-    when it lists no primary 8-K/8-K/A document, or when a primary or exhibit
-    row has no ``<FILENAME>``.
+    Exhibit types are normalised as described in the module docstring: case,
+    the separator after ``99``, optional parentheses and zero padding do not
+    matter, so ``EX-99.01``, ``EX-99.(1)``, ``EX-99-1`` and ``EX-99_1`` all
+    become ``EX-99.1``. ``EX-99`` and ``EX-99.2`` are not exhibit 99.1 and are
+    ignored.
+
+    Raises :class:`ValueError` naming the accession when the page carries no
+    accession number (or conflicting ones), when it has no ``<DOCUMENT>`` block,
+    when its ``<DOCUMENT>`` tags are unbalanced, when a block has no usable
+    ``<SEQUENCE>``, ``<TYPE>`` or ``<FILENAME>``, or when it does not list exactly
+    one primary 8-K/8-K/A document.
     """
-    raise NotImplementedError("8-K document discovery lands with the filing-text ingest")
+    body = html.unescape(index_headers_html)
+    accession = _accession(body)
+    blocks = _blocks(body, accession)
+
+    primary = [block for block in blocks if block[2].upper() in _PRIMARY_TYPES]
+    if not primary:
+        raise ValueError(f"filing {accession} index page lists no primary 8-K/8-K/A document")
+    if len(primary) > 1:
+        listed = ", ".join(f"{block[3]} (<TYPE> {block[2]})" for block in primary)
+        raise ValueError(
+            f"filing {accession} index page lists {len(primary)} primary 8-K/8-K/A "
+            f"documents: {listed}"
+        )
+
+    exhibits = sorted(
+        (block for block in blocks if _is_exhibit_99_1(block[2])),
+        key=lambda block: (block[0], block[1]),
+    )
+    return [
+        DocumentRef(accession=accession, filename=primary[0][3], doc_type="primary"),
+        *(
+            DocumentRef(accession=accession, filename=block[3], doc_type="EX-99.1")
+            for block in exhibits
+        ),
+    ]
