@@ -343,6 +343,8 @@ def test_one_changed_issuer_is_fetched_fully_while_the_others_are_skipped(tmp_pa
     assert (ryan.headers_fetched, ryan.headers_cached) == (0, first.issuers[0].headers_fetched)
     assert apple.unchanged and shop.unchanged
     assert (apple.requests, shop.requests) == (1, 1)
+    assert len(recorder.calls) == 3 + page_count(RY_CIK) + 1
+    assert second.requests == 3 + page_count(RY_CIK) + 1
     stored = json.loads(RawCache(tmp_path).latest("submissions", RY_CIK) or b"{}")
     assert stored["filings"]["recent"]["accessionNumber"][0] == new_accession
 
