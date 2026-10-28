@@ -409,7 +409,7 @@ def test_response_models_mirror_the_query_dataclasses() -> None:
 def test_openapi_documents_every_parameter(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
 
-    assert set(schema["paths"]) == {"/health", "/asof", "/history", "/events"}
+    assert set(schema["paths"]) == {"/health", "/asof", "/history", "/events", "/text"}
     for path, operations in schema["paths"].items():
         for method, operation in operations.items():
             assert operation.get("summary"), (path, method)

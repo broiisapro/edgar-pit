@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: fundamentals_pit_usd
+    description: >-
+      main.fundamentals_pit converted to USD (decision A-32), every input column
+      unchanged and in the same order. USD rows convert at 1.0; CAD rows use the
+      latest FXUSDCAD observation on or before the period end and are known at
+      greatest(acceptance_ts, fx_known_at); other currencies stay unconverted
+      with unconverted_reason = 'currency_out_of_scope', and a CAD period end
+      before the first observation gets 'no_rate' (decision A-38). Consumers
+      filter on asof_ts <= t, never on acceptance_ts.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [cik, field, period_start, period_end, accession]
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: field
+        tests:
+          - not_null
+      - name: period_end
+        tests:
+          - not_null
+      - name: accession
+        tests:
+          - not_null
+      - name: acceptance_ts
+        tests:
+          - not_null
+      - name: value
+        tests:
+          - not_null
+      - name: converted
+        tests:
+          - not_null
+      - name: asof_ts
+        tests:
+          - not_null
+      - name: unconverted_reason
+        tests:
+          - accepted_values:
+              arguments:
+                values: ["no_rate", "currency_out_of_scope"]
