@@ -42,10 +42,12 @@ from edgarpit.concepts import (
     ConceptMap,
     load_concept_map,
 )
+from edgarpit.fx.valet import parse_valet
 from edgarpit.ingest.companyfacts import ingest_facts
 from edgarpit.ingest.submissions import ingest_filings, load_item_labels
 from edgarpit.rawcache import RawCache
-from edgarpit.schemas import COLUMNS, SCHEMAS, duckdb_ddl
+from edgarpit.schemas import COLUMNS, DUCKDB_TYPES, SCHEMAS, duckdb_ddl
+from edgarpit.text.ingest import ingest_text
 
 if TYPE_CHECKING:
     from dbt.cli.main import dbtRunnerResult
@@ -63,12 +65,16 @@ BUILD_INFO_TABLES: tuple[str, ...] = (
     "raw.filings",
     "raw.events_8k",
     "raw.facts_raw",
+    "raw.filings_text",
+    "raw.fx_daily",
     "raw.concept_map",
     "raw.universe",
     "main.fundamentals_pit",
+    "main.fundamentals_pit_usd",
     "main.ratios_pit",
     "main.events_8k",
     "main.filings",
+    "main.filings_text",
 )
 
 DEFAULT_UNIVERSE_CSV = Path(__file__).resolve().parents[1] / "config" / "universe.csv"
@@ -98,6 +104,10 @@ _UNIVERSE_COLUMNS = list(REFERENCE_TYPES["universe"])
 _POLARS_TYPES: dict[str, DataType | DataTypeClass] = {
     "VARCHAR(10)": pl.String,
     "VARCHAR": pl.String,
+    "DATE": pl.Date,
+    "TIMESTAMPTZ": pl.Datetime("us", "UTC"),
+    "BOOLEAN": pl.Boolean,
+    "DOUBLE": pl.Float64,
     "INTEGER": pl.Int64,
 }
 
@@ -168,26 +178,43 @@ def _read_universe(path: Path) -> pl.DataFrame:
     return frame
 
 
+def _empty_contract_frame(table: str) -> pl.DataFrame:
+    """Return an empty frame with exactly the contract columns and dtypes of ``table``."""
+    schema = {name: _POLARS_TYPES[dtype] for name, dtype in DUCKDB_TYPES[table].items()}
+    return pl.DataFrame(schema=schema).select(COLUMNS[table])
+
+
 def load_tables(
     con: duckdb.DuckDBPyConnection,
     *,
     filings: pl.DataFrame,
     events_8k: pl.DataFrame,
     facts_raw: pl.DataFrame,
+    filings_text: pl.DataFrame,
+    fx_daily: pl.DataFrame,
 ) -> None:
     """Validate each frame with its Pandera schema and replace the ``raw.*`` tables.
 
-    ``filings``, ``events_8k`` and ``facts_raw`` must be valid under
-    :class:`edgarpit.schemas.FilingsSchema`,
-    :class:`edgarpit.schemas.Events8kSchema` and
-    :class:`edgarpit.schemas.FactsRawSchema`. The connection's timezone is set
-    to UTC before loading (decision A-5). Each frame is validated before any
-    statement is executed, then all three tables are dropped, recreated from
+    ``filings``, ``events_8k``, ``facts_raw``, ``filings_text`` and ``fx_daily``
+    must be valid under :class:`edgarpit.schemas.FilingsSchema`,
+    :class:`edgarpit.schemas.Events8kSchema`,
+    :class:`edgarpit.schemas.FactsRawSchema`,
+    :class:`edgarpit.schemas.FilingsTextSchema` and
+    :class:`edgarpit.schemas.FxDailySchema`; an empty frame of the table's
+    contract columns is the way to load nothing. The connection's timezone is
+    set to UTC before loading (decision A-5). Each frame is validated before any
+    statement is executed, then all five tables are dropped, recreated from
     :func:`edgarpit.schemas.duckdb_ddl` and filled in one transaction, so an
     invalid frame raises :class:`pandera.errors.SchemaError` with nothing
     written. All timestamps are timezone-aware UTC instants.
     """
-    frames = {"filings": filings, "events_8k": events_8k, "facts_raw": facts_raw}
+    frames = {
+        "filings": filings,
+        "events_8k": events_8k,
+        "facts_raw": facts_raw,
+        "filings_text": filings_text,
+        "fx_daily": fx_daily,
+    }
     for table, frame in frames.items():
         SCHEMAS[table].validate(frame)
     con.execute("SET TimeZone='UTC'")
@@ -282,6 +309,68 @@ def _deduplicate_filings(
         subset=["accession", "item_code"], keep="first", maintain_order=True
     )
     return filings.drop("_borrowed"), events_8k.drop("_borrowed")
+
+
+def _indexed_accessions(raw: RawCache) -> dict[str, list[str]]:
+    """Return the accessions with a cached filing index, per CIK.
+
+    A ``filing_index`` directory entry is created by ``fetch-text`` for every
+    8-K whose index headers were fetched, so its presence is exactly the set of
+    accessions whose text :func:`edgarpit.text.ingest.ingest_text` can extract.
+    The result is ordered by CIK and accession, and is empty when the cache
+    holds no filing index.
+    """
+    directory = raw.raw_dir / "filing_index"
+    if not directory.is_dir():
+        return {}
+    indexed: dict[str, list[str]] = {}
+    for entry in sorted(directory.iterdir()):
+        if not entry.is_dir() or not _CIK_DIR.fullmatch(entry.name):
+            continue
+        accessions = raw.keys("filing_index", entry.name)
+        if accessions:
+            indexed[entry.name] = accessions
+    return indexed
+
+
+def _ingest_filings_text(raw: RawCache, filings: pl.DataFrame) -> pl.DataFrame:
+    """Extract every cached filing index into a ``raw.filings_text`` frame.
+
+    ``filings`` is the frame about to be loaded into ``raw.filings``; the row of
+    each indexed accession supplies the CIK, acceptance time and imputed flag,
+    so text is known exactly when its filing was accepted. Returns an empty
+    frame with the contract's columns when the cache holds no filing index.
+    Raises whatever :func:`edgarpit.text.ingest.ingest_text` raises for an
+    accession missing from ``filings`` or a missing cached document.
+    """
+    indexed = _indexed_accessions(raw)
+    frames: list[pl.DataFrame] = []
+    for cik, accessions in indexed.items():
+        issuer = filings.filter(pl.col("accession").is_in(accessions))
+        frames.append(ingest_text(raw, cik, accessions, issuer))
+    if not frames:
+        return _empty_contract_frame("filings_text")
+    return pl.concat(frames)
+
+
+def _ingest_fx_daily(raw: RawCache) -> pl.DataFrame:
+    """Parse every cached FX series into a ``raw.fx_daily`` frame.
+
+    Each key under ``raw/fx/_/`` is a series id (``FXUSDCAD``) and the latest
+    stored document for it is parsed with
+    :func:`edgarpit.fx.valet.parse_valet`; series are concatenated in key order,
+    so the result is a function of the cache alone. Returns an empty frame with
+    the contract's columns when no series is cached.
+    """
+    frames: list[pl.DataFrame] = []
+    for series in raw.keys("fx", ""):
+        body = raw.latest("fx", "", series)
+        if body is None:
+            continue
+        frames.append(parse_valet(json.loads(body), series))
+    if not frames:
+        return _empty_contract_frame("fx_daily")
+    return pl.concat(frames)
 
 
 def _run_dbt(db_path: Path, target_path: Path) -> dbtRunnerResult:
@@ -384,8 +473,9 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     """Build the database from a raw cache directory.
 
     ``raw_dir`` is a cache root as written by the fetcher (``raw/submissions``,
-    ``raw/submissions_page``, ``raw/companyfacts``, ``raw/headers``). Every CIK
-    with a cached submissions document, in ascending order, is ingested with
+    ``raw/submissions_page``, ``raw/companyfacts``, ``raw/headers``, and the
+    Phase 2 ``raw/filing_index`` and ``raw/fx`` slots). Every CIK with a cached
+    submissions document, in ascending order, is ingested with
     :func:`edgarpit.ingest.submissions.ingest_filings` (item labels from
     ``config/8k_items.yaml``) and :func:`edgarpit.ingest.companyfacts.ingest_facts`;
     the frames are concatenated, cross-issuer repeats of one accession are
@@ -398,6 +488,12 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     package version, the raw cache path, per-CIK document counts, the raw
     manifest's ``fetched_at`` range, the contract table row counts and the dbt
     node summary.
+
+    ``raw.filings_text`` is filled by
+    :func:`edgarpit.text.ingest.ingest_text` for every accession with a cached
+    filing index and ``raw.fx_daily`` by :func:`edgarpit.fx.valet.parse_valet`
+    for every cached FX series (decision A-37); a cache without those endpoints
+    loads both tables empty, so a Phase 1 cache still builds.
 
     Returns the database path. Raises the ingest, Pandera, DuckDB or dbt error
     unchanged, and :class:`RuntimeError` when dbt reports a failed node, so a
@@ -435,6 +531,8 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
             filings=deduplicated_filings,
             events_8k=deduplicated_events,
             facts_raw=pl.concat(facts_frames),
+            filings_text=_ingest_filings_text(raw, deduplicated_filings),
+            fx_daily=_ingest_fx_daily(raw),
         )
         load_reference_tables(con)
     finally:

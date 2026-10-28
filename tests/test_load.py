@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import doubles
 import duckdb
 import polars as pl
 import pytest
@@ -33,6 +35,8 @@ UNIVERSE_CSV = REPO_ROOT / "config" / "universe.csv"
 RY_CIK = "0001000275"
 RY_FY2023_40F = "0001193125-23-285639"
 RY_FY2023_ACCEPTANCE = datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC)
+APPLE_CIK = "0000320193"
+APPLE_8K = "0000320193-25-000071"
 
 
 def polars_type(dtype: str) -> Any:
@@ -80,6 +84,8 @@ def load_staging(con: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
         filings=frames["filings"],
         events_8k=frames["events_8k"],
         facts_raw=frames["facts_raw"],
+        filings_text=frames["filings_text"],
+        fx_daily=frames["fx_daily"],
     )
     return frames
 
@@ -93,6 +99,8 @@ def test_staging_round_trip(tmp_path: Path) -> None:
             filings=frames["filings"],
             events_8k=frames["events_8k"],
             facts_raw=frames["facts_raw"],
+            filings_text=frames["filings_text"],
+            fx_daily=frames["fx_daily"],
         )
         assert con.execute("SELECT current_setting('TimeZone')").fetchone() == ("UTC",)
         for table, frame in frames.items():
@@ -113,11 +121,15 @@ def test_load_tables_replaces_previous_contents(tmp_path: Path) -> None:
             filings=subset,
             events_8k=empty_frame("events_8k"),
             facts_raw=empty_frame("facts_raw"),
+            filings_text=empty_frame("filings_text"),
+            fx_daily=empty_frame("fx_daily"),
         )
 
         assert con.execute("SELECT count(*) FROM raw.filings").fetchone() == (3,)
         assert con.execute("SELECT count(*) FROM raw.events_8k").fetchone() == (0,)
         assert con.execute("SELECT count(*) FROM raw.facts_raw").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM raw.filings_text").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM raw.fx_daily").fetchone() == (0,)
         restored = con.execute("SELECT * FROM raw.filings").pl().cast(frame_schema("filings"))
         assert restored.sort("accession").equals(subset.sort("accession"))
     finally:
@@ -134,6 +146,8 @@ def test_invalid_frame_is_rejected_with_nothing_written(tmp_path: Path) -> None:
                 filings=bad_filings,
                 events_8k=empty_frame("events_8k"),
                 facts_raw=empty_frame("facts_raw"),
+                filings_text=empty_frame("filings_text"),
+                fx_daily=empty_frame("fx_daily"),
             )
 
         assert raw_table_names(con) == set()
@@ -153,6 +167,8 @@ def test_invalid_frame_leaves_previous_tables_untouched(tmp_path: Path) -> None:
                 filings=frames["filings"],
                 events_8k=frames["events_8k"],
                 facts_raw=bad_facts,
+                filings_text=frames["filings_text"],
+                fx_daily=frames["fx_daily"],
             )
 
         count = con.execute("SELECT count(*) FROM raw.facts_raw").fetchone()
@@ -370,6 +386,97 @@ def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -
     assert {"main.fundamentals_pit", "main.ratios_pit", "main.events_8k", "main.filings"} <= set(
         info["tables"]
     )
+
+
+def test_a_phase1_cache_builds_with_the_phase2_tables_empty(tmp_path: Path) -> None:
+    """A cache without filing indexes or FX keeps ``build --offline`` working.
+
+    Decision A-37: the database is a function of the cache, so the two Phase 2
+    raw tables exist and are empty, their dbt models exist and are empty, and
+    the USD conversion model still covers every Phase 1 fundamental.
+    """
+    out = tmp_path / "build"
+    db = build_from_raw(FIXTURE_RAW, out)
+
+    con = duckdb.connect(str(db))
+    try:
+        con.execute("SET TimeZone='UTC'")
+        assert con.execute("SELECT count(*) FROM raw.filings_text").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM raw.fx_daily").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM main.filings_text").fetchone() == (0,)
+        assert (
+            con.execute("SELECT count(*) FROM main.fundamentals_pit_usd").fetchone()
+            == con.execute("SELECT count(*) FROM main.fundamentals_pit").fetchone()
+        )
+        # Without an FXUSDCAD series nothing in CAD converts, and every
+        # converted row is a USD row.
+        reasons = dict(
+            con.execute(
+                "SELECT unconverted_reason, count(*) FROM main.fundamentals_pit_usd "
+                "GROUP BY unconverted_reason ORDER BY unconverted_reason"
+            ).fetchall()
+        )
+        assert reasons.get(None, 0) > 0
+        assert reasons.get("no_rate", 0) > 0
+        assert set(reasons) <= {None, "no_rate", "currency_out_of_scope"}
+    finally:
+        con.close()
+
+
+def test_build_from_raw_ingests_cached_text_and_fx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache with a filing index and an FX series fills both tables (A-37)."""
+    cache = tmp_path / "cache"
+    shutil.copytree(FIXTURE_RAW, cache)
+    index_dir = cache / "raw" / "filing_index" / APPLE_CIK / APPLE_8K
+    index_dir.mkdir(parents=True)
+    (index_dir / "20261028T000000000000Z.html").write_text("<html></html>", encoding="utf-8")
+    fx_dir = cache / "raw" / "fx" / "_" / "FXUSDCAD"
+    fx_dir.mkdir(parents=True)
+    (fx_dir / "20261028T000000000000Z.json").write_text(
+        '{"observations": [{"d": "2023-10-31", "FXUSDCAD": {"v": "1.3659"}}]}',
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_ingest_text(
+        raw: object, cik: str, accessions: list[str], filings: pl.DataFrame
+    ) -> pl.DataFrame:
+        seen["text_call"] = (cik, list(accessions), filings["accession"].to_list())
+        return doubles.filings_text_frame()
+
+    def fake_parse_valet(doc: dict[str, object], series: str) -> pl.DataFrame:
+        seen["fx_call"] = (series, doc)
+        return doubles.fx_daily_frame()
+
+    monkeypatch.setattr("edgarpit.load.ingest_text", fake_ingest_text)
+    monkeypatch.setattr("edgarpit.load.parse_valet", fake_parse_valet)
+
+    db = build_from_raw(cache, tmp_path / "build")
+
+    assert seen["text_call"] == (APPLE_CIK, [APPLE_8K], [APPLE_8K])
+    assert seen["fx_call"] == (
+        "FXUSDCAD",
+        {"observations": [{"d": "2023-10-31", "FXUSDCAD": {"v": "1.3659"}}]},
+    )
+    info = json.loads((tmp_path / "build" / BUILD_INFO_NAME).read_text(encoding="utf-8"))
+    assert info["tables"]["raw.filings_text"] == 3
+    assert info["tables"]["raw.fx_daily"] == 3
+    assert info["tables"]["main.filings_text"] == 3
+    con = duckdb.connect(str(db))
+    try:
+        con.execute("SET TimeZone='UTC'")
+        assert con.execute("SELECT count(*) FROM raw.filings_text").fetchone() == (3,)
+        assert con.execute("SELECT count(*) FROM raw.fx_daily").fetchone() == (3,)
+        assert con.execute("SELECT DISTINCT ticker FROM main.filings_text").fetchall() == [
+            ("AAPL",)
+        ]
+        assert con.execute(
+            "SELECT count(*) FROM raw.fx_daily WHERE known_at < rate_date"
+        ).fetchone() == (0,)
+    finally:
+        con.close()
 
 
 def test_cross_issuer_duplicate_accessions_keep_the_filer_row() -> None:

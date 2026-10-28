@@ -34,7 +34,8 @@ EXPECTED_SIGNATURES = {
     companyfacts.parse_companyfacts: "(doc: 'Mapping[str, Any]') -> 'pl.DataFrame'",
     load.load_tables: (
         "(con: 'duckdb.DuckDBPyConnection', *, filings: 'pl.DataFrame', "
-        "events_8k: 'pl.DataFrame', facts_raw: 'pl.DataFrame') -> 'None'"
+        "events_8k: 'pl.DataFrame', facts_raw: 'pl.DataFrame', "
+        "filings_text: 'pl.DataFrame', fx_daily: 'pl.DataFrame') -> 'None'"
     ),
     load.build_from_raw: "(raw_dir: 'Path', out_dir: 'Path') -> 'Path'",
     ratios.compute_ratio: "(numerator: 'RatioInput', denominator: 'RatioInput') -> 'RatioValue'",
