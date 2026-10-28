@@ -1,0 +1,127 @@
+# Nightly incremental refresh: fetch new SEC filings into the raw cache, rebuild
+# the database, add 8-K text and FX rates, rebuild again, and record the QA report.
+#
+# The workflow is inert until the repository variable REFRESH_ENABLED is "true";
+# merging it changes nothing. The SEC requires a declared User-Agent, so the
+# repository secret SEC_USER_AGENT must be set before the first enabled run.
+# See docs/operations.md for enabling, running by hand and reading a failure.
+name: Refresh data
+
+on:
+  schedule:
+    # 10:43 UTC = 02:43 or 03:43 US Pacific, i.e. outside the 06:00-09:00
+    # window when the owner's machine and the network are busy, and at a
+    # minute that is not shared with another scheduled job.
+    - cron: "43 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A slow refresh must never overlap the next night's run: the first run keeps
+# the slot and the queued one starts after it, so two writers never touch the
+# same cache key or the same SEC endpoints at once.
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: vars.REFRESH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    # A cold run fetches ~57k SGML headers at 5 requests/s, so the first run
+    # needs hours; warm nightly runs finish in minutes. 360 is the hosted cap.
+    timeout-minutes: 360
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Check SEC_USER_AGENT
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          if [ -z "$SEC_USER_AGENT" ]; then
+            echo "::error::The repository secret SEC_USER_AGENT is empty. Set it to a real contact such as 'Your Name you@example.com' (SEC fair-access policy) and re-run."
+            exit 1
+          fi
+
+      - name: Restore raw cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/raw
+          # A fresh key per run keeps the cache rolling; restore-keys falls back
+          # to the newest previous run, so the cache grows instead of being lost.
+          key: edgarpit-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            edgarpit-raw-
+
+      - name: Fetch (incremental)
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: uv run edgarpit fetch --universe config/universe_large.csv --out data --incremental
+
+      - name: Build
+        run: uv run edgarpit build --data data --out build
+
+      - name: Fetch filing text
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: uv run edgarpit fetch-text --db build/edgarpit.duckdb --items 2.02 --data data
+
+      - name: Fetch FX rates
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: uv run edgarpit fx --out data
+
+      # Text and FX are raw inputs, so the database is rebuilt from the cache
+      # after they land; the build is a pure function of the cache.
+      - name: Build with text and FX
+        run: uv run edgarpit build --data data --out build
+
+      # tee keeps the report as an artifact; pipefail makes a key violation
+      # fail the job even though tee itself exits 0.
+      - name: QA
+        run: |
+          set -o pipefail
+          uv run edgarpit qa --db build/edgarpit.duckdb | tee build/qa.txt
+
+      # Saved even when a later step failed: the files already fetched are
+      # immutable, so keeping them saves the next run a repeat. Skipped when the
+      # run never fetched anything, so a failed guard does not add a second,
+      # confusing failure to the same run.
+      - name: Check the raw cache has content
+        id: cache-present
+        if: always()
+        run: |
+          if [ -f data/raw/manifest.jsonl ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save raw cache
+        if: always() && steps.cache-present.outputs.present == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/raw
+          key: edgarpit-raw-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload build report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: refresh-report
+          path: |
+            build/build-info.json
+            build/qa.txt
+          if-no-files-found: warn
+          retention-days: 14
