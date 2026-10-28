@@ -57,9 +57,9 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def write_doc(cache: Path, parts: list[str], payload: Any) -> None:
+def write_doc(root: Path | RawCache, parts: list[str], payload: Any) -> None:
     """Write one uncompressed cache document under ``raw/<parts>/<stamp>.json``."""
-    directory = cache.joinpath("raw", *parts)
+    directory = (root.root if isinstance(root, RawCache) else root).joinpath("raw", *parts)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{STAMP}.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -473,6 +473,31 @@ def test_document_reader_serves_the_cache_and_reports_a_miss(tmp_path: Path) -> 
     assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")) is None
 
 
+def test_read_filings_follows_a_page_to_reach_the_cutoff(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = RawCache(tmp_path)
+    page_name = "CIK0000320193-submissions-001"
+    write_doc(
+        cache,
+        ["submissions_page", "0000320193", page_name],
+        {
+            "form": ["40-F", "8-K"],
+            "filingDate": ["2025-02-01", "2024-11-01"],
+        },
+    )
+    document = {
+        "filings": {
+            "recent": {"form": ["8-K"], "filingDate": ["2026-09-01"]},
+            "files": [{"name": f"{page_name}.json"}],
+        }
+    }
+    reader = builder.DocumentReader(cache, None, [0])
+    cutoff = date(2024, 10, 29)
+    pairs = builder.read_filings(reader, document, "0000320193", cutoff)
+    assert ("40-F", date(2025, 2, 1)) in pairs
+    assert builder.annual_filer_type(pairs, cutoff) == "40-F"
+
+
 class RecordingClient:
     """A ``SecClient`` stand-in that records the URLs it is asked for."""
 
@@ -701,6 +726,14 @@ def build_cache(tmp_path: Path) -> Path:
         cache,
         ["companyconcept", "0000000006", "us-gaap__Assets"],
         assets("EUR", 90_000_000_000.0),
+    )
+    # A US-address issuer the float frame places in Canada: with assets on file
+    # it would enter a loc-based Canadian list, so its absence proves the
+    # submissions address decides.
+    write_doc(
+        cache,
+        ["companyconcept", "0000000010", "us-gaap__Assets"],
+        assets("USD", 800_000_000_000.0),
     )
     write_doc(
         cache,
