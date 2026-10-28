@@ -53,7 +53,7 @@ RELEASE_COMMANDS: tuple[str, ...] = (
     r"^edgarpit export --db build/edgarpit\.duckdb --out release$",
 )
 
-# Every job that receives the SEC User-Agent, by step name.
+# Every step that receives the SEC User-Agent, by step name.
 SECRET_RECEIVERS = frozenset(
     {"Check SEC_USER_AGENT", "Fetch (incremental)", "Fetch filing text", "Fetch FX rates"}
 )
@@ -205,7 +205,13 @@ def test_every_job_is_gated_on_refresh_enabled(path: Path) -> None:
 
 @PATHS
 def test_the_workflow_token_starts_read_only(path: Path) -> None:
-    assert load(path)["permissions"] == {"contents": "read"}
+    document = load(path)
+    assert document["permissions"] == {"contents": "read"}
+    for name, job in document["jobs"].items():
+        permissions = job.get("permissions") or {}
+        writable = permissions.get("contents") == "write"
+        # The single exception is the release job that creates the tag.
+        assert not writable or (path == RELEASE_PATH and name == "publish"), name
 
 
 def test_only_the_publishing_job_may_write() -> None:
@@ -447,6 +453,7 @@ def test_publishing_is_a_separate_least_privilege_job() -> None:
     publish_run = step_named(RELEASE_PATH, "Publish the GitHub Release")["run"]
     assert 'TAG="$(cat meta/release-tag.txt)"' in publish_run
     assert 'gh release create "$TAG"' in publish_run
+    assert '--target "$GITHUB_SHA"' in publish_run
     assert "--notes-file meta/release-notes.md" in publish_run
     assert "assets/*" in publish_run
     # An existing tag is never overwritten: published data releases are immutable.
