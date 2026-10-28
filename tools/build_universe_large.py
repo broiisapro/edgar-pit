@@ -50,8 +50,9 @@ Selection rules, in order:
 The SEC serves no ``ifrs-full`` frames (every taxonomy/tag/unit/period probed
 returns 404), and many MJDS filers tag no ``dei`` cover fact at all, so a
 40-F filer that neither tags ``dei`` nor appears in ``config/universe.csv``
-cannot be discovered from frames. The build reports how many such issuers it
-cannot see; a per-CIK submissions sweep is the documented follow-up.
+cannot be discovered from frames; neither can a Canadian issuer whose XBRL
+``loc`` is a US address. The build reports how many candidates it sees and
+drops; a per-CIK submissions sweep is the documented follow-up.
 
 Responses are cached immutably under ``--cache`` (never committed): frames and
 submissions at <= 5 requests/second through
@@ -154,7 +155,7 @@ class UniverseBuildError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
-# Frame cache
+# Document cache
 # --------------------------------------------------------------------------
 
 
@@ -696,8 +697,8 @@ def merge_universe(
 
     Seeded rows always win and keep their fields verbatim. Every Canadian row
     whose CIK is not seeded is added. US rows are added in the given order
-    until the file holds ``target_total`` rows, but never fewer than ``min_us``
-    when the Canadian rows alone reach the target. A duplicate ticker or CIK
+    until the file holds ``target_total`` rows, but always at least ``min_us``
+    US rows, so the US large-cap list is never empty. A duplicate ticker or CIK
     raises :class:`UniverseError`; the result is sorted by
     ``(country, ticker)``, so the file order never depends on input order.
     """
@@ -811,11 +812,22 @@ def _reject(report: BuildReport, reason: str) -> None:
         raise UniverseBuildError(f"unknown rejection reason {reason!r}")
 
 
-def _ticker_for(facts: SubmissionFacts, tickers: Mapping[str, str]) -> str | None:
+def _tickers_by_cik(tickers: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
+    """Invert ``ticker -> CIK`` into ``CIK -> sorted tickers``."""
+    by_cik: dict[str, list[str]] = defaultdict(list)
+    for ticker, cik in tickers.items():
+        by_cik[cik].append(ticker)
+    return {cik: tuple(sorted(entries)) for cik, entries in by_cik.items()}
+
+
+def _ticker_for(
+    facts: SubmissionFacts,
+    tickers: Mapping[str, str],
+    tickers_by_cik: Mapping[str, tuple[str, ...]],
+) -> str | None:
     """Primary ticker that ``company_tickers.json`` maps to this CIK."""
     valid = [ticker for ticker in facts.tickers if tickers.get(ticker) == facts.cik]
-    mapped = tuple(sorted(ticker for ticker, cik in tickers.items() if cik == facts.cik))
-    return primary_ticker(valid, mapped)
+    return primary_ticker(valid, tickers_by_cik.get(facts.cik, ()))
 
 
 def _issuer(facts: SubmissionFacts, ticker: str, country: str) -> Issuer:
@@ -841,8 +853,8 @@ def build(
 ) -> BuildReport:
     """Build the universe from the cache or SEC.
 
-    ``cache_dir`` holds the immutable raw cache (frames, submissions,
-    ``company_tickers``). ``as_of`` is the calendar date whose quarter ends the
+    ``cache_dir`` holds the immutable raw cache (frames, companyconcept,
+    submissions, ``company_tickers``). ``as_of`` is the calendar date whose quarter ends the
     frame window and whose two-year annual-report window is applied; it is a
     date, not a timestamp. Raises :class:`ConfigError` for a missing
     User-Agent, :class:`UniverseBuildError` for malformed SEC data and
@@ -876,6 +888,7 @@ def build(
             counter[0] += 1
         tickers_doc = client.get_json(company_tickers_url())
         tickers = ticker_map(tickers_doc)
+        tickers_by_cik = _tickers_by_cik(tickers)
         float_rows: list[FrameRow] = []
         canadian_rows: list[FrameRow] = []
         for period in report.periods:
@@ -925,7 +938,7 @@ def build(
         chosen_ciks: set[str] = set()
         for cik in sorted(canadian_ciks - seeded_ciks):
             facts = read_facts(cik)
-            ticker = _ticker_for(facts, tickers)
+            ticker = _ticker_for(facts, tickers, tickers_by_cik)
             if not check(facts, ticker) or ticker is None:
                 continue
             country = facts.country or "CA"
@@ -969,11 +982,15 @@ def build(
             if row.cik in seeded_ciks or row.cik in chosen_ciks:
                 continue
             facts = read_facts(row.cik)
-            ticker = _ticker_for(facts, tickers)
+            ticker = _ticker_for(facts, tickers, tickers_by_cik)
             if not check(facts, ticker) or ticker is None:
                 continue
             if facts.country == "CA":
-                report.rejected_not_canadian += 1
+                # A Canadian-domiciled issuer can appear in the US float frame
+                # when its tagged location is a US address; it is a Canadian
+                # row, not a US one.
+                canadian.append(_issuer(facts, ticker, "CA"))
+                chosen_ciks.add(row.cik)
                 continue
             us.append(_issuer(facts, ticker, "US"))
             chosen_ciks.add(row.cik)
