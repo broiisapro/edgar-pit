@@ -21,6 +21,18 @@ final HTTP error is fatal for that issuer, recorded in its report, and the run
 continues with the next issuer; the caller turns a report with errors into a
 non-zero exit.
 
+With ``incremental`` true each issuer is probed with one submissions request and
+compared with the newest cached copy (:func:`submissions_unchanged`). An
+unchanged issuer keeps its cached pages, companyfacts and headers, costs
+exactly that one request and is counted in
+:attr:`FetchReport.skipped_unchanged` (decision A-34). The probed submissions
+body is stored like every other response, because the shared client writes each
+200 body it receives and that body is the evidence the comparison used; what
+skipping saves is the pages, the companyfacts document and the headers. A
+late XBRL correction inside an otherwise unchanged submissions document is
+therefore missed until the next run with ``incremental`` false, which re-fetches
+everything; the trade-off is stated on :func:`fetch_universe`.
+
 Logging: one ``INFO`` line per issuer with its counts, and an ``ERROR`` line
 for an issuer that failed.
 """
@@ -32,6 +44,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +83,9 @@ class IssuerFetchReport:
     whose header URL answered 404, and ``requests`` the logical GETs issued to
     SEC (retries are not counted separately). ``errors`` holds the final
     failures after retries; an issuer with errors is fatal only for that
-    issuer.
+    issuer. ``unchanged`` is true when an incremental run found the issuer's
+    submissions document unchanged and stopped after the probe, so pages,
+    companyfacts and headers were skipped (decision A-34).
     """
 
     cik: str
@@ -83,6 +98,7 @@ class IssuerFetchReport:
     headers_404: list[str] = field(default_factory=list)
     requests: int = 0
     errors: list[str] = field(default_factory=list)
+    unchanged: bool = False
 
     @property
     def headers_not_found(self) -> int:
@@ -100,8 +116,8 @@ class FetchReport:
     """The outcome of :func:`fetch_universe`, one entry per issuer in order.
 
     ``skipped_unchanged`` counts the issuers an incremental run skipped because
-    their submissions document had not changed (decision A-34); it stays 0
-    until incremental fetch lands.
+    their submissions document had not changed (decision A-34); a full run
+    reports 0.
     """
 
     issuers: list[IssuerFetchReport] = field(default_factory=list)
@@ -260,19 +276,64 @@ def _fetch_headers(
         report.requests += 1
 
 
+def _cached_submissions(cache: RawCache, cik: str) -> Mapping[str, Any] | None:
+    """Return the newest cached submissions document for ``cik``, or ``None``.
+
+    A body that is not a JSON object is logged and treated as missing, which
+    makes the issuer fetch in full and store a fresh copy under a new
+    ``fetched_at`` (decision A-4); the unusable copy is never deleted.
+    """
+    body = cache.latest("submissions", cik, None)
+    if body is None:
+        return None
+    try:
+        return _as_mapping(json.loads(body), f"cached submissions for CIK {cik}")
+    except (ValueError, FetchError) as error:
+        LOGGER.warning("[%s] ignoring an unreadable cached submissions document: %s", cik, error)
+        return None
+
+
 def _fetch_issuer(
-    issuer: Issuer, cache: RawCache, client: SecClient, *, refresh: bool
+    issuer: Issuer,
+    cache: RawCache,
+    client: SecClient,
+    *,
+    refresh: bool,
+    incremental: bool,
 ) -> IssuerFetchReport:
-    """Fetch one issuer; never raises, records failures in the returned report."""
+    """Fetch one issuer; never raises, records failures in the returned report.
+
+    With ``incremental`` true the submissions document is always fetched, even
+    when ``refresh`` is false, because it is the change probe (decision A-34).
+    An unchanged issuer stops there with ``unchanged`` set; for a changed issuer
+    ``refresh`` governs the pages and the companyfacts document exactly as in a
+    full run.
+    """
     report = IssuerFetchReport(cik=issuer.cik or "", ticker=issuer.ticker)
     if issuer.cik is None:
         report.errors.append("issuer has no CIK; resolve the universe first")
         return report
     cik = issuer.cik
     try:
+        cached_main = _cached_submissions(cache, cik) if incremental else None
         main = _document(
-            cache, client, report, "submissions", cik, None, submissions_url(cik), refresh=refresh
+            cache,
+            client,
+            report,
+            "submissions",
+            cik,
+            None,
+            submissions_url(cik),
+            refresh=refresh or incremental,
         )
+        if incremental:
+            try:
+                unchanged = submissions_unchanged(cached_main, main)
+            except ValueError as error:
+                raise FetchError(f"submissions for CIK {cik}: {error}") from error
+            if unchanged:
+                report.unchanged = True
+                return report
         filings = main.get("filings")
         page_specs = filings.get("files", []) if isinstance(filings, Mapping) else []
         if not isinstance(page_specs, list):
@@ -315,6 +376,78 @@ def _fetch_issuer(
     return report
 
 
+_EARLIEST = datetime(1, 1, 1, tzinfo=UTC)
+
+
+def _acceptance_ts(value: Any) -> datetime | None:
+    """Return an ``acceptanceDateTime`` value as an aware UTC datetime, or ``None``.
+
+    The API value is diagnostic only for point-in-time work (decision A-1), but
+    here it orders filings inside one submissions document. A missing, empty or
+    unparseable value becomes ``None`` so the caller falls back to the
+    document's own order.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _change_key(document: Mapping[str, Any]) -> tuple[str | None, int] | None:
+    """Return ``(newest accession, total filing count)`` of a submissions document.
+
+    ``filings.recent`` is the API's column-oriented object: ``accessionNumber``
+    and ``acceptanceDateTime`` are parallel arrays, one entry per filing. The
+    newest accession is the accession whose acceptance time is greatest; rows
+    without a usable acceptance time sort below every row that has one, and ties
+    keep the first row in ``recent`` order, which is SEC's newest-first order.
+    The count is the number of ``recent`` rows plus every page's ``filingCount``
+    from ``filings.files``, so a page appearing or growing is visible without
+    fetching it. Returns ``None`` when the document cannot be read that way (no
+    ``accessionNumber`` array, arrays of unequal length, a non-string accession,
+    a page entry without a non-negative integer ``filingCount``); the caller
+    then cannot prove the issuer unchanged and fetches it in full. Raises
+    :class:`ValueError` when the document has no ``filings`` object or no
+    ``recent`` object, which no submissions response may be.
+    """
+    filings = document.get("filings")
+    if not isinstance(filings, Mapping):
+        raise ValueError("submissions document has no 'filings' object")
+    recent = filings.get("recent")
+    if not isinstance(recent, Mapping):
+        raise ValueError("submissions document has no 'filings.recent' object")
+    accessions = recent.get("accessionNumber")
+    acceptances = recent.get("acceptanceDateTime", [])
+    if not isinstance(accessions, list) or not isinstance(acceptances, list):
+        return None
+    if len(accessions) != len(acceptances):
+        return None
+    times = [_acceptance_ts(value) for value in acceptances]
+    newest: tuple[tuple[bool, datetime, int], str] | None = None
+    for index, accession in enumerate(accessions):
+        if not isinstance(accession, str) or not accession:
+            return None
+        when = times[index]
+        order = (when is not None, when if when is not None else _EARLIEST, -index)
+        if newest is None or order > newest[0]:
+            newest = (order, accession)
+    pages = filings.get("files", [])
+    if not isinstance(pages, list):
+        return None
+    count = len(accessions)
+    for page in pages:
+        if not isinstance(page, Mapping):
+            return None
+        page_count = page.get("filingCount")
+        if isinstance(page_count, bool) or not isinstance(page_count, int) or page_count < 0:
+            return None
+        count += page_count
+    return (newest[1] if newest is not None else None, count)
+
+
 def submissions_unchanged(cached: Mapping[str, Any] | None, fresh: Mapping[str, Any]) -> bool:
     """Whether a freshly fetched submissions document shows no new filings.
 
@@ -324,12 +457,24 @@ def submissions_unchanged(cached: Mapping[str, Any] | None, fresh: Mapping[str, 
     count of the two documents agree (decision A-34): ``data.sec.gov`` sends no
     ``ETag`` or ``Last-Modified``, so the document itself is the only signal, and
     a new filing always changes the newest accession or the count. A ``None``
-    cache is never unchanged. Raises :class:`ValueError` when either document
-    has no ``filings`` object with a ``recent`` list.
+    cache is never unchanged.
 
-    Returns ``True`` when the issuer can be skipped for this run.
+    Returns ``True`` when the issuer can be skipped for this run. The answer is
+    deliberately conservative: anything that cannot be read (see
+    :func:`_change_key`) or a cached document without a usable ``filings``
+    object counts as changed, so the issuer is fetched in full and a fresh copy
+    replaces the unusable one. Raises :class:`ValueError` when ``fresh`` has no
+    ``filings`` object with a ``recent`` object, because a run cannot proceed on
+    such a document.
     """
-    raise NotImplementedError("incremental fetch (decision A-34) lands with its own issue")
+    fresh_key = _change_key(fresh)
+    if cached is None or fresh_key is None:
+        return False
+    try:
+        cached_key = _change_key(cached)
+    except ValueError:
+        return False
+    return cached_key == fresh_key
 
 
 def fetch_universe(
@@ -351,29 +496,48 @@ def fetch_universe(
     whose ``ok`` is false when any issuer failed with a non-404 error; a header
     404 is counted but not fatal. Never raises for an issuer-level failure.
 
-    With ``incremental`` true an issuer whose submissions document is unchanged
-    would skip its pages, companyfacts and headers and be counted in
-    ``FetchReport.skipped_unchanged`` (decision A-34). That mode is not
-    implemented yet: passing ``incremental=True`` raises
-    :class:`NotImplementedError` rather than silently refetching everything.
+    With ``incremental`` true each issuer costs exactly one submissions request:
+    when that document equals the newest cached one (newest accession and filing
+    count, :func:`submissions_unchanged`) the issuer's pages, companyfacts and
+    headers are skipped, ``IssuerFetchReport.unchanged`` is set and
+    ``FetchReport.skipped_unchanged`` counts it (decision A-34). The probed
+    submissions body is stored under a new ``fetched_at`` because the injected
+    client writes every 200 response and it is the evidence for the comparison;
+    no page, companyfacts or header file is written for a skipped issuer. A
+    changed or uncached issuer takes the normal full path, and ``refresh`` still
+    decides whether its documents are re-fetched or reused from the cache.
+
+    The trade-off (decision A-34): a late XBRL correction inside companyfacts
+    that adds no filing and changes no filing count is invisible to the probe,
+    so an issuer may be skipped until the next run with ``incremental`` false.
+    No ``full_refresh_every`` counter exists because it would need state outside
+    the raw cache to count runs, which the CLI does not keep and a fresh process
+    could not read; a scheduled non-incremental run (``refresh=True``, the
+    default) already re-fetches every document and is the documented remedy.
     """
-    if incremental:
-        raise NotImplementedError(
-            "incremental fetch (decision A-34) lands with its own issue; "
-            "call fetch_universe with incremental=False"
-        )
     start = time.monotonic()
     cache = RawCache(out_dir)
     report = FetchReport()
     for issuer in issuers:
-        issuer_report = _fetch_issuer(issuer, cache, client, refresh=refresh)
+        issuer_report = _fetch_issuer(
+            issuer, cache, client, refresh=refresh, incremental=incremental
+        )
         report.issuers.append(issuer_report)
+        if issuer_report.unchanged:
+            report.skipped_unchanged += 1
         if issuer_report.errors:
             LOGGER.error(
                 "[%s] %s: %s",
                 issuer_report.cik or "-",
                 issuer.ticker,
                 "; ".join(issuer_report.errors),
+            )
+        elif issuer_report.unchanged:
+            LOGGER.info(
+                "[%s] %s: unchanged, %d request",
+                issuer_report.cik or "-",
+                issuer.ticker,
+                issuer_report.requests,
             )
         else:
             LOGGER.info(
@@ -388,5 +552,11 @@ def fetch_universe(
                 issuer_report.headers_not_found,
                 issuer_report.requests,
             )
+    if incremental:
+        LOGGER.info(
+            "incremental fetch: skipped %d of %d issuers unchanged",
+            report.skipped_unchanged,
+            len(report.issuers),
+        )
     report.elapsed_seconds = time.monotonic() - start
     return report
