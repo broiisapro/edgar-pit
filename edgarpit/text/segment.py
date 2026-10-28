@@ -14,10 +14,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-#: Section name of a document that could not be split confidently. It is the
-#: same value as :data:`edgarpit.schemas.UNSEGMENTED`, which the staging schema
-#: accepts.
-UNSEGMENTED = "unsegmented"
+from edgarpit.schemas import UNSEGMENTED
 
 # An item heading is the word ``Item`` (any case) at the start of a line, after
 # optional indentation, whitespace, a dotted EDGAR item code (the shape the
@@ -71,7 +68,7 @@ def segment_items(text: str, expected_items: Sequence[str]) -> list[Section]:
     Reconstruction rule: the sections' whitespace-separated tokens, in section
     order, are exactly ``text.split()``; for input whose lines carry no leading
     or trailing whitespace and that has no blank lines — the shape of a filing
-    body with one paragraph per line — ``"\\n".join(s.text for s in sections)``
+    body with one paragraph per line — ``"\\n".join(section.text for section in sections)``
     equals ``text.strip()`` character for character. Blank lines and indentation
     between a section's last line and the next heading are layout and are
     collapsed by the strip; no non-whitespace character is dropped.
