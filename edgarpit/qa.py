@@ -27,35 +27,59 @@ returns a :class:`QaReport`:
   ``ratios_pit`` row, counted by reason (mixed currency, zero denominator,
   ``OTHER`` period, missing input) with the first ten examples;
 - conflicting values within one accession (decision A-7);
-- key uniqueness of every contract table (and ``raw.filings``); any violation
+- key uniqueness of every contract table (and the raw tables); any violation
   makes :attr:`QaReport.ok` false. The report is read-only: nothing is written.
 
+The Phase 2 sections (decisions A-32, A-38, A-39 and A-40) cover the tables
+``raw.fx_daily``, ``main.fundamentals_pit_usd`` and ``raw.filings_text``. They
+are computed only when their table exists: a database built before those tables
+existed reports each section as "not built" in :func:`format_phase2` and never
+raises. An ``asof_ts`` in ``main.fundamentals_pit_usd`` earlier than the
+acceptance time or the FX known time behind it is a point-in-time key violation
+and makes :attr:`QaReport.ok` false, like a duplicated contract key.
+
 Timestamps are UTC; the connection's session timezone is set to UTC (decision
-A-5). A missing table is a query error, not a report entry.
+A-5). A missing table of the Phase 1 contract is a query error, not a report
+entry.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from typing import Any
 
 import duckdb
 
 # (table, key columns) checked for uniqueness; key columns are trusted
-# identifiers from the frozen contracts, never user input.
+# identifiers from the frozen contracts, never user input. The two Phase 2 raw
+# tables are skipped when the database predates them.
 KEY_CHECKS: tuple[tuple[str, str], ...] = (
     ("main.fundamentals_pit", "cik, field, period_start, period_end, accession"),
     ("main.ratios_pit", "cik, ratio, period_start, period_end, asof_ts"),
     ("main.events_8k", "accession, item_code"),
     ("main.filings", "accession"),
     ("raw.filings", "accession"),
+    ("raw.filings_text", "accession, document, section, section_order"),
+    ("raw.fx_daily", "series, rate_date"),
 )
 
 _ANOMALY_LIMIT = 10
 
 # New York date the 8-K item codes were expanded; earlier codes are unreliable.
 LEGACY_ITEMS_BEFORE = "2004-08-23"
+
+# The Bank of Canada Valet FXUSDCAD series starts on 2017-01-03 (decision
+# A-39); a CAD period ending on or after that date must find a rate when the FX
+# table is current.
+FX_FIRST_DATE = date(2017, 1, 3)
+
+# A rate more than five business days before the newest acceptance time is
+# stale (decision A-32: rates are business daily).
+FX_STALE_BUSINESS_DAYS = 5
+
+ITEM_2_02 = "2.02"
 
 # Why a period with an input produced no ``ratios_pit`` row; ``no candidate``
 # means both inputs are present with one non-null currency and a non-zero
@@ -75,6 +99,75 @@ def _scalar(con: duckdb.DuckDBPyConnection, sql: str) -> Any:
     if row is None:  # pragma: no cover - aggregate queries always return a row
         raise RuntimeError(f"query returned no row: {sql}")
     return row[0]
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, schema: str, table: str) -> bool:
+    """True when ``schema.table`` exists as a table or a view.
+
+    Phase 2 sections are optional, so the report asks before it queries. dbt
+    materializes ``main`` models as views, hence the check reads
+    ``information_schema.tables`` (which lists views) rather than
+    ``duckdb_tables()``.
+    """
+    row = con.execute(
+        """
+        SELECT count(*)
+        FROM information_schema.tables
+        WHERE table_schema = ? AND table_name = ?
+        """,
+        [schema, table],
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _column_exists(con: duckdb.DuckDBPyConnection, schema: str, table: str, column: str) -> bool:
+    """True when ``schema.table`` exists and has ``column``."""
+    row = con.execute(
+        """
+        SELECT count(*)
+        FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = ? AND column_name = ?
+        """,
+        [schema, table, column],
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _business_days_between(earlier: date, later: date) -> int:
+    """Number of Monday-Friday dates after ``earlier`` and on or before ``later``.
+
+    Public holidays are not modelled: the count is calendar weekdays, which can
+    only overstate a gap, so a staleness alarm fires no later than it should.
+    """
+    days = (later - earlier).days
+    if days <= 0:
+        return 0
+    weeks, remainder = divmod(days, 7)
+    start = earlier + timedelta(days=weeks * 7)
+    return weeks * 5 + sum(
+        1 for offset in range(1, remainder + 1) if (start + timedelta(days=offset)).weekday() < 5
+    )
+
+
+def _iso_date(value: date | None) -> str:
+    """``value`` as ISO-8601, or ``'-'`` when null."""
+    return "-" if value is None else value.isoformat()
+
+
+def _iso_ts(value: datetime) -> str:
+    """Format an aware UTC timestamp as ISO-8601 with a ``Z`` suffix."""
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _days(count: int) -> str:
+    """``count`` with a singular or plural ``day``."""
+    return f"{count} day" if count == 1 else f"{count} days"
+
+
+def _period_label(period_start: date | None, period_end: date) -> str:
+    """``start..end`` with ``instant`` for a null start, as the CLI prints it."""
+    start = _iso_date(period_start) if period_start is not None else "instant"
+    return f"{start}..{period_end.isoformat()}"
 
 
 @dataclass(frozen=True)
@@ -231,9 +324,163 @@ class KeyViolation:
     duplicates: int
 
 
+@dataclass(frozen=True)
+class FxSeriesCoverage:
+    """Coverage of one ``raw.fx_daily`` series.
+
+    ``first_date``/``last_date`` bound the observation dates, ``rows`` counts
+    stored rows (not distinct dates), and the largest gap is the widest interval
+    between two consecutive observation dates, in calendar and Monday-Friday
+    business days. ``business_days_since_last`` counts business days after
+    ``last_date`` up to the UTC date of ``latest_acceptance_ts`` (the newest
+    ``raw.filings.acceptance_ts``); ``stale`` is true when that count exceeds
+    five, or when there is no observation at all and filings exist.
+    """
+
+    series: str
+    rows: int
+    first_date: date | None
+    last_date: date | None
+    largest_gap_calendar_days: int | None
+    largest_gap_business_days: int | None
+    latest_acceptance_ts: datetime | None
+    business_days_since_last: int | None
+    stale: bool
+
+
+@dataclass(frozen=True)
+class FxCoverage:
+    """The ``raw.fx_daily`` section; ``built`` is false when the table is absent.
+
+    ``latest_acceptance_ts`` is the newest ``raw.filings`` acceptance time used
+    as the staleness reference. ``stale`` is true when any series is stale, and
+    when the table exists, has no observation at all, and filings exist.
+    """
+
+    built: bool = False
+    latest_acceptance_ts: datetime | None = None
+    by_series: list[FxSeriesCoverage] = field(default_factory=list)
+
+    @property
+    def stale(self) -> bool:
+        """True when a series is more than five business days behind."""
+        if not self.built:
+            return False
+        if not self.by_series:
+            return self.latest_acceptance_ts is not None
+        return any(series.stale for series in self.by_series)
+
+
+@dataclass(frozen=True)
+class ConversionCount:
+    """``main.fundamentals_pit_usd`` rows sharing a conversion status and currency.
+
+    ``converted`` is the row's flag; ``unconverted_reason`` is
+    ``no_rate``/``currency_out_of_scope`` for an unconverted row, null for a
+    converted one (and for every row of a database whose model predates the
+    column); ``currency`` is the row's source currency, null when it has none.
+    """
+
+    converted: bool
+    unconverted_reason: str | None
+    currency: str | None
+    count: int
+
+
+@dataclass(frozen=True)
+class NoRateIssuer:
+    """An issuer with ``no_rate`` rows whose period ends on or after 2017-01-03."""
+
+    cik: str
+    ticker: str | None
+    rows: int
+
+
+@dataclass(frozen=True)
+class AsOfViolation:
+    """A converted row whose ``asof_ts`` precedes when it could be known.
+
+    Either ``asof_ts < acceptance_ts`` or ``asof_ts < fx_known_at`` (decision
+    A-32), which lets a value appear before its filing or its exchange rate.
+    """
+
+    cik: str
+    field: str
+    period_start: date | None
+    period_end: date
+    accession: str
+    acceptance_ts: datetime
+    fx_known_at: datetime | None
+    asof_ts: datetime
+
+
+@dataclass(frozen=True)
+class UsdConversion:
+    """The ``main.fundamentals_pit_usd`` section.
+
+    ``counts`` groups every row by conversion status and currency;
+    ``no_rate_issuers`` lists issuers whose CAD period ends on or after
+    2017-01-03 without a rate (those must be zero while FX is current);
+    ``asof_violations`` are point-in-time key violations, counted by
+    ``asof_violation_count`` and capped in the detail list. ``built`` is false
+    when the model does not exist.
+    """
+
+    built: bool = False
+    counts: list[ConversionCount] = field(default_factory=list)
+    no_rate_rows: int = 0
+    no_rate_issuers: list[NoRateIssuer] = field(default_factory=list)
+    asof_violation_count: int = 0
+    asof_violations: list[AsOfViolation] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MissingTextIssuer:
+    """An issuer with Item 2.02 8-Ks that have no ``raw.filings_text`` rows."""
+
+    cik: str
+    ticker: str | None
+    filings: int
+
+
+@dataclass(frozen=True)
+class TextCoverage:
+    """The ``raw.filings_text`` section (decision A-40).
+
+    ``item_202_filings`` counts distinct ``raw.events_8k`` accessions carrying
+    item 2.02; ``item_202_without_text`` those with no text row at all, and
+    ``issuers_without_text`` the top issuers by that count. ``primary_documents``
+    and ``unsegmented_primaries`` count distinct primary documents (a whole
+    document fell back to ``section='unsegmented'``); ``unsegmented_share`` is
+    their ratio. ``zero_length_sections`` counts rows whose text or
+    ``char_count`` is empty; ``duplicate_sha256_accessions`` counts text hashes
+    shared by more than one accession (press releases can legitimately repeat).
+    """
+
+    built: bool = False
+    item_202_filings: int = 0
+    item_202_without_text: int = 0
+    issuers_without_text: list[MissingTextIssuer] = field(default_factory=list)
+    primary_documents: int = 0
+    unsegmented_primaries: int = 0
+    zero_length_sections: int = 0
+    duplicate_sha256_accessions: int = 0
+
+    @property
+    def unsegmented_share(self) -> float | None:
+        """Share of primary documents that are one ``unsegmented`` row, or null."""
+        if not self.primary_documents:
+            return None
+        return self.unsegmented_primaries / self.primary_documents
+
+
 @dataclass
 class QaReport:
-    """Everything :func:`run_qa` found; ``ok`` is false on any key violation."""
+    """Everything :func:`run_qa` found; ``ok`` is false on any key violation.
+
+    A point-in-time key violation (``asof_ts`` before ``acceptance_ts`` or
+    ``fx_known_at``) counts like a duplicated key.
+    """
 
     canonical_fields: int = 0
     universe_issuers: int = 0
@@ -254,12 +501,20 @@ class QaReport:
     ratio_gap_counts: dict[str, int] = field(default_factory=dict)
     ratio_gaps: list[RatioGap] = field(default_factory=list)
     conflicting_values: list[ConflictingValue] = field(default_factory=list)
+    fx_coverage: FxCoverage = field(default_factory=FxCoverage)
+    usd_conversion: UsdConversion = field(default_factory=UsdConversion)
+    text_coverage: TextCoverage = field(default_factory=TextCoverage)
     key_violations: list[KeyViolation] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """True when every contract table key is unique."""
-        return not self.key_violations
+        """True when every contract key is unique and no ``asof_ts`` leak exists.
+
+        Duplicated keys and ``main.fundamentals_pit_usd`` rows whose ``asof_ts``
+        precedes their acceptance time or FX known time both make a point-in-time
+        table unusable, so either is a non-zero exit.
+        """
+        return not self.key_violations and not self.usd_conversion.asof_violation_count
 
 
 def _coverage(con: duckdb.DuckDBPyConnection) -> tuple[list[IssuerCoverage], int]:
@@ -723,9 +978,281 @@ def _conflicts(con: duckdb.DuckDBPyConnection) -> list[ConflictingValue]:
     ]
 
 
+def _fx_coverage(con: duckdb.DuckDBPyConnection) -> FxCoverage:
+    """``raw.fx_daily`` range, gaps and staleness against the newest acceptance.
+
+    The staleness reference is the UTC date of the latest
+    ``raw.filings.acceptance_ts``: a series ending well before the newest filing
+    has no observation near that filing's period end. Business days are
+    Monday-Friday (no holiday calendar), so the count never understates a gap.
+    """
+    if not _table_exists(con, "raw", "fx_daily"):
+        return FxCoverage()
+    latest_row = con.execute("SELECT max(acceptance_ts) FROM raw.filings").fetchone()
+    latest: datetime | None = latest_row[0] if latest_row else None
+    reference = None if latest is None else latest.astimezone(UTC).date()
+    row_counts = {
+        row[0]: int(row[1])
+        for row in con.execute(
+            "SELECT series, count(*) FROM raw.fx_daily GROUP BY series ORDER BY series"
+        ).fetchall()
+    }
+    dates: dict[str, list[date]] = {}
+    for series, rate_date in con.execute(
+        "SELECT DISTINCT series, rate_date FROM raw.fx_daily ORDER BY series, rate_date"
+    ).fetchall():
+        dates.setdefault(series, []).append(rate_date)
+    by_series: list[FxSeriesCoverage] = []
+    for series, row_count in row_counts.items():
+        observed = dates.get(series, [])
+        first = observed[0] if observed else None
+        last = observed[-1] if observed else None
+        largest_calendar: int | None = None
+        largest_business: int | None = None
+        for previous, current in pairwise(observed):
+            calendar_gap = (current - previous).days
+            business_gap = _business_days_between(previous, current)
+            largest_calendar = (
+                calendar_gap if largest_calendar is None else max(largest_calendar, calendar_gap)
+            )
+            largest_business = (
+                business_gap if largest_business is None else max(largest_business, business_gap)
+            )
+        since_last = (
+            None if reference is None or last is None else _business_days_between(last, reference)
+        )
+        by_series.append(
+            FxSeriesCoverage(
+                series=series,
+                rows=row_count,
+                first_date=first,
+                last_date=last,
+                largest_gap_calendar_days=largest_calendar,
+                largest_gap_business_days=largest_business,
+                latest_acceptance_ts=latest,
+                business_days_since_last=since_last,
+                stale=reference is not None
+                and (since_last is None or since_last > FX_STALE_BUSINESS_DAYS),
+            )
+        )
+    return FxCoverage(built=True, latest_acceptance_ts=latest, by_series=by_series)
+
+
+def _usd_conversion(con: duckdb.DuckDBPyConnection) -> UsdConversion:
+    """Conversion coverage and ``asof_ts`` leaks of ``main.fundamentals_pit_usd``.
+
+    Rows are grouped by ``(converted, unconverted_reason, currency)``. The
+    reason column is read only when the model has it: a database whose model
+    predates decision A-38 keeps its ``converted`` flag and reports every
+    unconverted row with a null reason instead of failing. ``no_rate`` rows are
+    listed per issuer only from ``FX_FIRST_DATE`` on, because a period end
+    before the first observation cannot have a rate (decision A-39). A row whose
+    ``asof_ts`` precedes ``acceptance_ts`` or ``fx_known_at`` is a key violation.
+    """
+    if not _table_exists(con, "main", "fundamentals_pit_usd"):
+        return UsdConversion()
+    reason = "unconverted_reason"
+    if not _column_exists(con, "main", "fundamentals_pit_usd", "unconverted_reason"):
+        reason = "CAST(NULL AS VARCHAR)"
+    counts = [
+        ConversionCount(
+            converted=bool(row[0]),
+            unconverted_reason=row[1],
+            currency=row[2],
+            count=int(row[3]),
+        )
+        for row in con.execute(
+            f"""
+            SELECT converted, {reason} AS unconverted_reason, currency, count(*)
+            FROM main.fundamentals_pit_usd
+            GROUP BY converted, unconverted_reason, currency
+            ORDER BY converted DESC, unconverted_reason, currency
+            """
+        ).fetchall()
+    ]
+    no_rate_issuers = [
+        NoRateIssuer(cik=row[0], ticker=row[1], rows=int(row[2]))
+        for row in con.execute(
+            f"""
+            SELECT cik, any_value(ticker), count(*)
+            FROM main.fundamentals_pit_usd
+            WHERE NOT converted
+              AND {reason} = 'no_rate'
+              AND period_end >= DATE '{FX_FIRST_DATE.isoformat()}'
+            GROUP BY cik
+            ORDER BY cik
+            """
+        ).fetchall()
+    ]
+    asof_violation_count = int(
+        _scalar(
+            con,
+            """
+            SELECT count(*)
+            FROM main.fundamentals_pit_usd
+            WHERE asof_ts < acceptance_ts
+               OR (fx_known_at IS NOT NULL AND asof_ts < fx_known_at)
+            """,
+        )
+    )
+    asof_violations = [
+        AsOfViolation(
+            cik=row[0],
+            field=row[1],
+            period_start=row[2],
+            period_end=row[3],
+            accession=row[4],
+            acceptance_ts=row[5],
+            fx_known_at=row[6],
+            asof_ts=row[7],
+        )
+        for row in con.execute(
+            f"""
+            SELECT cik, field, period_start, period_end, accession,
+                   acceptance_ts, fx_known_at, asof_ts
+            FROM main.fundamentals_pit_usd
+            WHERE asof_ts < acceptance_ts
+               OR (fx_known_at IS NOT NULL AND asof_ts < fx_known_at)
+            ORDER BY cik, field, period_end, accession, asof_ts
+            LIMIT {_ANOMALY_LIMIT}
+            """
+        ).fetchall()
+    ]
+    return UsdConversion(
+        built=True,
+        counts=counts,
+        no_rate_rows=sum(issuer.rows for issuer in no_rate_issuers),
+        no_rate_issuers=no_rate_issuers,
+        asof_violation_count=asof_violation_count,
+        asof_violations=asof_violations,
+    )
+
+
+def _text_coverage(con: duckdb.DuckDBPyConnection) -> TextCoverage:
+    """Item 2.02 coverage, segmentation and text duplications in ``raw.filings_text``.
+
+    A filing counts as covered when it has any ``raw.filings_text`` row; a
+    primary document counts as unsegmented when it produced a single
+    ``section='unsegmented'`` row (decision A-40). Empty text or an empty
+    ``char_count`` is a zero-length section. A hash shared by more than one
+    accession is counted but is not a failure: press releases repeat text.
+    """
+    if not _table_exists(con, "raw", "filings_text"):
+        return TextCoverage()
+    item_filings = int(
+        _scalar(
+            con,
+            f"SELECT count(DISTINCT accession) FROM raw.events_8k WHERE item_code = '{ITEM_2_02}'",
+        )
+    )
+    missing_rows = con.execute(
+        f"""
+        WITH items AS (
+            SELECT DISTINCT accession, cik
+            FROM raw.events_8k
+            WHERE item_code = '{ITEM_2_02}'
+        )
+        SELECT items.cik, universe.ticker, count(*)
+        FROM items
+        LEFT JOIN raw.universe AS universe ON universe.cik = items.cik
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM raw.filings_text AS text
+            WHERE text.accession = items.accession
+        )
+        GROUP BY items.cik, universe.ticker
+        ORDER BY count(*) DESC, items.cik
+        LIMIT {_ANOMALY_LIMIT}
+        """
+    ).fetchall()
+    missing_total = int(
+        _scalar(
+            con,
+            f"""
+            SELECT count(*)
+            FROM (
+                SELECT DISTINCT accession
+                FROM raw.events_8k
+                WHERE item_code = '{ITEM_2_02}'
+            ) AS items
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM raw.filings_text AS text
+                WHERE text.accession = items.accession
+            )
+            """,
+        )
+    )
+    primary_documents = int(
+        _scalar(
+            con,
+            """
+            SELECT count(*)
+            FROM (
+                SELECT DISTINCT accession, document
+                FROM raw.filings_text
+                WHERE doc_type = 'primary'
+            )
+            """,
+        )
+    )
+    unsegmented_primaries = int(
+        _scalar(
+            con,
+            """
+            SELECT count(*)
+            FROM (
+                SELECT DISTINCT accession, document
+                FROM raw.filings_text
+                WHERE doc_type = 'primary' AND section = 'unsegmented'
+            )
+            """,
+        )
+    )
+    return TextCoverage(
+        built=True,
+        item_202_filings=item_filings,
+        item_202_without_text=missing_total,
+        issuers_without_text=[
+            MissingTextIssuer(cik=row[0], ticker=row[1], filings=int(row[2]))
+            for row in missing_rows
+        ],
+        primary_documents=primary_documents,
+        unsegmented_primaries=unsegmented_primaries,
+        zero_length_sections=int(
+            _scalar(
+                con,
+                """
+                SELECT count(*)
+                FROM raw.filings_text
+                WHERE char_count = 0 OR length(text) = 0
+                """,
+            )
+        ),
+        duplicate_sha256_accessions=int(
+            _scalar(
+                con,
+                """
+                SELECT count(*)
+                FROM (
+                    SELECT sha256
+                    FROM raw.filings_text
+                    GROUP BY sha256
+                    HAVING count(DISTINCT accession) > 1
+                )
+                """,
+            )
+        ),
+    )
+
+
 def _key_violations(con: duckdb.DuckDBPyConnection) -> list[KeyViolation]:
+    """Duplicate rows per contract key; tables a database predates are skipped."""
     violations: list[KeyViolation] = []
     for table, key in KEY_CHECKS:
+        schema, _, name = table.partition(".")
+        if not _table_exists(con, schema, name):
+            continue
         duplicates = int(
             _scalar(
                 con,
@@ -764,6 +1291,9 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
     headers_without_acceptance = _headers_without_acceptance(con)
     multi_currency, unexpected_units = _unit_anomalies(con)
     ratio_gap_counts, ratio_gaps = _ratio_gaps(con)
+    fx_coverage = _fx_coverage(con)
+    usd_conversion = _usd_conversion(con)
+    text_coverage = _text_coverage(con)
     return QaReport(
         canonical_fields=canonical_fields,
         universe_issuers=universe_issuers,
@@ -784,5 +1314,116 @@ def run_qa(con: duckdb.DuckDBPyConnection) -> QaReport:
         ratio_gap_counts=ratio_gap_counts,
         ratio_gaps=ratio_gaps,
         conflicting_values=_conflicts(con),
+        fx_coverage=fx_coverage,
+        usd_conversion=usd_conversion,
+        text_coverage=text_coverage,
         key_violations=_key_violations(con),
     )
+
+
+def format_phase2(report: QaReport) -> list[str]:
+    """Render the Phase 2 QA sections as CLI output lines.
+
+    ``report`` is a :class:`QaReport`; the returned strings follow the layout of
+    the existing ``edgarpit qa`` output (a section title, then two-space
+    indented entries). A section whose table does not exist renders as
+    ``not built``; no query is made while formatting, so the function is pure.
+    Timestamps render as ISO-8601 UTC, dates as ISO-8601 and the unsegmented
+    share as a percentage.
+    """
+    lines: list[str] = ["FX daily (raw.fx_daily)"]
+    fx = report.fx_coverage
+    if not fx.built:
+        lines.append("  not built")
+    elif not fx.by_series:
+        lines.append("  no observations")
+        lines.append(
+            f"  latest acceptance_ts: {_iso_ts(fx.latest_acceptance_ts)}"
+            if fx.latest_acceptance_ts is not None
+            else "  latest acceptance_ts: none"
+        )
+        lines.append("  stale: yes" if fx.stale else "  stale: no")
+    else:
+        for series in fx.by_series:
+            lines.append(
+                f"  {series.series}: {series.rows} rows, "
+                f"{_iso_date(series.first_date)}..{_iso_date(series.last_date)}"
+            )
+            if series.largest_gap_calendar_days is None:
+                lines.append("  largest gap: none")
+            else:
+                assert series.largest_gap_business_days is not None
+                lines.append(
+                    f"  largest gap: {_days(series.largest_gap_calendar_days)} calendar, "
+                    f"{_days(series.largest_gap_business_days)} business"
+                )
+            lines.append(
+                f"  latest acceptance_ts: {_iso_ts(series.latest_acceptance_ts)}"
+                if series.latest_acceptance_ts is not None
+                else "  latest acceptance_ts: none"
+            )
+            lines.append(
+                f"  business days since last rate: {series.business_days_since_last}"
+                if series.business_days_since_last is not None
+                else "  business days since last rate: -"
+            )
+            lines.append("  stale: yes" if series.stale else "  stale: no")
+
+    lines.append("USD conversion (main.fundamentals_pit_usd)")
+    usd = report.usd_conversion
+    if not usd.built:
+        lines.append("  not built")
+    else:
+        if not usd.counts:
+            lines.append("  no rows")
+        for counted in usd.counts:
+            currency = counted.currency or "-"
+            if counted.converted:
+                lines.append(f"  converted {currency}: {counted.count}")
+            else:
+                lines.append(
+                    f"  unconverted {counted.unconverted_reason or 'unknown'} "
+                    f"{currency}: {counted.count}"
+                )
+        lines.append(
+            f"No-rate rows after 2017-01-03 (must be zero while FX is current): {usd.no_rate_rows}"
+        )
+        for issuer in usd.no_rate_issuers:
+            lines.append(f"  {issuer.cik} {issuer.ticker or '-'}: {issuer.rows} rows")
+        lines.append(
+            "Asof_ts violations (asof_ts earlier than acceptance_ts or fx_known_at): "
+            f"{usd.asof_violation_count}"
+        )
+        for violation in usd.asof_violations:
+            before: list[str] = []
+            if violation.asof_ts < violation.acceptance_ts:
+                before.append(f"acceptance_ts {_iso_ts(violation.acceptance_ts)}")
+            if violation.fx_known_at is not None and violation.asof_ts < violation.fx_known_at:
+                before.append(f"fx_known_at {_iso_ts(violation.fx_known_at)}")
+            lines.append(
+                f"  {violation.cik} {violation.field} "
+                f"{_period_label(violation.period_start, violation.period_end)} "
+                f"{violation.accession}: asof_ts {_iso_ts(violation.asof_ts)} "
+                f"before {', '.join(before)}"
+            )
+
+    lines.append("8-K text (raw.filings_text)")
+    text = report.text_coverage
+    if not text.built:
+        lines.append("  not built")
+    else:
+        lines.append(
+            f"  Item 2.02 filings: {text.item_202_filings}, "
+            f"missing text: {text.item_202_without_text}"
+        )
+        for missing in text.issuers_without_text:
+            lines.append(f"  {missing.cik} {missing.ticker or '-'}: {missing.filings} filings")
+        share = text.unsegmented_share
+        share_label = "-" if share is None else f"{share:.1%}"
+        lines.append(
+            f"  primary documents: {text.primary_documents}, "
+            f"unsegmented: {text.unsegmented_primaries} ({share_label})"
+        )
+        lines.append(f"  zero-length sections: {text.zero_length_sections}")
+        lines.append(f"  duplicate sha256 across accessions: {text.duplicate_sha256_accessions}")
+    return lines

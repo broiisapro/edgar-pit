@@ -16,7 +16,7 @@ import json
 import re
 import sys
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -507,6 +507,67 @@ def test_staging_events_explode_at_least_ten_apple_8ks() -> None:
     assert len(keys) == len(set(keys))
     for row in events:
         assert row["acceptance_ts"] == read_filing_acceptance(row["accession"])
+
+
+def test_staging_filings_text_names_real_8k_filings() -> None:
+    """Every staged section belongs to a staged 8-K and carries its acceptance time."""
+    filings = {row["accession"]: row for row in read_staging_rows("filings")}
+    rows = read_staging_rows("filings_text")
+    assert rows
+    for row in rows:
+        filing = filings[row["accession"]]
+        assert filing["form"] in EVENT_FORMS, row
+        assert row["cik"] == filing["cik"]
+        assert row["acceptance_ts"] == filing["acceptance_ts"]
+        assert row["ts_imputed"] == filing["ts_imputed"]
+        assert row["doc_type"] in {"primary", "EX-99.1"}
+        assert hashlib.sha256(row["text"].encode("utf-8")).hexdigest() == row["sha256"], row
+        assert len(row["text"]) == int(row["char_count"]), row
+    keys = [
+        (row["accession"], row["document"], row["section"], row["section_order"]) for row in rows
+    ]
+    assert len(keys) == len(set(keys))
+
+
+FX_FIXTURE_DIR = FIXTURE_ROOT / "fx" / "raw" / "fx" / "_" / "FXUSDCAD"
+
+
+def bank_of_canada_rates() -> dict[str, float]:
+    """The fixture ``FXUSDCAD`` observations as ``{rate date: value}``."""
+    paths = sorted(FX_FIXTURE_DIR.glob("*.json"))
+    assert len(paths) == 1
+    document = json.loads(paths[0].read_text(encoding="utf-8"))
+    return {
+        observation["d"]: float(observation["FXUSDCAD"]["v"])
+        for observation in document["observations"]
+        if observation["FXUSDCAD"]["v"]
+    }
+
+
+def test_staging_fx_daily_is_the_bank_of_canada_series() -> None:
+    """The hand-written staging series carries real Valet values and known times.
+
+    Values are checked against the captured ``FXUSDCAD`` response, and
+    ``known_at`` must be 17:00 ``America/Toronto`` in UTC (decision A-32), which
+    is 22:00Z in winter and 21:00Z in summer. The series starts on the Bank's
+    first business-daily observation (2017-01-03, decision A-39), so a period
+    end before it has no rate.
+    """
+    toronto = ZoneInfo("America/Toronto")
+    rates = bank_of_canada_rates()
+    rows = read_staging_rows("fx_daily")
+    assert rows
+    dates = [row["rate_date"] for row in rows]
+    assert dates == sorted(set(dates)), "staging FX dates must be unique and ascending"
+    assert dates[0] == "2017-01-03"
+    for row in rows:
+        assert row["series"] == "FXUSDCAD"
+        assert row["source"] == "valet"
+        assert float(row["value"]) == rates[row["rate_date"]], row
+        expected = datetime.combine(
+            date.fromisoformat(row["rate_date"]), time(17, 0), tzinfo=toronto
+        ).astimezone(UTC)
+        assert row["known_at"] == expected.strftime("%Y-%m-%dT%H:%M:%SZ"), row
 
 
 def read_filing_acceptance(accession: str) -> str:

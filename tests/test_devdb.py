@@ -62,12 +62,14 @@ def test_empty_staging_leaves_empty_tables(tmp_path: Path) -> None:
         "filings",
         "events_8k",
         "facts_raw",
+        "filings_text",
+        "fx_daily",
         "concept_map",
         "universe",
     }
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        for table in ("filings", "events_8k", "facts_raw"):
+        for table in ("filings", "events_8k", "facts_raw", "filings_text", "fx_daily"):
             assert con.execute(f"SELECT count(*) FROM raw.{table}").fetchone() == (0,)
         assert con.execute("SELECT count(*) FROM raw.concept_map").fetchone() != (0,)
         assert con.execute("SELECT count(*) FROM raw.universe").fetchone() == (40,)
@@ -101,6 +103,44 @@ def test_populated_staging_loads_validated_rows(tmp_path: Path) -> None:
             "SELECT item_label FROM raw.events_8k WHERE item_code = '2.02'"
         ).fetchone()
         assert label == ("Results of Operations and Financial Condition",)
+    finally:
+        con.close()
+
+
+def test_populated_staging_round_trips_filings_text_and_fx(tmp_path: Path) -> None:
+    db_path = create_dev_db(tmp_path / "out")
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        assert con.execute("SELECT count(*) FROM raw.filings_text").fetchone() == (3,)
+        assert con.execute("SELECT count(*) FROM raw.fx_daily").fetchone() == (10,)
+
+        section = con.execute(
+            "SELECT cik, acceptance_ts, doc_type, section, section_order, char_count "
+            "FROM raw.filings_text WHERE doc_type = 'primary' AND section = '2.02'"
+        ).fetchone()
+        assert section == (
+            "0000320193",
+            datetime(2025, 7, 31, 20, 30, 25, tzinfo=UTC),
+            "primary",
+            "2.02",
+            1,
+            len(
+                "Item 2.02 Results of Operations and Financial Condition\n\n"
+                "On July 31, 2025, Apple Inc. issued a press release announcing its financial "
+                "results for the fiscal quarter ended June 28, 2025."
+            ),
+        )
+
+        # A January rate is published at 17:00 EST, 22:00Z; October is EDT.
+        assert con.execute(
+            "SELECT rate_date, value, known_at FROM raw.fx_daily "
+            "WHERE rate_date = date '2017-01-03'"
+        ).fetchone() == (date(2017, 1, 3), 1.3435, datetime(2017, 1, 3, 22, 0, tzinfo=UTC))
+        assert con.execute(
+            "SELECT known_at FROM raw.fx_daily WHERE rate_date = date '2023-10-31'"
+        ).fetchone() == (datetime(2023, 10, 31, 21, 0, tzinfo=UTC),)
     finally:
         con.close()
 

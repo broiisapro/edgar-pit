@@ -1,12 +1,13 @@
 """Build the foundation development database with the frozen ``raw`` tables.
 
 Until the ingest pipeline exists (Epic 01), dbt and query development runs
-against ``<out_dir>/edgarpit.duckdb``, filled from staging CSVs in
-``tests/fixtures/staging`` when they are present and left empty otherwise.
-Every CSV is validated with the Pandera schema of its table before it is
-loaded, the ``raw.concept_map`` and ``raw.universe`` reference tables are
-always loaded from ``config/``, and every connection sets the session
-timezone to UTC (decision A-5).
+against ``<out_dir>/edgarpit.duckdb``, filled from the staging CSVs in
+``tests/fixtures/staging`` for the five contract tables (``filings``,
+``events_8k``, ``facts_raw``, ``filings_text`` and ``fx_daily``) when they are
+present and left empty otherwise. Every CSV is validated with the Pandera
+schema of its table before it is loaded, the ``raw.concept_map`` and
+``raw.universe`` reference tables are always loaded from ``config/``, and every
+connection sets the session timezone to UTC (decision A-5).
 """
 
 from __future__ import annotations
@@ -42,9 +43,9 @@ def _read_staging_csv(table: str, path: Path) -> pl.DataFrame:
 def create_dev_db(out_dir: Path, staging_dir: Path | None = None) -> Path:
     """Recreate ``<out_dir>/edgarpit.duckdb`` with the ``raw`` tables.
 
-    Each ``<table>.csv`` found in ``staging_dir`` (default
-    ``tests/fixtures/staging``) is validated with its Pandera schema, then
-    loaded; tables without a CSV stay empty. ``raw.concept_map`` and
+    Each ``<table>.csv`` of the five contract tables found in ``staging_dir``
+    (default ``tests/fixtures/staging``) is validated with its Pandera schema,
+    then loaded; tables without a CSV stay empty. ``raw.concept_map`` and
     ``raw.universe`` are always loaded from ``config/``. Per-table row counts
     are printed and the database path is returned.
     """

@@ -28,9 +28,11 @@ from edgarpit.sec_client import (
     _retry_wait,
     classify,
     company_tickers_url,
+    companyconcept_url,
     companyfacts_url,
     document_url,
     filing_index_url,
+    frames_url,
     header_url,
     submissions_page_url,
     submissions_url,
@@ -503,6 +505,60 @@ def test_filing_index_and_fx_are_cached_in_their_slots(tmp_path: Path) -> None:
     assert stored is not None
     assert json.loads(stored) == {"observations": []}
     assert cache.latest("fx", "_", "FXUSDCAD") == stored
+    assert cache.verify().ok
+
+
+def test_frames_url_and_classification() -> None:
+    url = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
+    assert url == "https://data.sec.gov/api/xbrl/frames/dei/EntityPublicFloat/USD/CY2026Q3I.json"
+    assert classify(url) == ("frames", "", "dei__EntityPublicFloat__USD__CY2026Q3I")
+    assert classify(frames_url("us-gaap", "Assets", "USD-per-shares", "CY2025Q4I")) == (
+        "frames",
+        "",
+        "us-gaap__Assets__USD-per-shares__CY2025Q4I",
+    )
+    with pytest.raises(ValueError, match="invalid XBRL unit"):
+        frames_url("dei", "EntityPublicFloat", "", "CY2026Q3I")
+    with pytest.raises(ValueError, match="invalid XBRL taxonomy"):
+        frames_url("..", "Assets", "USD", "CY2026Q3I")
+    with pytest.raises(ValueError, match="invalid XBRL tag"):
+        frames_url("dei", "Entity__PublicFloat", "USD", "CY2026Q3I")
+
+
+def test_companyconcept_url_and_classification() -> None:
+    url = companyconcept_url("1000275", "ifrs-full", "Assets")
+    assert url == (
+        "https://data.sec.gov/api/xbrl/companyconcept/CIK0001000275/ifrs-full/Assets.json"
+    )
+    assert classify(url) == ("companyconcept", "0001000275", "ifrs-full__Assets")
+    with pytest.raises(ValueError, match="CIK must be digits"):
+        companyconcept_url("not-a-cik", "us-gaap", "Assets")
+    with pytest.raises(ValueError, match="invalid XBRL tag"):
+        companyconcept_url("1000275", "us-gaap", "Assets/../../../etc/passwd")
+
+
+def test_xbrl_documents_are_cached_in_their_slots(tmp_path: Path) -> None:
+    clock = FakeClock()
+    cache = RawCache(tmp_path)
+    client = SecClient(make_settings(), cache=cache, clock=clock.monotonic, sleep=clock.sleep)
+    frame = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
+    concept = companyconcept_url(RY, "ifrs-full", "Assets")
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(frame).mock(return_value=httpx.Response(200, json={"data": []}))
+        mock.get(concept).mock(return_value=httpx.Response(200, json={"units": {}}))
+        assert client.get_json(frame) == {"data": []}
+        assert client.get_json(concept) == {"units": {}}
+    endpoints = {row["endpoint"]: row for row in cache.manifest_rows()}
+    assert endpoints["frames"]["cik"] == ""
+    assert endpoints["frames"]["path"].startswith(
+        "raw/frames/_/dei__EntityPublicFloat__USD__CY2026Q3I/"
+    )
+    assert endpoints["companyconcept"]["cik"] == RY
+    assert endpoints["companyconcept"]["path"].startswith(
+        f"raw/companyconcept/{RY}/ifrs-full__Assets/"
+    )
+    assert cache.latest("frames", "", "dei__EntityPublicFloat__USD__CY2026Q3I") is not None
+    assert cache.latest("companyconcept", RY, "ifrs-full__Assets") is not None
     assert cache.verify().ok
 
 
