@@ -96,7 +96,7 @@ FUNDAMENTALS_PIT_USD_COLUMNS: list[str] = [
 ]
 
 _US_DOLLAR = "USD"
-_CAD_PER_USD = "CAD"
+_CAD = "CAD"
 
 
 def sha256_of(text: str) -> str:
@@ -172,8 +172,8 @@ class FundamentalUsdRow:
     period_type: str = "FY"
     form: str = "40-F"
     ts_imputed: bool = False
-    unit: str = _CAD_PER_USD
-    currency: str | None = _CAD_PER_USD
+    unit: str = _CAD
+    currency: str | None = _CAD
     source_taxonomy: str = "ifrs-full"
     source_concept: str = "Revenue"
     concept_rank: int = 1
