@@ -325,3 +325,61 @@ def test_fx_daily_rejects_a_naive_known_at() -> None:
     )
     with pytest.raises(SchemaError):
         FxDailySchema.validate(frame)
+
+
+def test_fundamentals_pit_usd_double_follows_the_conversion_rule() -> None:
+    frame = doubles.fundamentals_pit_usd_frame()
+    assert frame.columns == doubles.FUNDAMENTALS_PIT_USD_COLUMNS
+    converted, unconverted = frame.iter_rows(named=True)
+    # A CAD row converts at the observation's rate and is known only once both
+    # the filing and the rate exist.
+    assert converted["value_usd"] == pytest.approx(converted["value"] / converted["fx_rate"])
+    assert converted["converted"] is True
+    assert converted["asof_ts"] == max(converted["acceptance_ts"], converted["fx_known_at"])
+    # A row without a rate keeps its value in the original currency and is
+    # flagged, never silently converted at 1.0.
+    assert unconverted["value_usd"] is None
+    assert unconverted["fx_rate"] is None
+    assert unconverted["converted"] is False
+    assert unconverted["asof_ts"] == unconverted["acceptance_ts"]
+
+
+def test_fundamentals_pit_usd_double_converts_usd_at_one() -> None:
+    row = doubles.FundamentalUsdRow(
+        cik="0000320193",
+        field="revenue",
+        value=416_161_000_000.0,
+        period_end=date(2025, 9, 27),
+        accession="0000320193-25-000079",
+        acceptance_ts=datetime(2025, 10, 31, 18, 1, 59, tzinfo=UTC),
+        unit="USD",
+        currency="USD",
+        source_taxonomy="us-gaap",
+    )
+    frame = doubles.fundamentals_pit_usd_frame([row])
+    record = frame.row(0, named=True)
+    assert record["value_usd"] == row.value
+    assert record["converted"] is True
+    assert record["fx_rate"] is None
+    assert record["asof_ts"] == row.acceptance_ts
+
+
+def test_fundamentals_pit_usd_double_waits_for_a_late_rate() -> None:
+    # The rate is published after the filing: the row is known at the rate, not
+    # at the filing, so a query at the acceptance time cannot see it.
+    late_rate = datetime(2023, 12, 1, 22, 0, tzinfo=UTC)
+    row = doubles.FundamentalUsdRow(
+        cik="0001000275",
+        field="revenue",
+        value=51_464_000_000.0,
+        period_end=date(2023, 10, 31),
+        accession="0001193125-23-285639",
+        acceptance_ts=datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC),
+        fx_rate=1.3659,
+        fx_rate_date=date(2023, 10, 31),
+        fx_known_at=late_rate,
+    )
+    record = doubles.fundamentals_pit_usd_frame([row]).row(0, named=True)
+    assert record["asof_ts"] == late_rate
+    assert record["asof_ts"] > record["acceptance_ts"]
+
