@@ -129,7 +129,8 @@ def validate_document(document: Any, series: str) -> None:
     details = document.get("seriesDetail")
     if not isinstance(details, dict) or series not in details:
         raise FixtureError(f"{series}: seriesDetail does not describe the series")
-    if details[series].get("dateFormat") != "daily":
+    detail = details[series]
+    if not isinstance(detail, dict) or detail.get("dateFormat") != "daily":
         raise FixtureError(f"{series}: expected dateFormat 'daily'")
     observations = document.get("observations")
     if not isinstance(observations, list) or not observations:
@@ -232,11 +233,14 @@ def store_series(
 
 
 def build() -> dict[str, dict[str, Any]]:
-    """Fetch, validate and store every series; return a per-series summary."""
+    """Fetch, validate and store every series; return a per-series summary.
+
+    All responses are fetched and validated before the first file is written,
+    so a failed run leaves the stored tree untouched.
+    """
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    rows = load_manifest_rows()
     limiter = RateLimiter(RATE_LIMIT_RPS)
-    summary: dict[str, dict[str, Any]] = {}
+    pending: list[tuple[str, str, int, bytes, dict[str, Any]]] = []
 
     for series in SERIES:
         url = observation_url(series)
@@ -247,6 +251,11 @@ def build() -> dict[str, dict[str, Any]]:
         except json.JSONDecodeError as error:
             raise FixtureError(f"{series}: response is not JSON ({error})") from error
         validate_document(document, series)
+        pending.append((series, url, status, body, document))
+
+    rows = load_manifest_rows()
+    summary: dict[str, dict[str, Any]] = {}
+    for series, url, status, body, document in pending:
         path = store_series(rows, series=series, url=url, body=body, http_status=status)
         observations = document["observations"]
         summary[series] = {
@@ -256,11 +265,6 @@ def build() -> dict[str, dict[str, Any]]:
             "last": observations[-1]["d"],
             "bytes": len(body),
         }
-        print(
-            f"[{series}] {len(observations)} observations "
-            f"{observations[0]['d']}..{observations[-1]['d']} {len(body)} bytes",
-            flush=True,
-        )
 
     write_manifest(rows)
     return summary

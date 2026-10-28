@@ -226,7 +226,8 @@ def test_expected_cases_cover_the_required_scenarios() -> None:
     holidays = [
         case
         for case in cases.values()
-        if date.fromisoformat(case["period_end"]) not in daily_dates
+        if case["expected_rate_date"] is not None
+        and date.fromisoformat(case["period_end"]) not in daily_dates
         and date.fromisoformat(case["period_end"]).weekday() < 5
     ]
     assert holidays, "no period end on a Bank of Canada holiday"
