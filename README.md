@@ -136,6 +136,7 @@ Set a declared User-Agent first; SEC requires one of the form "Name email" and t
 
 ```bash
 uv run edgarpit fetch --universe config/universe.csv --out ./data
+uv run edgarpit build --data ./data --out ./build
 uv run edgarpit fetch-text --db ./build/edgarpit.duckdb --items 2.02 --data ./data
 uv run edgarpit fx --out ./data
 uv run edgarpit build --data ./data --out ./build
@@ -157,9 +158,9 @@ The client respects SEC fair access: one request at a time through a token bucke
 
 `fetch --incremental` asks each issuer for one submissions document and compares
 its newest accession and filing count with the cached copy. An unchanged issuer
-costs that one request; its pages, company facts, headers, filing indexes and
-8-K documents are skipped and the run prints `skipped N unchanged`. A changed
-issuer is fetched in full, so the run is always safe to repeat (decision A-34).
+costs that one request; its pages, company facts and headers are skipped and the
+run prints `skipped N unchanged`. A changed issuer is fetched in full, so the
+run is always safe to repeat (decision A-34).
 
 Two GitHub Actions workflows use the commands above; both are documented in
 [`docs/operations.md`](docs/operations.md):

@@ -69,7 +69,7 @@ so the database remains a pure function of the cache (decision A-37).
 | `edgarpit/query.py` | `asof()`, `history()`, `events()`, `filing_text()`, `issuers()`, `fields()` over DuckDB. |
 | `edgarpit/qa.py` | Coverage, restatements, imputed timestamps, unmapped concepts, unit/currency anomalies, header-vs-API disagreements, Phase 2 coverage (text rows, FX conversions and unconverted reasons); non-zero exit on key violations. |
 | `edgarpit/export.py` | Deterministic Parquet + `manifest.json`; the Phase 2 tables ship when the database has them (section 9). |
-| `edgarpit/fetch.py` | Fetch orchestration for a universe (submissions, pages, companyfacts, headers, filing indexes, 8-K documents); `incremental` skips unchanged issuers (decision A-34). |
+| `edgarpit/fetch.py` | Fetch orchestration for a universe (submissions, paginated pages, companyfacts, SGML headers); `incremental` skips unchanged issuers (decision A-34). |
 | `edgarpit/cli.py` | Typer app `edgarpit`: `universe resolve`, `fetch`, `fetch-text`, `build`, `fx`, `asof`, `qa`, `export` (section 12). |
 | `transform/` | dbt-duckdb project. |
 | `api/main.py` | FastAPI over `query.py`: `/asof`, `/history`, `/events`, `/text`, `/health`. |
@@ -131,7 +131,7 @@ was known when.
 
 ### Incremental fetch (decision A-34)
 
-`data.sec.gov` sends no `ETag` or `Last-Modified`, so the only change signal is the document itself. An issuer is unchanged when the newly fetched submissions document's newest accession and filing count equal the cached one (`fetch.submissions_unchanged`); then its pages, companyfacts, headers, filing indexes and documents are skipped and the run reports `skipped N unchanged`. One submissions request per issuer per run. A submissions document with a new accession, a different count or no cached predecessor is fetched in full, so the run is always safe to repeat.
+`data.sec.gov` sends no `ETag` or `Last-Modified`, so the only change signal is the document itself. An issuer is unchanged when the newly fetched submissions document's newest accession and filing count equal the cached one (`fetch.submissions_unchanged`); then its pages, companyfacts and headers are skipped and the run reports `skipped N unchanged`. One submissions request per issuer per run. A submissions document with a new accession, a different count or no cached predecessor is fetched in full, so the run is always safe to repeat.
 
 ## 6. Staging contract (`raw` schema, Pandera in `edgarpit/schemas.py`)
 
