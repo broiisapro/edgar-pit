@@ -1,0 +1,159 @@
+# Weekly data release: rebuild from the latest raw cache, prove the data with QA,
+# export the Parquet release and publish it as a GitHub Release.
+#
+# Like the nightly refresh this workflow is inert until the repository variable
+# REFRESH_ENABLED is "true". It never fetches from the SEC: the raw cache it
+# restores was filled by the refresh workflow, so a release is reproducible from
+# cached responses and costs the SEC nothing. See docs/operations.md.
+name: Data release
+
+on:
+  schedule:
+    # Sunday 12:17 UTC = 04:17 or 05:17 US Pacific, after the nightly refresh,
+    # so the release uses a cache that already holds the week's filings.
+    - cron: "17 12 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time; a manual run waits for a scheduled one instead of
+# racing it for the same tag.
+concurrency:
+  group: data-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.REFRESH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      # Read-only: the release must publish a cache the refresh workflow wrote,
+      # never replace it with a partial one.
+      - name: Restore raw cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/raw
+          key: edgarpit-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            edgarpit-raw-
+          # An empty cache means the refresh has not run yet; publishing a
+          # database built from nothing would be worse than failing.
+          fail-on-cache-miss: true
+
+      - name: Build
+        run: uv run edgarpit build --data data --out build
+
+      # A key violation is a broken contract, so the release stops here: qa
+      # exits 1 and the job fails before anything is exported. pipefail keeps
+      # that exit code through tee, which stores the report as an artifact.
+      - name: QA
+        run: |
+          set -o pipefail
+          uv run edgarpit qa --db build/edgarpit.duckdb | tee build/qa.txt
+
+      - name: Export the Parquet release
+        run: uv run edgarpit export --db build/edgarpit.duckdb --out release
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets meta
+          cp build/edgarpit.duckdb assets/
+          cp build/build-info.json assets/
+          cp release/*.parquet release/manifest.json assets/
+          (
+            cd assets
+            sha256sum -- *.duckdb *.parquet manifest.json build-info.json > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          TAG="data-$(date -u +%F)"
+          printf '%s\n' "$TAG" > meta/release-tag.txt
+          {
+            printf '# Data release %s\n\n' "$TAG"
+            cat <<'NOTES'
+          Point-in-time fundamentals and corporate-events data from SEC EDGAR.
+
+          Every value is keyed by the acceptance timestamp of the filing that carried it: a row is observable at time t only when its filing was accepted at or before t. Restatements are kept as later versions of the same period, so a query can be replayed as of any date and returns exactly what was public then.
+
+          Assets:
+
+          - edgarpit.duckdb - the complete database: raw staging tables, point-in-time fundamentals, ratios, 8-K events and filing text.
+          - fundamentals_pit.parquet, ratios_pit.parquet, events_8k.parquet, filings.parquet, facts_raw.parquet - one Parquet file per released table, with a fixed row order so two exports of the same data are byte-identical.
+          - manifest.json - row counts, SHA-256 per Parquet file and the SEC fetch date range this build used.
+          - build-info.json - package version, table row counts and raw-cache document counts.
+          - SHA256SUMS - the SHA-256 of every file above.
+
+          Verify a download by running "sha256sum -c SHA256SUMS" in the directory that holds the files.
+
+          Query a Parquet file with DuckDB, for example: SELECT period_end, value, unit, accession, acceptance_ts FROM read_parquet('fundamentals_pit.parquet') WHERE ticker = 'RY' AND field = 'revenue' ORDER BY period_end DESC LIMIT 5;
+
+          The data are public records from SEC EDGAR, redistributed under the SEC's fair-access terms and credited here. The code that builds them is MIT licensed. Report a problem in this repository's issue tracker.
+          NOTES
+          } > meta/release-notes.md
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: |
+            assets/
+            meta/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Kept even when QA or the export failed, so a failed release leaves the
+      # report that explains it behind.
+      - name: Upload the build report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-report
+          path: |
+            build/build-info.json
+            build/qa.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The only job allowed to write: publishing creates a tag and a release.
+  publish:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download the release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: .
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="$(cat meta/release-tag.txt)"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Published data releases are immutable; wait for the next weekly run instead of overwriting one."
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file meta/release-notes.md \
+            assets/*
