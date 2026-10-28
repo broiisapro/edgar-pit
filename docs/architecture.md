@@ -107,6 +107,13 @@ The submissions API's `acceptanceDateTime` is currently unreliable: as of Octobe
 
 ## 6. Staging contract (`raw` schema, Pandera in `edgarpit/schemas.py`)
 
+The five data tables below are the staging contract: `edgarpit/schemas.py`
+declares each one's columns, order, dtypes and nullability in `SCHEMAS`,
+`COLUMNS` and `DUCKDB_TYPES`, `load.load_tables` writes them in one
+transaction, and `tests/fixtures/staging/<table>.csv` mirrors them one CSV per
+table. `raw.concept_map` and `raw.universe` are the reference tables loaded by
+`load.load_reference_tables`.
+
 ### `raw.filings` — one row per filing
 | column | type | notes |
 |---|---|---|
@@ -183,7 +190,9 @@ to one tab-separated line per row, entities are resolved and whitespace is
 normalised. The text is split on `Item N.NN` headings that match the filing's own
 item list; when the headings do not cover the expected items exactly once and in
 order, the whole document is a single `section='unsegmented'` row instead of a
-guess. `sha256` and `char_count` describe the stored `text`, so a consumer can
+guess; `EX-99.1` exhibits are never segmented, each one is a single
+`unsegmented` row (decision A-40). `sha256` and `char_count` describe the stored
+`text`, so a consumer can
 deduplicate and verify a section without re-reading the document. Nothing in the
 document (its dates, its period) decides what was known: the row carries the
 filing's `acceptance_ts`.
@@ -278,6 +287,7 @@ Every column of `fundamentals_pit`, unchanged and in the same order, plus:
 | fx_known_at | TIMESTAMPTZ NULL | `fx_rate_date` 17:00 `America/Toronto` in UTC; null like `fx_rate_date` |
 | converted | BOOLEAN | true when `value_usd` is populated |
 | asof_ts | TIMESTAMPTZ | `greatest(acceptance_ts, fx_known_at)`: when the converted row is known |
+| unconverted_reason | VARCHAR NULL | null when converted; `no_rate` when a CAD period ends before the first observation; `currency_out_of_scope` for any other currency, including rows with no currency (decision A-38) |
 
 Key: the same `(cik, field, period_start, period_end, accession)` as
 `fundamentals_pit`, so a converted row keeps the version identity of the row it
@@ -289,10 +299,13 @@ A `CAD` row uses the latest `FXUSDCAD` observation on or before `period_end`:
 `value_usd = value / fx_rate` and `asof_ts = greatest(acceptance_ts, fx_known_at)`.
 A row whose currency is neither `USD` nor `CAD`, or whose `period_end` precedes
 the first observation, keeps `value_usd`, `fx_rate`, `fx_rate_date` and
-`fx_known_at` null, sets `converted = false`, keeps `asof_ts = acceptance_ts`, and
-is counted by QA. Consumers must filter on `asof_ts <= t` (not `acceptance_ts`)
+`fx_known_at` null, sets `converted = false`, records the reason in
+`unconverted_reason`, keeps `asof_ts = acceptance_ts`, and is counted by QA.
+Consumers must filter on `asof_ts <= t` (not `acceptance_ts`)
 when they use `value_usd`, so a CAD value cannot appear before its rate was
-published.
+published. A converted row's rate is the latest observation whose `rate_date` is
+on or before its `period_end`; nothing else about the observation (its
+publication order, a later restatement of the series) changes that choice.
 
 ### `ratios_pit` — one row per (cik, ratio, period_start, period_end, asof_ts)
 | column | type |
@@ -312,7 +325,7 @@ published.
 
 Invariant (dbt test `assert_ratio_inputs_not_from_future`): `numerator_acceptance_ts <= asof_ts AND denominator_acceptance_ts <= asof_ts`.
 
-### `events_8k` — as `raw.events_8k`, plus `ticker`. `filings` — as `raw.filings`, plus `ticker`.
+### `events_8k` — as `raw.events_8k`, plus `ticker`. `filings` — as `raw.filings`, plus `ticker`. `filings_text` — as `raw.filings_text`, plus `ticker`.
 
 ## 8. Query semantics
 
@@ -353,12 +366,19 @@ edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS [--currency
 - `fetch --incremental` fetches one submissions document per issuer and skips the
   issuers whose document is unchanged, reporting `skipped N unchanged`
   (decision A-34).
-- `fetch-text` reads the 8-K filings whose `items` contain one of `--items` from
-  the database at `--db`, extracts their cached filing index and documents under
-  `--data` (default `./data`) into `raw.filings_text`, and stops after `--limit`
-  filings when given. It never fetches a document that is already cached
-  (decision A-30).
-- `fx` fetches the `FXUSDCAD` history into the raw cache at `--out` and prints
-  the row count; a cached series is reused, so a repeat run makes no request.
+- `fetch-text` only fetches (decision A-37): it reads the 8-K filings whose
+  `items` contain one of `--items` from the database at `--db`, writes their
+  `-index-headers.html` and each referenced document into the raw cache under
+  `--data` (default `./data`), and stops after `--limit` filings when given. It
+  never fetches a document that is already cached (decision A-30) and it never
+  writes `raw.filings_text`: `edgarpit build` ingests the cached text.
+- `fx` only fetches (decision A-37): it requests the `FXUSDCAD` history, stores
+  the body in the raw cache at `--out` only when it differs from the latest
+  cached copy, and prints the row count. A repeat run with an unchanged series
+  adds no cache file.
+- `build` ingests `raw.filings_text` from every cached `filing_index` and
+  `raw.fx_daily` from the latest cached `fx` series, and creates both tables and
+  their models empty when the cache holds no such endpoint, so a Phase 1 cache
+  still builds (decision A-37).
 - `asof --currency USD` reads `main.fundamentals_pit_usd` and applies the
   point-in-time rule to `asof_ts` (decision A-32).
