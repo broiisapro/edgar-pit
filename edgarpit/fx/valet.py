@@ -99,7 +99,7 @@ class ValetClient:
 
         ``start`` and ``end`` are inclusive observation dates; without them the
         whole history is returned. The response is cached in the ``fx`` slot, so
-        a later ``fetch`` of the same series reads the cache in offline mode.
+        a client built with ``offline_dir`` can read it without the network.
         """
         return self.get_json(valet_url(series, start, end))
 
