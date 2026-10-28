@@ -23,10 +23,10 @@ SecClient (rate-limited, retrying, User-Agent)  ──►  raw cache (immutable,
 ValetClient (same limiter) ──► Bank of Canada FX series  │
                                                          ▼
 ingest/submissions.py ─► filings, events_8k  ┐
-ingest/headers.py     ─► acceptance times    ├─► load.py (Pandera-validated) ─► DuckDB schema `raw`
-ingest/companyfacts.py ─► facts_raw          ┘                                         │
-text/ingest.py        ─► filings_text        ┐                                         │
-fx/valet.py           ─► fx_daily            ┘                                         ▼
+ingest/headers.py     ─► acceptance times    │
+ingest/companyfacts.py ─► facts_raw          ├─► load.py (Pandera-validated) ─► DuckDB schema `raw`
+text/ingest.py        ─► filings_text        │                                    │
+fx/valet.py           ─► fx_daily            ┘                                    ▼
                                                      dbt (transform/): stg → int → fundamentals_pit, fundamentals_pit_usd,
                                                      ratios_pit, events_8k, filings
                                                                                        │

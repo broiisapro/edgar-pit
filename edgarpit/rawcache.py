@@ -67,6 +67,7 @@ DOCUMENT_SEPARATOR = "__"
 GLOBAL_CIK = "_"
 
 _STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
+_ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 _ENDPOINTS = tuple(ENDPOINT_SUFFIX)
 
 
@@ -75,9 +76,12 @@ def document_key(accession: str, filename: str) -> str:
 
     ``accession`` is ``NNNNNNNNNN-YY-NNNNNN`` and ``filename`` the EDGAR file
     name of the document (``aapl-20260730.htm``); the extension of ``filename``
-    decides the stored file's extension. Raises :class:`ValueError` for an empty
-    file name, one containing a path separator, or one without an extension.
+    decides the stored file's extension. Raises :class:`ValueError` for a
+    malformed accession, an empty file name, a file name containing a path
+    separator, or a file name without an extension.
     """
+    if not _ACCESSION_RE.fullmatch(accession):
+        raise ValueError(f"invalid accession {accession!r}")
     if not filename or "/" in filename or "\\" in filename:
         raise ValueError(f"invalid document file name {filename!r}")
     if not Path(filename).suffix:

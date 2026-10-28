@@ -14,7 +14,6 @@ treated as known at ``d`` 17:00 ``America/Toronto`` (the Bank publishes around
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable, Mapping
 from datetime import date
@@ -26,9 +25,7 @@ import polars as pl
 
 from edgarpit.config import Settings
 from edgarpit.rawcache import RawCache
-from edgarpit.sec_client import VALET_HOST, SecClient
-
-_SERIES_RE = re.compile(r"[A-Za-z0-9_.-]+")
+from edgarpit.sec_client import VALET_HOST, SecClient, valet_series_id
 
 
 def valet_url(series: str, start: date | None = None, end: date | None = None) -> str:
@@ -41,8 +38,7 @@ def valet_url(series: str, start: date | None = None, end: date | None = None) -
     ``America/Toronto``. Raises :class:`ValueError` for an empty or malformed
     series id or for ``start`` after ``end``.
     """
-    if not _SERIES_RE.fullmatch(series):
-        raise ValueError(f"invalid Valet series id {series!r}")
+    series = valet_series_id(series)
     if start is not None and end is not None and start > end:
         raise ValueError(f"start {start} is after end {end}")
     query: list[str] = []

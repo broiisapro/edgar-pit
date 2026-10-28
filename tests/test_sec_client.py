@@ -424,6 +424,8 @@ def test_document_url_rejects_path_separators(filename: str) -> None:
 def test_classify_rejects_a_document_directory_without_an_accession() -> None:
     with pytest.raises(ValueError, match="cannot classify"):
         classify("https://www.sec.gov/Archives/edgar/data/320193/not-an-accession/doc.htm")
+    with pytest.raises(ValueError, match="no accession directory"):
+        classify("https://www.sec.gov/Archives/edgar/data/320193/123456/doc.htm")
     with pytest.raises(ValueError, match="cannot classify"):
         classify("https://www.sec.gov/Archives/edgar/data/320193/000032019325000080/")
 
@@ -443,10 +445,15 @@ def test_valet_url_shape_and_bounds() -> None:
     assert classify(valet_url("FXUSDCAD", date(2017, 1, 3))) == ("fx", "", "FXUSDCAD")
 
 
-@pytest.mark.parametrize("series", ["", "FX USDCAD", "FX/USDCAD"])
+@pytest.mark.parametrize("series", ["", "FX USDCAD", "FX/USDCAD", "..", "a..b", ".hidden"])
 def test_valet_url_rejects_a_malformed_series(series: str) -> None:
     with pytest.raises(ValueError, match="invalid Valet series id"):
         valet_url(series)
+
+
+def test_classify_rejects_a_valet_path_traversal() -> None:
+    with pytest.raises(ValueError, match="invalid Valet series id"):
+        classify("https://www.bankofcanada.ca/valet/observations/../json")
 
 
 def test_valet_url_rejects_a_reversed_range() -> None:

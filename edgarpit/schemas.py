@@ -33,7 +33,7 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 # a section named by an EDGAR item code (``2.02``) or ``unsegmented``.
 DOC_TYPES = ["primary", "EX-99.1"]
 UNSEGMENTED = "unsegmented"
-SECTION_PATTERN = r"^(\d{1,2}\.\d{2}|unsegmented)$"
+SECTION_PATTERN = rf"^(\d{{1,2}}\.\d{{2}}|{UNSEGMENTED})$"
 
 # FX (decision A-32): the Bank of Canada Valet daily series.
 FX_SOURCES = ["valet"]

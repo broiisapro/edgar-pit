@@ -382,4 +382,3 @@ def test_fundamentals_pit_usd_double_waits_for_a_late_rate() -> None:
     record = doubles.fundamentals_pit_usd_frame([row]).row(0, named=True)
     assert record["asof_ts"] == late_rate
     assert record["asof_ts"] > record["acceptance_ts"]
-

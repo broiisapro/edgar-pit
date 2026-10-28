@@ -263,6 +263,8 @@ def test_filing_index_layout_and_latest(tmp_path: Path) -> None:
 
 def test_document_key_shape_and_validation() -> None:
     assert document_key(RY_ACCESSION, "exhibit99-1.htm") == f"{RY_ACCESSION}__exhibit99-1.htm"
+    with pytest.raises(ValueError, match="invalid accession"):
+        document_key("0001193125-23-28563", "exhibit99-1.htm")
     with pytest.raises(ValueError, match="invalid document file name"):
         document_key(RY_ACCESSION, "")
     with pytest.raises(ValueError, match="invalid document file name"):

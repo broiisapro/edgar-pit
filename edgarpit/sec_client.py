@@ -61,7 +61,22 @@ _FILING_INDEX_RE = re.compile(
 )
 _DOCUMENT_RE = re.compile(r"/Archives/edgar/data/(\d+)/(\d+)/([^/]+)")
 _ACCESSION_DIGITS_RE = re.compile(r"(\d{10})(\d{2})(\d{6})")
+_SERIES_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _VALET_RE = re.compile(r"/valet/observations/([A-Za-z0-9_.-]+)/json")
+
+
+def valet_series_id(series: str) -> str:
+    """Validate a Bank of Canada Valet series id and return it unchanged.
+
+    ``series`` is a Valet identifier such as ``FXUSDCAD``: letters, digits,
+    ``_``, ``.`` and ``-``, starting with a letter or digit. Dots are allowed
+    inside an id (``FXUSDCAD.1``) but a ``..`` segment is rejected, so the id can
+    never escape its directory when it becomes a raw-cache key. Raises
+    :class:`ValueError` for an empty, malformed or dot-segment id.
+    """
+    if not _SERIES_RE.fullmatch(series) or ".." in series:
+        raise ValueError(f"invalid Valet series id {series!r}")
+    return series
 
 
 class SecClientError(RuntimeError):
@@ -205,7 +220,7 @@ def classify(url: str) -> tuple[str, str, str]:
     if host == "www.bankofcanada.ca":
         match = _VALET_RE.fullmatch(path)
         if match:
-            return ("fx", "", match.group(1))
+            return ("fx", "", valet_series_id(match.group(1)))
     raise ValueError(f"cannot classify URL: {url}")
 
 
