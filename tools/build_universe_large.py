@@ -338,6 +338,9 @@ def float_history(document: Mapping[str, Any], source: str) -> list[tuple[date, 
     rows = units.get("USD")
     if rows is None:
         return []
+    if isinstance(rows, Mapping) and not rows:
+        # The endpoint renders a unit with no facts as an empty object.
+        return []
     if not isinstance(rows, list):
         raise UniverseBuildError(f"{source} has a non-array USD unit")
     history: list[tuple[date, float]] = []
@@ -431,6 +434,10 @@ def annual_assets(document: Mapping[str, Any], source: str) -> AssetFact | None:
     other: list[AssetFact] = []
     for unit in sorted(units):
         rows = units[unit]
+        if isinstance(unit, str) and isinstance(rows, Mapping) and not rows:
+            # The endpoint renders a unit with no facts as an empty object; a
+            # filer that tags the concept in no unit must not fail the build.
+            continue
         if not isinstance(unit, str) or not isinstance(rows, list):
             raise UniverseBuildError(f"{source} has a malformed unit {unit!r}")
         for row in rows:
@@ -1193,7 +1200,10 @@ def build(
         )
         report.assets_usd = {}
         for issuer in report.rows:
-            if issuer.cik is None:  # pragma: no cover - merge rejects a missing CIK
+            if issuer.country != "CA" or issuer.cik is None:
+                # Only the Canadian ranking needs assets in the report; a US
+                # issuer's size is its float and reading its balance sheet
+                # would cost a request per row for nothing.
                 continue
             value = ranked_assets(issuer.cik)
             if value is not None:

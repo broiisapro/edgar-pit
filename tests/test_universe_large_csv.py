@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from edgarpit.rawcache import RawCache
-from edgarpit.sec_client import frames_url
+from edgarpit.sec_client import SecNotFound, frames_url
 from edgarpit.universe import Issuer, UniverseError, load_universe, write_universe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -203,6 +203,8 @@ def test_float_history_reads_usd_observations() -> None:
         (date(2025, 6, 30), 200.0),
     ]
     assert builder.float_history({"units": {}}, "CIK0000000001") == []
+    # The live endpoint renders a unit with no facts as an empty object.
+    assert builder.float_history({"units": {"USD": {}}}, "CIK0000000001") == []
     with pytest.raises(builder.UniverseBuildError):
         builder.float_history({"units": {"USD": [{"val": 1}]}}, "CIK0000000001")
 
@@ -283,6 +285,9 @@ def test_annual_assets_reads_the_newest_row_across_units() -> None:
 def test_annual_assets_rejects_malformed_documents() -> None:
     builder = load_builder()
     assert builder.annual_assets({"units": {}}, "CIK") is None
+    # The live endpoint renders a unit with no facts as an empty object.
+    assert builder.annual_assets({"units": {"USD": {}}}, "CIK") is None
+    assert builder.annual_assets({"units": {"CAD": [], "USD": {}}}, "CIK") is None
     with pytest.raises(builder.UniverseBuildError):
         builder.annual_assets({"units": {"CAD": [{"val": 1, "form": "40-F"}]}}, "CIK")
     with pytest.raises(builder.UniverseBuildError):
@@ -461,6 +466,31 @@ def test_document_reader_serves_the_cache_and_reports_a_miss(tmp_path: Path) -> 
     builder = load_builder()
     cache = RawCache(tmp_path)
     url = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
+    key = "dei__EntityPublicFloat__USD__CY2026Q3I"
+    cache.write("frames", "", key, b'{"data": []}', url=url, http_status=200)
+    reader = builder.DocumentReader(cache, None, [0])
+    assert reader.json(url) == {"data": []}
+    assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")) is None
+
+
+class RecordingClient:
+    """A ``SecClient`` stand-in that records the URLs it is asked for."""
+
+    def __init__(self, payload: dict[str, Any] | None) -> None:
+        self.payload = payload
+        self.calls: list[str] = []
+
+    def get_json(self, url: str) -> dict[str, Any]:
+        self.calls.append(url)
+        if self.payload is None:
+            raise SecNotFound(f"SEC returned 404 for {url}")
+        return self.payload
+
+
+def test_document_reader_reads_the_cache_before_any_request(tmp_path: Path) -> None:
+    builder = load_builder()
+    cache = RawCache(tmp_path)
+    url = frames_url("dei", "EntityPublicFloat", "USD", "CY2026Q3I")
     cache.write(
         "frames",
         "",
@@ -469,9 +499,22 @@ def test_document_reader_serves_the_cache_and_reports_a_miss(tmp_path: Path) -> 
         url=url,
         http_status=200,
     )
-    reader = builder.DocumentReader(cache, None, [0])
+    client: Any = RecordingClient({"data": [{"cik": 1}]})
+    counter = [0]
+    reader = builder.DocumentReader(cache, client, counter)
     assert reader.json(url) == {"data": []}
-    assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")) is None
+    assert client.calls == [], "a cached document must never be fetched again"
+    assert counter == [0]
+
+    missing = frames_url("dei", "EntityPublicFloat", "USD", "CY2020Q1I")
+    assert reader.json(missing) == {"data": [{"cik": 1}]}
+    assert client.calls == [missing]
+    assert counter == [1]
+
+    not_found: Any = RecordingClient(None)
+    reader = builder.DocumentReader(cache, not_found, counter)
+    assert reader.json(frames_url("dei", "EntityPublicFloat", "USD", "CY2019Q1I")) is None
+    assert counter == [2]
 
 
 # --------------------------------------------------------------------------
