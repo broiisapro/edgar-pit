@@ -231,6 +231,11 @@ class StubClient:
         return None
 
 
+def flat(text: str) -> str:
+    """Collapse whitespace and Rich's panel border, so a wrapped usage error is searchable."""
+    return " ".join(text.replace("│", " ").split())
+
+
 # --- fetch --incremental ------------------------------------------------------
 
 
@@ -403,7 +408,7 @@ def test_fetch_text_without_the_events_table_exits_1(
     result = RUNNER.invoke(app, ["fetch-text", "--db", str(db), "--items", "2.02"])
     assert result.exit_code == 1
     assert "raw.events_8k" in result.stderr
-    assert "run `edgarpit build` first" in result.stderr
+    assert "run `edgarpit build` first" in flat(result.stderr)
 
 
 def test_fetch_text_usage_errors_exit_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,7 +421,7 @@ def test_fetch_text_usage_errors_exit_2(tmp_path: Path, monkeypatch: pytest.Monk
     missing_db = RUNNER.invoke(app, ["fetch-text", "--items", "2.02"])
     assert missing_items.exit_code == 2
     assert negative_limit.exit_code == 2
-    assert "must be zero or positive" in negative_limit.stderr
+    assert "--limit must be zero or positive" in flat(negative_limit.stderr)
     assert missing_db.exit_code == 2
 
 
@@ -545,7 +550,7 @@ def test_fx_failure_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr("edgarpit.cli.fetch_fx", failing_fetch_fx)
     result = RUNNER.invoke(app, ["fx", "--out", str(tmp_path / "cache")])
     assert result.exit_code == 1
-    assert "error: Valet document does not describe series 'FXUSDCAD'" in result.stderr
+    assert "error: Valet document does not describe series 'FXUSDCAD'" in flat(result.stderr)
 
 
 def test_fx_end_to_end_stores_the_valet_series_once(
@@ -644,15 +649,16 @@ def test_asof_usd_without_the_conversion_model_exits_1(tmp_path: Path) -> None:
     db = create_usd_db(tmp_path / "edgarpit.duckdb", with_usd_table=False)
     result = RUNNER.invoke(app, asof_args(db, "2024-01-03T00:00:00Z", "--currency", "USD"))
     assert result.exit_code == 1
-    assert "main.fundamentals_pit_usd is missing" in result.stderr
-    assert "Phase 2 FX model" in result.stderr
+    message = flat(result.stderr)
+    assert "main.fundamentals_pit_usd is missing" in message
+    assert "Phase 2 FX model" in message
 
 
 def test_asof_rejects_another_currency(tmp_path: Path) -> None:
     db = create_usd_db(tmp_path / "edgarpit.duckdb")
     result = RUNNER.invoke(app, asof_args(db, "2024-01-03T00:00:00Z", "--currency", "EUR"))
     assert result.exit_code == 2
-    assert "--currency must be USD" in result.stderr
+    assert "Invalid value: --currency must be USD" in flat(result.stderr)
 
 
 # --- qa -----------------------------------------------------------------------
@@ -720,5 +726,6 @@ def test_qa_asof_violation_exits_non_zero_and_names_it(
         result.stdout
     )
     assert f"{RY_CIK} revenue 2022-11-01..2023-10-31 0001193125-23-285639" in result.stdout
-    assert "1 asof_ts violations in main.fundamentals_pit_usd" in result.stderr
-    assert "asof_ts before acceptance_ts or fx_known_at" in result.stderr
+    message = flat(result.stderr)
+    assert "1 asof_ts violations in main.fundamentals_pit_usd" in message
+    assert "asof_ts before acceptance_ts or fx_known_at" in message
