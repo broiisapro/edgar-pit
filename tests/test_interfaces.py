@@ -162,7 +162,6 @@ def test_phase2_stubs_raise_not_implemented(tmp_path: Path) -> None:
         }
     )
     calls: list[Any] = [
-        lambda: discover.exhibit_documents("<html></html>"),
         lambda: clean.html_to_text("<html></html>"),
         lambda: segment.segment_items("text", ["2.02"]),
         lambda: ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings),
