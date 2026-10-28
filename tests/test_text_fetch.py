@@ -28,7 +28,6 @@ from edgarpit.sec_client import SecClient, classify, document_url, filing_index_
 from edgarpit.text import discover, fetch
 from edgarpit.text.discover import DocumentRef
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 TEXT_ROOT = Path(__file__).resolve().parent / "fixtures" / "sec_text"
 RAW = TEXT_ROOT / "raw"
 EXPECTED_PATH = Path(__file__).resolve().parent / "fixtures" / "text_expected.json"
