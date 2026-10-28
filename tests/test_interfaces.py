@@ -166,17 +166,17 @@ def test_phase2_stubs_raise_not_implemented(tmp_path: Path) -> None:
         lambda: segment.segment_items("text", ["2.02"]),
         lambda: ingest.ingest_text(rawcache.RawCache(tmp_path), "0000320193", [], filings),
         lambda: valet.parse_valet({}),
-        lambda: fetch.submissions_unchanged(None, {}),
     ]
     for call in calls:
         with pytest.raises(NotImplementedError):
             call()
 
 
-def test_incremental_fetch_is_refused_rather_than_silently_full(tmp_path: Path) -> None:
+def test_incremental_fetch_accepts_the_keyword(tmp_path: Path) -> None:
     client = sec_client.SecClient(Settings(sec_user_agent="Test User test@example.com"))
-    with pytest.raises(NotImplementedError, match="incremental"):
-        fetch.fetch_universe([], tmp_path, client=client, incremental=True)
+    report = fetch.fetch_universe([], tmp_path, client=client, incremental=True)
+    assert report.skipped_unchanged == 0
+    assert report.requests == 0
 
 
 def test_currency_is_refused_until_the_usd_model_exists() -> None:
