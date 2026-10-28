@@ -205,8 +205,8 @@ def test_an_item_reference_inside_running_prose_is_not_a_heading(text: str) -> N
     ],
 )
 def test_a_heading_look_alike_that_is_not_at_a_line_start_is_ignored(text: str) -> None:
-    # "Items", "SubItem", a bullet and "2.021" are not the heading "Item 2.02",
-    # so only 9.01 is found and the declared pair is incomplete.
+    # "Items", "SubItem", a bullet and "2.021" do not match the heading
+    # "Item 2.02", so the declared pair is never found in full.
     sections = segment_items(text, ["2.02", "9.01"])
 
     assert sections == [Section(section="unsegmented", order=1, text=text.strip())]
