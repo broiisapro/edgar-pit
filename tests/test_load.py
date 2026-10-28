@@ -408,8 +408,9 @@ def test_a_phase1_cache_builds_with_the_phase2_tables_empty(tmp_path: Path) -> N
             con.execute("SELECT count(*) FROM main.fundamentals_pit_usd").fetchone()
             == con.execute("SELECT count(*) FROM main.fundamentals_pit").fetchone()
         )
-        # Without an FXUSDCAD series nothing in CAD converts, and every
-        # converted row is a USD row.
+        # Without an FXUSDCAD series no CAD row converts: the reasons are the
+        # null of a converted USD row, `no_rate` for CAD and
+        # `currency_out_of_scope` for share units.
         reasons = dict(
             con.execute(
                 "SELECT unconverted_reason, count(*) FROM main.fundamentals_pit_usd "

@@ -327,6 +327,40 @@ def test_fundamentals_pit_usd_double_follows_the_conversion_rule() -> None:
     assert unconverted["fx_rate"] is None
     assert unconverted["converted"] is False
     assert unconverted["asof_ts"] == unconverted["acceptance_ts"]
+    assert unconverted["unconverted_reason"] == "no_rate"
+    assert converted["unconverted_reason"] is None
+
+
+def test_fundamentals_pit_usd_double_flags_a_currency_out_of_scope() -> None:
+    row = doubles.FundamentalUsdRow(
+        cik="0001000275",
+        field="revenue",
+        value=1_234_000.0,
+        period_end=date(2023, 10, 31),
+        accession="0001193125-23-285639",
+        acceptance_ts=datetime(2023, 11, 30, 11, 45, 12, tzinfo=UTC),
+        unit="EUR",
+        currency="EUR",
+    )
+    record = doubles.fundamentals_pit_usd_frame([row]).row(0, named=True)
+    assert record["value_usd"] is None
+    assert record["converted"] is False
+    assert record["unconverted_reason"] == "currency_out_of_scope"
+    assert record["asof_ts"] == row.acceptance_ts
+
+
+def test_main_filings_text_double_joins_the_ticker() -> None:
+    frame = doubles.main_filings_text_frame()
+    assert frame.columns == doubles.MAIN_FILINGS_TEXT_COLUMNS
+    assert set(frame["ticker"].to_list()) == {"AAPL"}
+    unknown = doubles.FilingsTextRow(
+        accession="0000000001-25-000001",
+        document="x.htm",
+        section="2.02",
+        text="Item 2.02",
+        cik="0000000001",
+    )
+    assert doubles.main_filings_text_frame([unknown]).row(0, named=True)["ticker"] is None
 
 
 def test_fundamentals_pit_usd_double_converts_usd_at_one() -> None:

@@ -192,8 +192,8 @@ item list; when the headings do not cover the expected items exactly once and in
 order, the whole document is a single `section='unsegmented'` row instead of a
 guess; `EX-99.1` exhibits are never segmented, each one is a single
 `unsegmented` row (decision A-40). `sha256` and `char_count` describe the stored
-`text`, so a consumer can
-deduplicate and verify a section without re-reading the document. Nothing in the
+`text`, so a consumer can deduplicate and verify a section without re-reading
+the document. Nothing in the
 document (its dates, its period) decides what was known: the row carries the
 filing's `acceptance_ts`.
 
@@ -301,11 +301,11 @@ A row whose currency is neither `USD` nor `CAD`, or whose `period_end` precedes
 the first observation, keeps `value_usd`, `fx_rate`, `fx_rate_date` and
 `fx_known_at` null, sets `converted = false`, records the reason in
 `unconverted_reason`, keeps `asof_ts = acceptance_ts`, and is counted by QA.
-Consumers must filter on `asof_ts <= t` (not `acceptance_ts`)
-when they use `value_usd`, so a CAD value cannot appear before its rate was
-published. A converted row's rate is the latest observation whose `rate_date` is
-on or before its `period_end`; nothing else about the observation (its
-publication order, a later restatement of the series) changes that choice.
+Consumers must filter on `asof_ts <= t` (not `acceptance_ts`) when they use
+`value_usd`, so a CAD value cannot appear before its rate was published. A
+converted row's rate is the latest observation whose `rate_date` is on or before
+its `period_end`; nothing else about the observation (its publication order, a
+later restatement of the series) changes that choice.
 
 ### `ratios_pit` — one row per (cik, ratio, period_start, period_end, asof_ts)
 | column | type |
