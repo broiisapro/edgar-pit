@@ -17,14 +17,15 @@ anything.
 Two repository settings, both under **Settings → Secrets and variables →
 Actions**:
 
-1. **Variable** `REFRESH_ENABLED` = `true`. Every job carries
-   `if: vars.REFRESH_ENABLED == 'true'`, so with the variable unset or any
-   other value the run is skipped and reports green without doing anything.
+1. **Variable** `REFRESH_ENABLED` = `true`. Every job either carries
+   `if: vars.REFRESH_ENABLED == 'true'` or needs a job that does, so with the
+   variable unset or any other value the run is skipped and reports green
+   without doing anything.
 2. **Secret** `SEC_USER_AGENT` = a declared contact of the form
    `Your Name you@example.com`. SEC's fair-access policy requires it on every
-   request, and the client refuses to send one without it. The refresh
-   workflow's second step fails with a clear `::error::` when the secret is
-   empty, before any request is made.
+   request, and the client refuses to send one without it. An early step of the
+   refresh fails with a clear `::error::` when the secret is empty, before any
+   request is made.
 
 With `gh` authenticated as a repository admin:
 
@@ -57,8 +58,8 @@ scheduled one, and it takes no inputs, so there is no way to bypass the gate.
 
 One job, `refresh`, on `ubuntu-24.04` with a 360-minute timeout. In order:
 
-1. **Check `SEC_USER_AGENT`.** Empty, whitespace-free or missing: fail here
-   with a message naming the secret, before touching the network.
+1. **Check `SEC_USER_AGENT`.** Missing or empty: fail here with a message
+   naming the secret, before touching the network.
 2. **Restore the raw cache** from `data/raw` with a rolling key
    (`edgarpit-raw-<run id>-<attempt>`) and `restore-keys: edgarpit-raw-`, so
    the newest previous run is the fallback. A cache miss is not an error; the
@@ -138,16 +139,16 @@ common ones:
   that succeeded, and the `Save raw cache` step runs anyway, so the next run
   picks up where this one stopped.
 - **`Restore raw cache` failed** (release only) — there is no cache to publish
-  from: the refresh has not run, `REFRESH_ENABLED` was `false` since the last
-  eviction, or the cache was evicted. Run the refresh first.
+  from: the refresh has not run since the cache was last evicted, or never
+  ran, or `REFRESH_ENABLED` has been `false` throughout. Run the refresh first.
 - **`QA` failed** — the report's last line is `Key uniqueness: violated` and
   names the tables with duplicate keys. The refresh still saves its cache and
   uploads the report; the release stops before exporting. This is a data bug,
   not an infrastructure one: fix the pipeline, do not bypass QA.
 - **The job hit its timeout** — a cold backfill is the long case (see the next
   section). Completed steps are not lost: the next run restores the cache and
-  continues. `refresh-report` and `release-assets` are uploaded even when a
-  job fails, so the QA text of a failed run is always available.
+  continues. `refresh-report` and `release-report` are uploaded even when a job
+  fails, so the QA text of a failed run is always available.
 
 Both workflows have `concurrency` with `cancel-in-progress: false`: a run that
 starts while another is going waits for it instead of racing it for the cache
@@ -166,12 +167,13 @@ GitHub limits each repository to **10 GB of cache** and evicts entries that
 have not been accessed for **7 days**. A nightly run accesses the newest entry
 every night, so it stays warm; older entries age out as newer runs write new
 ones, and the 10 GB ceiling evicts the least recently used first. If the raw
-cache outgrows 10 GB, the next run after an eviction is a **full fetch**:
-250 issuers is roughly 57,000 SGML headers plus pages and company facts, tens
-of thousands of requests at the 5 requests/s fair-access ceiling, i.e. several
-hours — which is why the refresh timeout is 6 hours and why the release refuses
-to run without a cache rather than publishing an empty dataset. A warm
-incremental night is one request per issuer and finishes in minutes.
+cache outgrows 10 GB, the next run after an eviction is a **full fetch**: 250
+issuers means tens of thousands of SGML headers plus pages and company facts,
+tens of thousands of requests at the 5 requests/s fair-access ceiling, i.e.
+several hours — which is why the refresh timeout is 6 hours and why the
+release refuses to run without a cache rather than publishing an empty
+dataset. A warm incremental night is one request per issuer and finishes in
+minutes.
 
 The cache upload at the end of a refresh moves the whole `data/raw` tree, so a
 cold run also spends time compressing and uploading it. That cost is paid once
