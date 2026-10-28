@@ -23,8 +23,9 @@ _CELL_SEP = "\x1f"
 # inline-XBRL contexts and hidden facts; ``head`` carries the document title.
 _DROP_TAGS = frozenset({"script", "style", "head", "ix:header"})
 
-# Block-level elements: each one ends a line.  ``br`` is handled separately
-# because consecutive breaks are a real blank line, not another block boundary.
+# Block-level elements: each one ends a line.  ``br`` and ``hr`` are handled
+# separately because consecutive breaks are a real blank line, not another
+# block boundary.
 _BLOCK_TAGS = frozenset(
     {
         "address",
@@ -50,7 +51,6 @@ _BLOCK_TAGS = frozenset(
         "h5",
         "h6",
         "header",
-        "hr",
         "legend",
         "li",
         "main",
