@@ -33,6 +33,7 @@ from edgarpit.fx.valet import FxFetchReport, valet_url
 from edgarpit.qa import AsOfViolation, FxCoverage, QaReport, TextCoverage, UsdConversion
 from edgarpit.rawcache import RawCache, document_key
 from edgarpit.schemas import duckdb_ddl
+from edgarpit.sec_client import document_url, filing_index_url
 from edgarpit.text.fetch import TextFetchReport
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -463,9 +464,12 @@ def test_fetch_text_end_to_end_writes_the_cached_index_and_documents(
     assert "failed: 0" in result.stdout
 
     cache = RawCache(data)
-    assert cache.latest("filing_index", APPLE_CIK, APPLE_Q4_2025) is not None
+    index_url = filing_index_url(APPLE_CIK, APPLE_Q4_2025)
+    assert cache.latest("filing_index", APPLE_CIK, APPLE_Q4_2025) == bodies[index_url]
     for filename in APPLE_Q4_DOCUMENTS:
-        assert cache.latest("documents", APPLE_CIK, document_key(APPLE_Q4_2025, filename))
+        key = document_key(APPLE_Q4_2025, filename)
+        url = document_url(APPLE_CIK, APPLE_Q4_2025, filename)
+        assert cache.latest("documents", APPLE_CIK, key) == bodies[url]
     requested = {str(call.request.url) for call in route.calls}
     assert len(requested) == 3
     assert all(url in bodies for url in requested)
