@@ -218,6 +218,7 @@ def asof(
     n: int = 1,
     *,
     db: str | Path | duckdb.DuckDBPyConnection | None = None,
+    currency: Literal["USD"] | None = None,
 ) -> list[AsOfResult]:
     """Return the ``n`` most recent periods known at ``asof_ts``.
 
@@ -233,7 +234,18 @@ def asof(
     :class:`ValueError` for ``n < 1``, an unsupported ``period``, malformed
     timestamps or naive timestamps (no timezone). Opens a read-only connection
     unless a connection is passed.
+
+    ``currency="USD"`` would read ``main.fundamentals_pit_usd`` instead
+    (decision A-32), converting CAD values at the FX rate known at the time;
+    that model does not exist yet, so passing it raises
+    :class:`NotImplementedError` and the default ``None`` keeps the row's own
+    currency.
     """
+    if currency is not None:
+        raise NotImplementedError(
+            "currency conversion (decision A-32) lands with main.fundamentals_pit_usd; "
+            "call asof without currency"
+        )
     _validate_period(period, "period")
     if n < 1:
         raise ValueError(f"n must be at least 1; got {n}")
@@ -263,6 +275,7 @@ def history(
     period: Literal["FY", "Q"] | None = None,
     *,
     db: str | Path | duckdb.DuckDBPyConnection | None = None,
+    currency: Literal["USD"] | None = None,
 ) -> list[AsOfResult]:
     """Return every version of ``field`` for ``identifier``.
 
@@ -273,7 +286,17 @@ def history(
     timestamps are timezone-aware UTC. Raises :class:`LookupError` for an unknown
     or ambiguous identifier and :class:`ValueError` for an unsupported ``period``.
     Opens a read-only connection unless a connection is passed.
+
+    ``currency="USD"`` would read ``main.fundamentals_pit_usd`` instead
+    (decision A-32); that model does not exist yet, so passing it raises
+    :class:`NotImplementedError` and the default ``None`` keeps the row's own
+    currency.
     """
+    if currency is not None:
+        raise NotImplementedError(
+            "currency conversion (decision A-32) lands with main.fundamentals_pit_usd; "
+            "call history without currency"
+        )
     if period is not None:
         _validate_period(period, "period")
     with _connect(db) as con:
