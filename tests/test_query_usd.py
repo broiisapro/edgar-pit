@@ -245,8 +245,46 @@ def test_asof_usd_returns_the_converted_value_and_unit(con: duckdb.DuckDBPyConne
     assert result.currency == "USD"
     assert result.unit == "USD"
     assert result.acceptance_ts == RY_ORIGINAL_ACCEPTED
+    assert result.asof_ts == RY_ORIGINAL_ACCEPTED
     assert result.version == 1
     assert result.period_end == date(2023, 10, 31)
+
+
+def test_asof_ts_is_the_exact_known_time_of_a_usd_value(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    """Decision A-41: a USD result carries the row's own known time, not a bound."""
+    shop = query.asof(SHOP_CIK, "revenue", "2023-11-01T00:00:00Z", currency="USD", db=con)[0]
+
+    assert shop.acceptance_ts == SHOP_ACCEPTED
+    assert shop.asof_ts == OCT_31_RATE_KNOWN_AT
+    assert shop.asof_ts > shop.acceptance_ts
+    assert shop.value == pytest.approx(7_000_000_000.0 / FX_RATE)
+
+
+def test_usd_asof_ts_is_never_earlier_than_the_acceptance_time(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    """Classic bug (decision A-41): a converted row's known time covers both inputs."""
+    rows = query.history(RY_CIK, "revenue", db=con, currency="USD") + query.history(
+        SHOP_CIK, "revenue", db=con, currency="USD"
+    )
+
+    assert rows
+    for row in rows:
+        assert row.asof_ts is not None
+        assert row.asof_ts >= row.acceptance_ts
+    shop = next(row for row in rows if row.cik == SHOP_CIK)
+    assert shop.asof_ts == max(shop.acceptance_ts, OCT_31_RATE_KNOWN_AT)
+
+
+def test_reported_reads_carry_no_asof_ts(con: duckdb.DuckDBPyConnection) -> None:
+    asof = query.asof(RY_CIK, "revenue", "2024-01-15T00:00:00Z", db=con)
+    history = query.history(RY_CIK, "revenue", db=con)
+
+    assert asof and history
+    assert {row.asof_ts for row in asof} == {None}
+    assert {row.asof_ts for row in history} == {None}
 
 
 def test_asof_usd_converts_a_per_share_unit_family(con: duckdb.DuckDBPyConnection) -> None:
@@ -331,6 +369,7 @@ def test_history_usd_returns_only_converted_rows_in_order(
     ]
     assert {row.currency for row in rows} == {"USD"}
     assert {row.unit for row in rows} == {"USD"}
+    assert [row.asof_ts for row in rows] == [RY_ORIGINAL_ACCEPTED, RY_RESTATED_ACCEPTED]
 
 
 def test_history_usd_filters_period_type(con: duckdb.DuckDBPyConnection) -> None:

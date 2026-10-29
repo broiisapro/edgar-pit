@@ -36,7 +36,7 @@ _ASOF_COLUMNS = (
 _USD_ASOF_COLUMNS = (
     "cik, ticker, field, value_usd AS value, unit, currency, period_start, period_end, "
     "period_type, accession, form, acceptance_ts, version, is_restatement, ts_imputed, "
-    "restatement_kind"
+    "restatement_kind, asof_ts"
 )
 
 _EVENT_COLUMNS = "cik, ticker, accession, form, acceptance_ts, ts_imputed, item_code, item_label"
@@ -73,7 +73,9 @@ class AsOfResult:
     of that period ordered by ``(acceptance_ts, accession)``.
     ``restatement_kind`` is ``none``, ``split_adjustment`` (a share-based
     value re-reported for a stock split) or ``revision`` (every other
-    restatement; decision A-25).
+    restatement; decision A-25). ``asof_ts`` is the row's known time for a
+    converted USD read (``max(acceptance_ts, fx_known_at)``, timezone-aware
+    UTC) and ``None`` for a reported read (decision A-41).
     """
 
     cik: str
@@ -92,6 +94,7 @@ class AsOfResult:
     is_restatement: bool
     ts_imputed: bool
     restatement_kind: str
+    asof_ts: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -303,9 +306,14 @@ def _usd_unit(unit: str, currency: str | None) -> str:
 
 
 def _usd_result(row: tuple[Any, ...]) -> AsOfResult:
-    """Build the USD view of a ``fundamentals_pit_usd`` row (decision A-32)."""
+    """Build the USD view of a ``fundamentals_pit_usd`` row (decisions A-32, A-41)."""
     result = _asof_result(row)
-    return replace(result, unit=_usd_unit(result.unit, result.currency), currency="USD")
+    return replace(
+        result,
+        unit=_usd_unit(result.unit, result.currency),
+        currency="USD",
+        asof_ts=_utc(row[16]),
+    )
 
 
 def _text_result(row: tuple[Any, ...]) -> TextResult:
@@ -357,7 +365,8 @@ def asof(
     produced its USD amount was published. ``value`` is ``value_usd``,
     ``currency`` is ``"USD"`` and ``unit`` carries the reported unit with its
     currency replaced (``CAD`` → ``USD``, ``CAD/shares`` → ``USD/shares``);
-    ``acceptance_ts`` stays the filing's own acceptance time. Raises
+    ``acceptance_ts`` stays the filing's own acceptance time and ``asof_ts`` is
+    the row's known time (decision A-41). Raises
     :class:`MissingTableError` when the database has no
     ``main.fundamentals_pit_usd`` (a 1.0.0 release predates FX conversion).
     """

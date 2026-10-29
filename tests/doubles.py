@@ -329,6 +329,14 @@ def filings_text_frame(rows: Iterable[FilingsTextRow] | None = None) -> pl.DataF
     return frame
 
 
+def _main_filings_text(frame: pl.DataFrame, tickers: dict[str, str | None] | None) -> pl.DataFrame:
+    """Return ``frame`` with the issuer ``ticker`` joined on ``cik``."""
+    mapping: dict[str, str | None] = DEFAULT_TICKERS if tickers is None else tickers
+    return frame.with_columns(
+        pl.col("cik").replace_strict(mapping, default=None, return_dtype=pl.String).alias("ticker")
+    ).select(MAIN_FILINGS_TEXT_COLUMNS)
+
+
 def main_filings_text_frame(
     rows: Iterable[FilingsTextRow] | None = None,
     tickers: dict[str, str | None] | None = None,
@@ -343,15 +351,45 @@ def main_filings_text_frame(
     documented dtypes.
     """
     selected = default_filings_text() if rows is None else list(rows)
-    mapping: dict[str, str | None] = DEFAULT_TICKERS if tickers is None else tickers
     frame = pl.DataFrame(
         [_filings_text_values(row) for row in selected],
         schema=_filings_text_schema(),
         orient="row",
     )
-    return frame.with_columns(
-        pl.col("cik").replace_strict(mapping, default=None, return_dtype=pl.String).alias("ticker")
-    ).select(MAIN_FILINGS_TEXT_COLUMNS)
+    return _main_filings_text(frame, tickers)
+
+
+def create_filings_text_tables(
+    con: duckdb.DuckDBPyConnection,
+    frame: pl.DataFrame | None = None,
+    *,
+    tickers: dict[str, str | None] | None = None,
+) -> None:
+    """Create ``raw.filings_text`` and the ``main.filings_text`` model in ``con``.
+
+    ``con`` is an open connection; ``frame`` is a validated ``raw.filings_text``
+    frame (default: :func:`filings_text_frame` of the default rows) and
+    ``tickers`` maps a CIK to the issuer ticker as in
+    :func:`main_filings_text_frame` (default: the three fixture issuers). Both
+    tables are created from scratch, so every test that needs the 8-K text
+    models builds them the one way dbt does: the raw table plus the issuer's
+    ticker. Raises :class:`duckdb.Error` when the connection cannot create the
+    tables.
+    """
+    raw = filings_text_frame() if frame is None else frame
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.execute("CREATE SCHEMA IF NOT EXISTS main")
+    con.execute(duckdb_ddl("filings_text"))
+    con.register("_doubles_text_raw", raw)
+    try:
+        con.execute("INSERT INTO raw.filings_text SELECT * FROM _doubles_text_raw")
+    finally:
+        con.unregister("_doubles_text_raw")
+    con.register("_doubles_text_main", _main_filings_text(raw, tickers))
+    try:
+        con.execute("CREATE TABLE main.filings_text AS SELECT * FROM _doubles_text_main")
+    finally:
+        con.unregister("_doubles_text_main")
 
 
 def default_fx_daily() -> list[FxDailyRow]:
@@ -499,10 +537,10 @@ def build_phase2_db(
 ) -> duckdb.DuckDBPyConnection:
     """Create the Phase 2 tables, filled with the given frames.
 
-    ``raw.filings_text`` and ``raw.fx_daily`` are created with
+    ``raw.filings_text`` and ``main.filings_text`` are created by
+    :func:`create_filings_text_tables`; ``raw.fx_daily`` with
     :func:`edgarpit.schemas.duckdb_ddl`; ``main.fundamentals_pit_usd`` with
-    :data:`FUNDAMENTALS_PIT_USD_DDL` and ``main.filings_text`` from
-    :func:`main_filings_text_frame`. A ``None`` frame uses the default rows of
+    :data:`FUNDAMENTALS_PIT_USD_DDL`. A ``None`` frame uses the default rows of
     the matching builder, so ``build_phase2_db()`` returns a usable database.
     ``path`` selects the database file; without it the database is in memory.
     The session timezone is UTC (decision A-5) and the returned connection is
@@ -512,27 +550,14 @@ def build_phase2_db(
     con.execute("SET TimeZone='UTC'")
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.execute("CREATE SCHEMA IF NOT EXISTS main")
-    frames = {
-        "filings_text": filings_text_frame() if filings_text is None else filings_text,
-        "fx_daily": fx_daily_frame() if fx_daily is None else fx_daily,
-    }
-    for table, frame in frames.items():
-        con.execute(duckdb_ddl(table))
-        con.register("_doubles_frame", frame)
-        try:
-            con.execute(f"INSERT INTO raw.{table} SELECT * FROM _doubles_frame")
-        finally:
-            con.unregister("_doubles_frame")
-    text_main = frames["filings_text"].with_columns(
-        pl.col("cik")
-        .replace_strict(DEFAULT_TICKERS, default=None, return_dtype=pl.String)
-        .alias("ticker")
-    )
-    con.register("_doubles_text", text_main.select(MAIN_FILINGS_TEXT_COLUMNS))
+    create_filings_text_tables(con, filings_text)
+    con.execute(duckdb_ddl("fx_daily"))
+    fx = fx_daily_frame() if fx_daily is None else fx_daily
+    con.register("_doubles_fx", fx)
     try:
-        con.execute("CREATE TABLE main.filings_text AS SELECT * FROM _doubles_text")
+        con.execute("INSERT INTO raw.fx_daily SELECT * FROM _doubles_fx")
     finally:
-        con.unregister("_doubles_text")
+        con.unregister("_doubles_fx")
     con.execute(FUNDAMENTALS_PIT_USD_DDL)
     usd = fundamentals_pit_usd_frame() if fundamentals_usd is None else fundamentals_usd
     con.register("_doubles_usd", usd)

@@ -179,6 +179,7 @@ def test_asof_returns_the_version_known_at_the_time(client: TestClient) -> None:
             "is_restatement": False,
             "ts_imputed": False,
             "restatement_kind": "none",
+            "asof_ts": None,
         }
     ]
 

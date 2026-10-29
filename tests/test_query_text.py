@@ -15,12 +15,10 @@ from pathlib import Path
 import doubles
 import duckdb
 import pit_tables
-import polars as pl
 import pytest
 
 from edgarpit import query
 from edgarpit.query import MissingTableError, TextResult
-from edgarpit.schemas import duckdb_ddl
 
 AAPL_CIK = "0000320193"
 RY_CIK = "0001000275"
@@ -122,40 +120,16 @@ TEXT_ROWS = [
 ]
 
 
-def _insert(con: duckdb.DuckDBPyConnection, table: str, frame: pl.DataFrame) -> None:
-    con.register("_text_frame", frame)
-    try:
-        con.execute(f"INSERT INTO {table} SELECT * FROM _text_frame")
-    finally:
-        con.unregister("_text_frame")
-
-
 def build_text_db(*, path: str | Path | None = None) -> duckdb.DuckDBPyConnection:
     """Create the v1 tables, ``raw.filings_text`` and ``main.filings_text``.
 
-    ``main.filings_text`` is ``raw.filings_text`` plus the issuer's ``ticker``
-    (decision A-38), the shape the dbt model has. ``path`` selects the database
-    file; without it the database is in memory and the open connection is
-    returned, which the caller closes.
+    The two text tables come from :func:`doubles.create_filings_text_tables`, the
+    shared builder of the 8-K text models. ``path`` selects the database file;
+    without it the database is in memory and the open connection is returned,
+    which the caller closes.
     """
     con = pit_tables.build_pit_db(PIT_FUNDAMENTALS, EVENTS, path=path)
-    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
-    con.execute(duckdb_ddl("filings_text"))
-    _insert(con, "raw.filings_text", doubles.filings_text_frame(TEXT_ROWS))
-    con.execute(
-        """
-        CREATE TABLE main.filings_text AS
-        SELECT text.cik, text.accession, text.acceptance_ts, text.ts_imputed, text.document,
-               text.doc_type, text.section, text.section_order, text.text, text.sha256,
-               text.char_count, issuers.ticker
-        FROM raw.filings_text AS text
-        LEFT JOIN (
-            SELECT DISTINCT cik, ticker FROM main.fundamentals_pit
-            UNION
-            SELECT DISTINCT cik, ticker FROM main.events_8k
-        ) AS issuers USING (cik)
-        """
-    )
+    doubles.create_filings_text_tables(con, doubles.filings_text_frame(TEXT_ROWS))
     return con
 
 
