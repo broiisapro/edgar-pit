@@ -320,6 +320,35 @@ def test_a_document_without_text_contributes_no_row(fakes: Fakes, tmp_path: Path
     FilingsTextSchema.validate(frame)
 
 
+def test_a_pdf_exhibit_contributes_no_row_and_is_not_converted(
+    fakes: Fakes, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An ``EX-99.1`` can be a PDF (7 of the live cache's 13,883 documents).
+
+    Its bytes are not HTML, so the converter must never see them; the file
+    name decides. ``fakes.cleaned`` has no entry for the PDF body, so a call
+    would raise ``KeyError`` and fail the test.
+    """
+    cache = RawCache(tmp_path)
+    prime_apple_filing(fakes, cache)
+    pdf = "a15-14853_1ex99d1.pdf"
+    store_document(cache, ACCESSION, pdf, b"%PDF-1.5\r%\xe2\xe3\xcf\xd3\r\n201 0 obj")
+    fakes.pages["index page"].append(
+        DocumentRef(accession=ACCESSION, filename=pdf, doc_type="EX-99.1")
+    )
+    caplog.set_level(logging.INFO, logger="edgarpit.text.ingest")
+
+    frame = ingest.ingest_text(cache, CIK, [ACCESSION], filings_frame())
+
+    assert pdf not in frame["document"].to_list()
+    assert frame["doc_type"].unique().to_list() == ["EX-99.1", "primary"]
+    assert any(
+        "skipped 1 document(s) that are not HTML or text" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+    FilingsTextSchema.validate(frame)
+
+
 def test_a_filing_with_no_extractable_text_yields_the_empty_contract_frame(
     fakes: Fakes, tmp_path: Path
 ) -> None:

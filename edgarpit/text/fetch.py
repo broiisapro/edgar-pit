@@ -5,8 +5,11 @@ database, then stores each filing's ``-index-headers.html`` page and every
 document the page names for the text table — the primary 8-K/8-K/A document and
 each ``EX-99.1`` exhibit (decision A-40) — in the raw cache under ``--data``.
 Filing indexes and documents are immutable, so a key that is already cached is
-never requested again (decision A-30); a second run over the same cache makes no
-HTTP request.
+never requested again (decision A-30); a second run over the same cache makes
+no HTTP request for the keys it holds. An index page that answered 404 is not a
+cache entry — the raw cache stores response bodies, not absences — so those
+accessions are asked again on every run; the pre-2014 filings have no
+``-index-headers.html`` at all and account for almost all of them.
 
 The fetch only fetches: ``raw.filings_text`` is built later by
 :func:`edgarpit.text.ingest.ingest_text` from the cache (decision A-37), which
