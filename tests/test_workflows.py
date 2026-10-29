@@ -4,8 +4,8 @@ These two workflows are the only code here that runs unattended with a real
 credential, on a public repository, against SEC endpoints. The tests pin what a
 reviewer would otherwise have to trust by reading YAML: which events start a
 run, the enable switch, least-privilege permissions, action pins, timeouts, the
-overlap guard, the recorded command sequence, where the SEC User-Agent is
-passed, and which assets a release publishes.
+single concurrency lane both files share, the recorded command sequence, where
+the SEC User-Agent is passed, and the full asset list a release publishes.
 
 Nothing is executed and nothing touches the network: the files are parsed as
 YAML (for structure) and as text (for pins and comments).
@@ -14,6 +14,7 @@ YAML (for structure) and as text (for pins and comments).
 from __future__ import annotations
 
 import re
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,13 @@ from typing import Any
 import pytest
 import yaml
 
+from edgarpit import __version__
+from edgarpit.export import EXPORTS, PHASE2_EXPORTS
+
 WORKFLOW_DIR = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 REFRESH_PATH = WORKFLOW_DIR / "refresh.yml"
 RELEASE_PATH = WORKFLOW_DIR / "release.yml"
+ROOT = WORKFLOW_DIR.parents[1]
 PATHS = pytest.mark.parametrize("path", [REFRESH_PATH, RELEASE_PATH], ids=["refresh", "release"])
 
 # The repository variable that turns the scheduled workflows on. Both workflows
@@ -281,6 +286,36 @@ def test_one_run_at_a_time(path: Path) -> None:
         assert "concurrency" not in job, f"{path.name} job {name!r} overrides concurrency"
 
 
+def test_refresh_and_release_share_one_schedule_lane() -> None:
+    """One group across both files: they can never fetch at the same time.
+
+    Each run holds its own SEC token bucket, so two overlapping runs would
+    send up to 10 requests/s even though every single run respects 5. A
+    release that arrives while the refresh is still going must queue, and
+    neither may be cancelled in flight: a cancel would leave the cache with
+    whatever half-finished write the runner had reached.
+    """
+    refresh = load(REFRESH_PATH)["concurrency"]
+    release = load(RELEASE_PATH)["concurrency"]
+    assert refresh["group"] == "edgarpit-scheduled"
+    assert release["group"] == refresh["group"]
+    assert refresh["cancel-in-progress"] is False
+    assert release["cancel-in-progress"] is False
+
+
+# --- released version ---------------------------------------------------------
+
+
+def test_every_place_that_reports_the_version_agrees() -> None:
+    """The package version, the project metadata and the lockfile are one number."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked = {package["name"]: package["version"] for package in lock["package"]}
+    assert pyproject["project"]["version"] == "1.1.0"
+    assert __version__ == pyproject["project"]["version"]
+    assert locked["edgarpit"] == pyproject["project"]["version"]
+
+
 # --- no interpolation into shell scripts --------------------------------------
 
 
@@ -457,9 +492,11 @@ def test_release_fetches_the_whole_universe_before_building() -> None:
 
 def test_release_assembles_every_documented_asset() -> None:
     assemble = step_named(RELEASE_PATH, "Assemble the release assets")["run"]
+    # One glob copies whatever the exporter wrote; the exporter's table list
+    # below is what the notes must describe.
+    assert "cp release/*.parquet release/manifest.json assets/" in assemble
     for asset in (
         "edgarpit.duckdb",
-        "*.parquet",
         "manifest.json",
         "build-info.json",
         "SHA256SUMS",
@@ -469,13 +506,36 @@ def test_release_assembles_every_documented_asset() -> None:
     assert 'TAG="data-$(date -u +%F)"' in assemble
 
 
-def test_release_notes_are_written_for_strangers() -> None:
-    assemble = step_named(RELEASE_PATH, "Assemble the release assets")["run"]
-    assert "acceptance timestamp" in assemble
-    assert "sha256sum -c SHA256SUMS" in assemble
-    assert "SEC EDGAR" in assemble
-    assert "MIT" in assemble
-    assert "assets:" in assemble.lower()
+def test_release_notes_list_every_exported_asset() -> None:
+    """The notes name all eight tables the export writes, and invent none.
+
+    The list is pinned against ``edgarpit.export`` rather than against a copy,
+    so adding a table to the release without describing it fails here.
+    """
+    notes = step_named(RELEASE_PATH, "Assemble the release assets")["run"]
+    tables = [table.name for table in EXPORTS + PHASE2_EXPORTS]
+    assert len(tables) == 8
+    for table in tables:
+        assert f"- {table}.parquet - " in notes, table
+    for asset in ("edgarpit.duckdb", "manifest.json", "build-info.json", "SHA256SUMS"):
+        assert f"- {asset} - " in notes, asset
+    # No stale or invented Parquet name in the notes.
+    mentioned = set(re.findall(r"\b([a-z][a-z0-9_]*)\.parquet\b", notes))
+    assert mentioned == set(tables)
+    # A stranger must learn what the two Phase 2 tables mean, not just see names.
+    assert "8-K text is split on the filing's own Item headings" in notes
+    assert "USD values are converted with the latest Bank of Canada rate" in notes
+
+
+def test_release_notes_explain_how_the_release_became_known() -> None:
+    notes = step_named(RELEASE_PATH, "Assemble the release assets")["run"]
+    # The point-in-time rule is the one thing every consumer must understand.
+    assert "acceptance timestamp" in notes
+    assert "asof_ts" in notes
+    assert "sha256sum -c SHA256SUMS" in notes
+    assert "SEC EDGAR" in notes
+    assert "MIT" in notes
+    assert "assets:" in notes.lower()
 
 
 def test_publishing_is_a_separate_least_privilege_job() -> None:

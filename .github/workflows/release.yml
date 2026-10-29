@@ -21,10 +21,13 @@ on:
 permissions:
   contents: read
 
-# One release at a time; a manual run waits for a scheduled one instead of
-# racing it for the same tag.
+# The release shares one lane with the nightly refresh (decision A-42): it
+# waits for a running refresh instead of racing it for the cache key, and
+# because each workflow holds its own SEC token bucket, overlapping runs would
+# otherwise send up to 10 requests/s. A manual run also waits for a scheduled
+# one instead of racing it for the same tag.
 concurrency:
-  group: data-release
+  group: edgarpit-scheduled
   cancel-in-progress: false
 
 jobs:
@@ -114,11 +117,20 @@ jobs:
 
           Assets:
 
-          - edgarpit.duckdb - the complete database: raw staging tables, point-in-time fundamentals, ratios, 8-K events and filing text.
-          - fundamentals_pit.parquet, ratios_pit.parquet, events_8k.parquet, filings.parquet, facts_raw.parquet - one Parquet file per released table, with a fixed row order so two exports of the same data are byte-identical.
+          - edgarpit.duckdb - the complete database: raw staging tables, point-in-time fundamentals, USD-converted fundamentals, ratios, 8-K events and their text, and the FX series.
+          - fundamentals_pit.parquet - one row per reported value version, keyed by the accession and acceptance time of the filing that carried it.
+          - fundamentals_pit_usd.parquet - the same versions converted to US dollars at the Bank of Canada rate published by their asof_ts; a row appears only once both its filing and its rate were public.
+          - ratios_pit.parquet - ratios computed only from versions known at each row's asof_ts.
+          - events_8k.parquet - one row per 8-K item, timestamped by the filing's acceptance time.
+          - filings.parquet - every filing the dataset used, with its form, acceptance time and whether that time was imputed.
+          - filings_text.parquet - the text of every selected 8-K, split into item sections, known at the acceptance time of the filing it came from.
+          - fx_daily.parquet - the Bank of Canada FXUSDCAD series with the instant each observation became public.
+          - facts_raw.parquet - every XBRL fact as filed, before concept mapping, so a mapped value can be traced back to its source.
           - manifest.json - row counts, SHA-256 per Parquet file and the SEC fetch date range this build used.
           - build-info.json - package version, table row counts and raw-cache document counts.
           - SHA256SUMS - the SHA-256 of every file above.
+
+          Each Parquet file holds one released table with a fixed row order, so two exports of the same data are byte-identical. 8-K text is split on the filing's own Item headings and falls back to one unsegmented row when the headings are ambiguous. USD values are converted with the latest Bank of Canada rate dated on or before the period end and are never visible before that rate was published.
 
           Verify a download by running "sha256sum -c SHA256SUMS" in the directory that holds the files.
 

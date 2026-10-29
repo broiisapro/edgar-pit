@@ -18,11 +18,14 @@ on:
 permissions:
   contents: read
 
-# A slow refresh must never overlap the next night's run: the first run keeps
-# the slot and the queued one starts after it, so two writers never touch the
-# same cache key or the same SEC endpoints at once.
+# One schedule lane shared with the weekly release (decision A-42): a slow
+# refresh must never overlap the next night's run, and a release entering the
+# lane waits for a running refresh instead of racing it for the cache key.
+# Because each run holds its own SEC token bucket, overlapping runs would also
+# send up to 10 requests/s. The first run keeps the slot and the queued one
+# starts after it, so neither ever happens.
 concurrency:
-  group: refresh-data
+  group: edgarpit-scheduled
   cancel-in-progress: false
 
 jobs:
