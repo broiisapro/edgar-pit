@@ -33,6 +33,19 @@ _TEXT_DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
 
 _TEXT_COLUMNS = list(_TEXT_DTYPES)
 
+# Documents the text pipeline can read: HTML markup and plain text. An
+# ``EX-99.1`` can also be a PDF (7 of the 13,883 documents in the 250-issuer
+# live cache fetched on 2026-10-29), which carries no markup and no plain text;
+# converting its bytes would produce garbage or, on a compressed stream, a
+# RecursionError in the HTML renderer. Those documents stay in the raw cache as
+# fetched evidence and contribute no ``raw.filings_text`` row.
+_TEXT_SUFFIXES = (".htm", ".html", ".txt")
+
+
+def _is_text_document(filename: str) -> bool:
+    """True when ``filename`` is an HTML or plain-text document (case-insensitive)."""
+    return filename.strip().lower().endswith(_TEXT_SUFFIXES)
+
 
 def _frame(rows: list[tuple[object, ...]]) -> pl.DataFrame:
     """Return ``rows`` as a ``raw.filings_text`` frame in contract column order.
@@ -118,7 +131,10 @@ def ingest_text(
     accession's ``items`` column (``"2.02,9.01"``), in the order the filing
     lists them. Per decision A-40 only the primary 8-K/8-K/A document is
     segmented; every ``EX-99.1`` exhibit becomes one ``section='unsegmented'``
-    row. Documents whose cleaned text is blank contribute no rows.
+    row. Documents whose cleaned text is blank contribute no rows, and neither
+    does a document whose file name is not HTML or plain text (an ``EX-99.1``
+    can be a PDF): its bytes stay in the raw cache as fetched evidence, but the
+    HTML converter never runs on them.
 
     The result has one row per (document, section), valid under
     :class:`edgarpit.schemas.FilingsTextSchema` and sorted by
@@ -150,6 +166,7 @@ def ingest_text(
 
     rows: list[tuple[object, ...]] = []
     skipped: list[str] = []
+    binary: list[str] = []
     for accession in accessions:
         filing = _filing_row(filings, accession)
         index_body = raw.latest("filing_index", cik, accession)
@@ -163,6 +180,9 @@ def ingest_text(
                 raise ValueError(
                     f"filing index for {accession} lists a document of {ref.accession}"
                 )
+            if not _is_text_document(ref.filename):
+                binary.append(document_key(accession, ref.filename))
+                continue
             key = document_key(accession, ref.filename)
             body = raw.latest("documents", cik, key)
             if body is None:
@@ -195,6 +215,13 @@ def ingest_text(
             cik,
             len(skipped),
             ", ".join(skipped[:5]),
+        )
+    if binary:
+        LOGGER.info(
+            "CIK %s: skipped %d document(s) that are not HTML or text (first five: %s)",
+            cik,
+            len(binary),
+            ", ".join(binary[:5]),
         )
     frame = _frame(rows).sort(["accession", "document", "section_order"], maintain_order=True)
     FilingsTextSchema.validate(frame)

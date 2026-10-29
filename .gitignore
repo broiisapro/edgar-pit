@@ -22,6 +22,7 @@ build/
 
 # Data and build outputs (fixtures under tests/fixtures/ are committed)
 data/
+build-live/
 release/
 *.duckdb
 *.duckdb.wal

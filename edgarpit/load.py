@@ -3,8 +3,8 @@
 Two loaders write the ``raw`` schema of ``<out_dir>/edgarpit.duckdb``:
 :func:`load_tables` replaces the Pandera-validated staging tables from the
 ingest frames, and :func:`load_reference_tables` replaces ``raw.concept_map``
-and ``raw.universe`` from ``config/concept_map.yaml`` and
-``config/universe.csv``. Both set the connection's session timezone to UTC
+and ``raw.universe`` from ``config/concept_map.yaml`` and a universe frame.
+Both set the connection's session timezone to UTC
 (decision A-5) and both are transactional: a validation error or a failed
 insert leaves the previously loaded tables untouched.
 
@@ -27,7 +27,7 @@ import logging
 import os
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -78,6 +78,14 @@ BUILD_INFO_TABLES: tuple[str, ...] = (
 )
 
 DEFAULT_UNIVERSE_CSV = Path(__file__).resolve().parents[1] / "config" / "universe.csv"
+DEFAULT_UNIVERSE_LARGE_CSV = Path(__file__).resolve().parents[1] / "config" / "universe_large.csv"
+
+# The project's universe files, most specific first. ``build_from_raw`` loads
+# the rows of both that the cache actually holds, so a build of the 250-issuer
+# cache carries a ticker, country and filer type for every cached issuer and
+# never lists an issuer the cache has no filings for (decision A-20; the
+# 40-issuer file is a subset of the large one since decision A-36).
+UNIVERSE_PATHS: tuple[Path, ...] = (DEFAULT_UNIVERSE_CSV, DEFAULT_UNIVERSE_LARGE_CSV)
 
 _CIK_DIR = re.compile(r"^\d{10}$")
 
@@ -162,20 +170,73 @@ def _concept_map_frame(concept_map: ConceptMap) -> pl.DataFrame:
 
 
 def _read_universe(path: Path) -> pl.DataFrame:
-    """Read ``config/universe.csv``: five columns, zero-padded CIK strings."""
+    """Read a universe CSV: five columns, zero-padded CIK strings."""
     try:
         frame = pl.read_csv(path, schema_overrides={"cik": pl.String})
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"universe CSV not found: {path}") from exc
+    return _validate_universe(frame, str(path))
+
+
+def _validate_universe(frame: pl.DataFrame, source: str) -> pl.DataFrame:
+    """Select and check the five universe columns of ``frame``.
+
+    ``source`` names the CSV or caller in the error messages. Returns the frame
+    with the columns in ``_UNIVERSE_COLUMNS`` order and ``cik`` as a string.
+    Raises :class:`ValueError` for a missing column or a CIK that is not ten
+    digits.
+    """
     missing = [column for column in _UNIVERSE_COLUMNS if column not in frame.columns]
     if missing:
-        raise ValueError(f"universe CSV {path} is missing columns {missing}")
+        raise ValueError(f"universe {source} is missing columns {missing}")
     frame = frame.select(_UNIVERSE_COLUMNS)
-    malformed = frame.filter(~pl.col("cik").str.contains(r"^\d{10}$"))
+    malformed = frame.filter(~pl.col("cik").cast(pl.String).str.contains(r"^\d{10}$"))
     if malformed.height:
         ciks = malformed.get_column("cik").to_list()
-        raise ValueError(f"universe CSV {path} has CIKs that are not 10 digits: {ciks}")
-    return frame
+        raise ValueError(f"universe {source} has CIKs that are not 10 digits: {ciks}")
+    return frame.with_columns(pl.col("cik").cast(pl.String))
+
+
+def reference_universe(
+    cached_ciks: Collection[str], *, paths: Sequence[Path] = UNIVERSE_PATHS
+) -> pl.DataFrame:
+    """Return the ``raw.universe`` rows of the issuers a raw cache holds.
+
+    ``cached_ciks`` are the ten-digit CIKs with a cached submissions document,
+    i.e. the issuers a build can produce rows for. ``paths`` are universe CSVs
+    in precedence order, by default ``config/universe.csv`` then
+    ``config/universe_large.csv``. Returns every row of those files whose CIK is
+    in ``cached_ciks``, once per CIK and sorted by CIK, with the columns
+    ``ticker, cik, name, country, filer_type`` and ``cik`` as a zero-padded
+    ten-character string.
+
+    An issuer listed in both files keeps its first row, because the two files
+    describe the same issuer; a CIK whose rows disagree on any of the four
+    metadata columns raises :class:`ValueError` naming it rather than letting
+    file order decide which ticker a consumer sees. Raises
+    :class:`FileNotFoundError` for a missing file and :class:`ValueError` for a
+    malformed one.
+    """
+    frames = [_read_universe(Path(path)) for path in paths]
+    if not frames:
+        raise ValueError("no universe CSV given")
+    combined = pl.concat(frames)
+    variants = (
+        combined.unique()
+        .group_by("cik")
+        .agg(pl.len().alias("rows"))
+        .filter(pl.col("rows") > 1)
+        .sort("cik")
+    )
+    if variants.height:
+        ciks = variants.get_column("cik").to_list()
+        raise ValueError(f"universe files disagree about CIK(s) {ciks}")
+    wanted = sorted(set(cached_ciks))
+    return (
+        combined.filter(pl.col("cik").is_in(wanted))
+        .unique(subset="cik", keep="first", maintain_order=True)
+        .sort("cik")
+    )
 
 
 def _empty_contract_frame(table: str) -> pl.DataFrame:
@@ -229,6 +290,7 @@ def load_reference_tables(
     *,
     concept_map: ConceptMap | None = None,
     universe_csv: Path | None = None,
+    universe: pl.DataFrame | None = None,
 ) -> None:
     """Replace ``raw.concept_map`` and ``raw.universe`` with the reference data.
 
@@ -236,18 +298,27 @@ def load_reference_tables(
     unit_family)`` is flattened from ``concept_map`` (default:
     :func:`edgarpit.concepts.load_concept_map` on ``config/concept_map.yaml``);
     ``concept_rank`` is 1-based, 1 being the field's preferred concept.
-    ``raw.universe(ticker, cik, name, country, filer_type)`` is read from
-    ``universe_csv`` (default ``config/universe.csv``) with ``cik`` kept as a
-    zero-padded 10-digit string. Both tables are dropped, recreated and filled
-    in one transaction; a malformed map or CSV raises before anything is
-    written. The connection's timezone is set to UTC (decision A-5) so
-    ``concept_rank`` etc. load deterministically; these tables carry no
-    timestamps.
+    ``raw.universe(ticker, cik, name, country, filer_type)`` comes from
+    ``universe`` when given (the rows
+    :func:`reference_universe` selected for a cache), otherwise from
+    ``universe_csv`` (default ``config/universe.csv``), with ``cik`` kept as a
+    zero-padded 10-digit string. ``universe`` and ``universe_csv`` are mutually
+    exclusive. Both tables are dropped, recreated and filled in one transaction;
+    a malformed map, CSV or frame raises before anything is written. The
+    connection's timezone is set to UTC (decision A-5) so ``concept_rank`` etc.
+    load deterministically; these tables carry no timestamps.
     """
+    if universe is not None and universe_csv is not None:
+        raise ValueError("pass either universe or universe_csv, not both")
     if concept_map is None:
         concept_map = load_concept_map(DEFAULT_CONCEPT_MAP_PATH)
     concept_frame = _concept_map_frame(concept_map)
-    universe_frame = _read_universe(DEFAULT_UNIVERSE_CSV if universe_csv is None else universe_csv)
+    if universe is not None:
+        universe_frame = _validate_universe(universe, "frame")
+    else:
+        universe_frame = _read_universe(
+            DEFAULT_UNIVERSE_CSV if universe_csv is None else universe_csv
+        )
     con.execute("SET TimeZone='UTC'")
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     with _transaction(con):
@@ -493,7 +564,10 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     :func:`edgarpit.text.ingest.ingest_text` for every accession with a cached
     filing index and ``raw.fx_daily`` by :func:`edgarpit.fx.valet.parse_valet`
     for every cached FX series (decision A-37); a cache without those endpoints
-    loads both tables empty, so a Phase 1 cache still builds.
+    loads both tables empty, so a Phase 1 cache still builds. ``raw.universe``
+    carries exactly the cached issuers that the project's universe files list
+    (:func:`reference_universe`), so every row the build produces can be joined
+    to its ticker and no issuer the cache lacks is listed.
 
     Returns the database path. Raises the ingest, Pandera, DuckDB or dbt error
     unchanged, and :class:`RuntimeError` when dbt reports a failed node, so a
@@ -508,7 +582,8 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
     filings_frames: list[pl.DataFrame] = []
     events_frames: list[pl.DataFrame] = []
     facts_frames: list[pl.DataFrame] = []
-    for cik in _cached_ciks(raw):
+    cached_ciks = _cached_ciks(raw)
+    for cik in cached_ciks:
         filings, events_8k = ingest_filings(raw, cik, item_labels)
         filings_frames.append(filings)
         events_frames.append(events_8k)
@@ -534,7 +609,15 @@ def build_from_raw(raw_dir: Path, out_dir: Path) -> Path:
             filings_text=_ingest_filings_text(raw, deduplicated_filings),
             fx_daily=_ingest_fx_daily(raw),
         )
-        load_reference_tables(con)
+        universe = reference_universe(cached_ciks)
+        unmapped = sorted(set(cached_ciks) - set(universe.get_column("cik").to_list()))
+        if unmapped:
+            LOGGER.warning(
+                "%d cached issuers have no row in the universe files: %s",
+                len(unmapped),
+                ", ".join(unmapped),
+            )
+        load_reference_tables(con, universe=universe)
     finally:
         con.close()
     result = _run_dbt(db_path, out / DBT_TARGET_DIRNAME)
