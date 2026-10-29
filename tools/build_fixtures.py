@@ -17,6 +17,8 @@ Layout (decision A-4, uncompressed so PR diffs are reviewable)::
     tests/fixtures/sec/raw/companyfacts/<cik10>/<fetched_at>.json
     tests/fixtures/sec/raw/headers/<cik10>/<accession>/<fetched_at>.hdr.sgml
     tests/fixtures/sec/raw/company_tickers/_/<fetched_at>.json
+    tests/fixtures/sec/raw/filing_index/<cik10>/<accession>/<fetched_at>.html
+    tests/fixtures/sec/raw/documents/<cik10>/<accession>__<filename>/<fetched_at>.<ext>
     tests/fixtures/sec/raw/manifest.jsonl
 
 ``fetched_at`` is ``YYYYMMDDTHHMMSSffffffZ`` (UTC, microseconds).  The
@@ -67,20 +69,27 @@ rest of the fixture tree is left untouched and the manifest is rewritten with
 the refreshed row.  Run it with ``uv run python tools/build_fixtures.py
 --company-tickers``.
 
-``--text`` builds the 8-K text fixtures under ``tests/fixtures/sec_text``
-(decision A-30) for the filings in :data:`TEXT_ITEM_2_02`,
+``--text`` builds the 8-K text fixtures for the filings in :data:`TEXT_ITEM_2_02`,
 :data:`TEXT_OTHER_8KS` and :data:`TEXT_8K_AMENDMENTS`, which must already be
-present in the submissions fixtures::
+present in the submissions fixtures (decision A-30). They join the same cache
+as everything else (decision A-44)::
 
-    tests/fixtures/sec_text/raw/filing_index/<cik>/<accession>/<fetched_at>.html
-    tests/fixtures/sec_text/raw/documents/<cik>/<accession>__<filename>/<fetched_at>.<ext>
-    tests/fixtures/sec_text/raw/manifest.jsonl
+    tests/fixtures/sec/raw/filing_index/<cik>/<accession>/<fetched_at>.html
+    tests/fixtures/sec/raw/documents/<cik>/<accession>__<filename>/<fetched_at>.<ext>
+    tests/fixtures/sec/raw/manifest.jsonl
 
 Every filing's ``<accession>-index-headers.html`` is fetched, then its primary
 document and every ``EX-99.1`` it lists.  Bytes are stored exactly as SEC
-served them, so the fixture manifest rows carry ``"trimmed": false``; the tree
-is separate from ``tests/fixtures/sec`` so that manifest and its checks stay
-untouched.  Run it with ``uv run python tools/build_fixtures.py --text``.
+served them, so the text manifest rows carry ``"trimmed": false``.  The mode
+replaces only the ``filing_index`` and ``documents`` rows and files, leaving
+the other endpoints of the cache untouched, so it can be rerun on its own.
+Run it with ``uv run python tools/build_fixtures.py --text``.
+
+Every mode shares one manifest.  A full run replaces the submissions, page,
+companyfacts and header rows and leaves the text, FX and ``company_tickers``
+entries (written by ``--text``, ``tools/build_fx_fixture.py`` and
+``--company-tickers``) in place, so the cache can be refreshed endpoint by
+endpoint without losing the rest.
 """
 
 from __future__ import annotations
@@ -92,7 +101,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import urllib.error
@@ -108,11 +116,21 @@ from zoneinfo import ZoneInfo
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec"
 RAW_DIR = FIXTURE_ROOT / "raw"
-TEXT_FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "sec_text"
-TEXT_RAW_DIR = TEXT_FIXTURE_ROOT / "raw"
 STAGING_DIR = REPO_ROOT / "tests" / "fixtures" / "staging"
 EXPECTED_ASOF_PATH = REPO_ROOT / "tests" / "fixtures" / "expected_asof.json"
 UNIVERSE_PATH = REPO_ROOT / "config" / "universe.csv"
+
+# The endpoints a full run refetches and rewrites. Everything else in the cache
+# (the 8-K text from ``--text``, the FX series from tools/build_fx_fixture.py
+# and company_tickers from ``--company-tickers``) is left untouched, so one
+# cache serves every endpoint (decision A-44).
+FULL_BUILD_ENDPOINTS: tuple[str, ...] = (
+    "submissions",
+    "submissions_page",
+    "companyfacts",
+    "headers",
+)
+TEXT_ENDPOINTS: tuple[str, ...] = ("filing_index", "documents")
 
 ISSUERS: tuple[tuple[str, str], ...] = (
     ("0001000275", "Royal Bank of Canada"),
@@ -547,15 +565,31 @@ class Manifest:
     """Collects ``raw/manifest.jsonl`` rows while storing fixture files.
 
     ``root`` is the fixture root the ``path`` column is relative to; the
-    default is the submissions fixture tree, and ``--text`` passes the
-    separate text root so both manifests keep the same row shape.
+    default is the one merged SEC cache, and every mode writes into it
+    (decision A-44).
     """
 
     def __init__(
-        self, rows: list[dict[str, Any]] | None = None, *, root: Path = FIXTURE_ROOT
+        self, rows: list[dict[str, Any]] | None = None, *, root: Path | None = None
     ) -> None:
         self.rows: list[dict[str, Any]] = list(rows or [])
-        self.root = root
+        self.root = FIXTURE_ROOT if root is None else root
+
+    def discard(self, endpoints: Iterable[str]) -> None:
+        """Delete the stored files and manifest rows of ``endpoints``.
+
+        ``endpoints`` are cache endpoint names (``submissions``, ``documents``,
+        ...). Rows of every other endpoint stay in the manifest, so a mode that
+        refreshes one part of the cache never drops the rest.
+        """
+        wanted = set(endpoints)
+        kept: list[dict[str, Any]] = []
+        for row in self.rows:
+            if row["endpoint"] in wanted:
+                (self.root / row["path"]).unlink(missing_ok=True)
+            else:
+                kept.append(row)
+        self.rows = kept
 
     def store(
         self,
@@ -600,9 +634,13 @@ class Manifest:
         (self.root / "raw" / "manifest.jsonl").write_text(lines, encoding="utf-8")
 
 
-def load_manifest_rows(root: Path = FIXTURE_ROOT) -> list[dict[str, Any]]:
-    """Read the stored fixture manifest under ``root``, or return an empty list."""
-    path = root / "raw" / "manifest.jsonl"
+def load_manifest_rows(root: Path | None = None) -> list[dict[str, Any]]:
+    """Read the stored fixture manifest under ``root``, or return an empty list.
+
+    ``root`` defaults to :data:`FIXTURE_ROOT`; the default is resolved at call
+    time, so a caller (or a test) can point the module at another cache.
+    """
+    path = (FIXTURE_ROOT if root is None else root) / "raw" / "manifest.jsonl"
     if not path.is_file():
         return []
     return [
@@ -668,10 +706,15 @@ def build_company_tickers(*, agent: str, limiter: RateLimiter) -> dict[str, Any]
 
 
 def build(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
-    if RAW_DIR.exists():
-        shutil.rmtree(RAW_DIR)
-    RAW_DIR.mkdir(parents=True)
-    manifest = Manifest()
+    """Fetch the filings, companyfacts and header fixtures into the cache.
+
+    The submissions, page, companyfacts and header rows are replaced; the text,
+    FX and ``company_tickers`` entries are kept, so a full run and the other
+    modes compose on one merged cache (decision A-44).
+    """
+    manifest = Manifest(load_manifest_rows())
+    manifest.discard(FULL_BUILD_ENDPOINTS)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {"issuers": {}, "missing_from_submissions": []}
 
     for cik, name in ISSUERS:
@@ -879,23 +922,27 @@ def _check_filing_kind(cik: str, accession: str, row: dict[str, Any]) -> None:
         raise FixtureError(f"{accession} is selected as the 8-K/A but its form is {form!r}")
 
 
-def build_text(*, agent: str, limiter: RateLimiter) -> dict[str, Any]:
-    """Fetch and store the 8-K text fixtures under ``tests/fixtures/sec_text``.
+def build_text(*, agent: str, limiter: RateLimiter, root: Path | None = None) -> dict[str, Any]:
+    """Fetch and store the 8-K text fixtures in the merged SEC cache.
 
     For every pair from :func:`text_selection` the tool fetches the
     ``-index-headers.html`` page, checks the selected filing's form and items
     against the stored submissions fixtures, then fetches the primary document
     (the index type equal to the form, whose filename must equal the
     submissions ``primaryDocument``) and every ``EX-99.1`` the page lists.
-    Bodies are stored unmodified under the decision A-30 layout and the
-    separate manifest is rewritten from scratch, so a rerun reproduces the
-    tree (only ``fetched_at`` names change).  Returns per-issuer counts.
+    Bodies are stored unmodified under the decision A-30 layout, and the
+    ``filing_index`` and ``documents`` rows of the cache manifest are rewritten
+    from scratch while every other endpoint stays, so a rerun reproduces those
+    two endpoints (only ``fetched_at`` names change) without touching the rest
+    of the merged tree (decision A-44). ``root`` is the cache root and defaults
+    to :data:`FIXTURE_ROOT`, resolved at call time. Returns per-issuer counts.
     """
-    if TEXT_FIXTURE_ROOT.exists():
-        shutil.rmtree(TEXT_FIXTURE_ROOT)
-    TEXT_RAW_DIR.mkdir(parents=True)
-    manifest = Manifest(root=TEXT_FIXTURE_ROOT)
-    index = read_submissions_index()
+    cache_root = FIXTURE_ROOT if root is None else root
+    manifest = Manifest(load_manifest_rows(cache_root), root=cache_root)
+    manifest.discard(TEXT_ENDPOINTS)
+    raw_dir = cache_root / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    index = read_submissions_index(raw_dir)
     summary: dict[str, Any] = {"issuers": {}, "filings": 0, "documents": 0, "exhibits": 0}
 
     for cik, accession in text_selection():
@@ -994,16 +1041,23 @@ def header_acceptance(cik: str, accession: str) -> datetime:
     return stamp.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
 
 
-def read_submissions_index() -> dict[str, dict[str, tuple[dict[str, Any], str]]]:
-    """Map each CIK and accession to its submissions row and source document."""
+def read_submissions_index(
+    raw_dir: Path | None = None,
+) -> dict[str, dict[str, tuple[dict[str, Any], str]]]:
+    """Map each CIK and accession to its submissions row and source document.
+
+    ``raw_dir`` is the cache's ``raw`` directory; it defaults to
+    :data:`RAW_DIR`, resolved at call time.
+    """
+    directory = RAW_DIR if raw_dir is None else raw_dir
     index: dict[str, dict[str, tuple[dict[str, Any], str]]] = {}
     for cik, _ in ISSUERS:
         entries: dict[str, tuple[dict[str, Any], str]] = {}
-        for path in sorted((RAW_DIR / "submissions" / cik).glob("*.json")):
+        for path in sorted((directory / "submissions" / cik).glob("*.json")):
             document = json.loads(path.read_text(encoding="utf-8"))
             for accession, row in submissions_rows(document).items():
                 entries[accession] = (row, "recent")
-        for path in sorted((RAW_DIR / "submissions_page" / cik).glob("*/*.json")):
+        for path in sorted((directory / "submissions_page" / cik).glob("*/*.json")):
             source = f"{path.parent.name}.json"
             document = json.loads(path.read_text(encoding="utf-8"))
             for accession, row in submissions_rows(document).items():
@@ -1339,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
         "--text",
         action="store_true",
         help="fetch the 8-K index, primary documents and EX-99.1 files into "
-        "tests/fixtures/sec_text (decision A-30)",
+        "tests/fixtures/sec/raw (decisions A-30, A-44)",
     )
     args = parser.parse_args(argv)
     if args.staging:
@@ -1373,11 +1427,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {error}", file=sys.stderr)
             return 1
         text_bytes = sum(
-            path.stat().st_size for path in TEXT_FIXTURE_ROOT.rglob("*") if path.is_file()
+            path.stat().st_size
+            for endpoint in TEXT_ENDPOINTS
+            for path in (RAW_DIR / endpoint).rglob("*")
+            if path.is_file()
         )
         text_summary["fixture_bytes"] = text_bytes
         print(json.dumps(text_summary, indent=2))
-        print(f"text fixtures written to {TEXT_FIXTURE_ROOT} ({text_bytes / 1e6:.2f} MB)")
+        print(f"text fixtures written to {RAW_DIR} ({text_bytes / 1e6:.2f} MB)")
         return 0
     try:
         summary = build(agent=agent, limiter=limiter)

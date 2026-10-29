@@ -1,11 +1,12 @@
 """Tests for the Bank of Canada Valet parser and FX fetch step (decision A-32).
 
-The fixture under ``tests/fixtures/fx`` is the real ``FXUSDCAD`` history plus the
-pre-2017 noon series ``IEXE0101``, which stays as evidence only (decision A-39).
-``parse_valet`` turns one document into ``raw.fx_daily`` rows and pins the point
-in time: a rate for date ``d`` is known at ``d`` 17:00 ``America/Toronto`` in
-UTC, 21:00 UTC under daylight saving and 22:00 UTC in winter. ``fetch_fx``
-stores a fetched series only when its body changed.
+The fixtures are the real ``FXUSDCAD`` history under ``tests/fixtures/sec/raw``
+(decisions A-44) plus the pre-2017 noon series ``IEXE0101`` under
+``tests/fixtures/fx/raw``, which stays as evidence only and is never ingested
+(decision A-39). ``parse_valet`` turns one document into ``raw.fx_daily`` rows
+and pins the point in time: a rate for date ``d`` is known at ``d`` 17:00
+``America/Toronto`` in UTC, 21:00 UTC under daylight saving and 22:00 UTC in
+winter. ``fetch_fx`` stores a fetched series only when its body changed.
 """
 
 from __future__ import annotations
@@ -30,11 +31,15 @@ from edgarpit.rawcache import RawCache
 from edgarpit.schemas import FxDailySchema
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
-FX_ROOT = FIXTURE_ROOT / "fx"
+SEC_FX_ROOT = FIXTURE_ROOT / "sec"
+EVIDENCE_FX_ROOT = FIXTURE_ROOT / "fx"
 EXPECTED_PATH = FIXTURE_ROOT / "fx_expected.json"
 
 SERIES = "FXUSDCAD"
 NOON_SERIES = "IEXE0101"
+# The ingested daily series lives in the merged SEC cache; the retired noon
+# series is evidence only and stays in its own root (decisions A-39, A-44).
+SERIES_ROOTS = {SERIES: SEC_FX_ROOT, NOON_SERIES: EVIDENCE_FX_ROOT}
 VALET_URL = "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json"
 TORONTO = ZoneInfo("America/Toronto")
 
@@ -70,7 +75,7 @@ def make_client() -> ValetClient:
 
 def read_fixture(series: str = SERIES) -> dict[str, Any]:
     """Read the newest committed document for ``series`` through the raw cache."""
-    body = RawCache(FX_ROOT).latest("fx", "", series)
+    body = RawCache(SERIES_ROOTS[series]).latest("fx", "", series)
     assert body is not None
     doc = json.loads(body)
     assert isinstance(doc, dict)

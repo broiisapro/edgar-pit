@@ -1,10 +1,11 @@
 """Fixture-tree checks for the real SEC responses under tests/fixtures/sec.
 
 These tests never touch the network.  They verify the tree produced by
-``tools/build_fixtures.py``: layout, size budget, manifest hashes, the
-required issuer cases, that every kept accession has a parsed header, and
-that the staging CSVs and ``expected_asof.json`` are consistent with the
-fixture tree and the frozen staging schemas.
+``tools/build_fixtures.py``, ``tools/build_fixtures.py --text`` and
+``tools/build_fx_fixture.py`` on one merged cache (decision A-44): layout, size
+budget, manifest hashes, the required issuer cases, that every kept accession
+has a parsed header, and that the staging CSVs and ``expected_asof.json`` are
+consistent with the fixture tree and the frozen staging schemas.
 """
 
 from __future__ import annotations
@@ -190,16 +191,68 @@ def test_fixture_tree_layout() -> None:
             "companyfacts",
             "headers",
             "company_tickers",
+            "filing_index",
+            "documents",
+            "fx",
         }
-        assert row["trimmed"] is True
+        # SEC bytes are trimmed to keep the fixtures reviewable; the 8-K text
+        # and the Bank of Canada series are stored exactly as served.
+        assert row["trimmed"] is (row["endpoint"] not in {"filing_index", "documents", "fx"})
         if row["endpoint"] == "headers":
             assert parts[0:3] == ["raw", "headers", row["cik"]]
             assert ACCESSION_RE.fullmatch(parts[3])
         elif row["endpoint"] == "company_tickers":
             assert parts[0:3] == ["raw", "company_tickers", "_"]
             assert row["cik"] == ""
+        elif row["endpoint"] == "filing_index":
+            assert parts[0:3] == ["raw", "filing_index", row["cik"]]
+            assert ACCESSION_RE.fullmatch(parts[3])
+            assert parts[-1].endswith(".html")
+        elif row["endpoint"] == "documents":
+            assert parts[0:3] == ["raw", "documents", row["cik"]]
+            accession, _, filename = parts[3].partition("__")
+            assert ACCESSION_RE.fullmatch(accession)
+            assert filename and parts[-1].endswith(Path(filename).suffix)
+        elif row["endpoint"] == "fx":
+            assert parts[0:3] == ["raw", "fx", "_"]
+            assert parts[3] == "FXUSDCAD", "the SEC cache holds only the ingested daily series"
+            assert row["cik"] == ""
         else:
             assert parts[2] == row["cik"]
+
+
+def test_the_text_and_fx_fixtures_live_in_the_merged_cache() -> None:
+    """Decision A-44: one SEC cache feeds the offline build, text and FX included.
+
+    The separate text root is gone, the 8-K pages and documents are listed in
+    the SEC manifest, and the ingested FX series sits in the same tree; the
+    retired noon series never does, because nothing may ingest it.
+    """
+    assert not (FIXTURE_ROOT / "sec_text").exists(), "tests/fixtures/sec_text was merged"
+    endpoints = {row["endpoint"] for row in load_manifest()}
+    assert {"filing_index", "documents", "fx"} <= endpoints
+    assert list((RAW_DIR / "filing_index").glob("*/*/*.html"))
+    assert list((RAW_DIR / "documents").glob("*/*/*.htm"))
+    assert not (FIXTURE_ROOT / "fx" / "raw" / "fx" / "_" / "FXUSDCAD").exists()
+
+
+def test_manifest_discard_removes_only_the_named_endpoints(tmp_path: Path) -> None:
+    """A mode that refreshes part of the cache keeps the other endpoints' rows."""
+    builder = load_fixture_builder()
+    manifest = builder.Manifest(root=tmp_path)
+    stored: dict[str, Path] = {}
+    for endpoint in ("submissions", "filing_index"):
+        path = tmp_path / "raw" / endpoint / "0000320193" / "20260101T000000000000Z.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"{}")
+        stored[endpoint] = path
+        manifest.rows.append({"path": path.relative_to(tmp_path).as_posix(), "endpoint": endpoint})
+
+    manifest.discard(("filing_index",))
+
+    assert [row["endpoint"] for row in manifest.rows] == ["submissions"]
+    assert not stored["filing_index"].exists()
+    assert stored["submissions"].exists()
 
 
 def test_size_budget() -> None:
@@ -224,6 +277,10 @@ def test_manifest_urls_are_real_sec_urls_for_the_cik() -> None:
             assert cik == ""
             assert url == "https://www.sec.gov/files/company_tickers.json"
             continue
+        if row["endpoint"] == "fx":
+            assert cik == ""
+            assert url == "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json"
+            continue
         assert re.fullmatch(r"\d{10}", cik)
         if row["endpoint"] == "submissions":
             assert url == f"https://data.sec.gov/submissions/CIK{cik}.json"
@@ -233,6 +290,16 @@ def test_manifest_urls_are_real_sec_urls_for_the_cik() -> None:
             assert page.startswith(f"CIK{cik}-submissions-")
         elif row["endpoint"] == "companyfacts":
             assert url == f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        elif row["endpoint"] in {"filing_index", "documents"}:
+            accession = parts[3].partition("__")[0]
+            assert ACCESSION_RE.fullmatch(accession)
+            directory = (
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}"
+            )
+            if row["endpoint"] == "filing_index":
+                assert url == f"{directory}/{accession}-index-headers.html"
+            else:
+                assert url == f"{directory}/{parts[3].partition('__')[2]}"
         else:
             accession = parts[3]
             assert ACCESSION_RE.fullmatch(accession)
@@ -529,7 +596,7 @@ def test_staging_filings_text_names_real_8k_filings() -> None:
     assert len(keys) == len(set(keys))
 
 
-FX_FIXTURE_DIR = FIXTURE_ROOT / "fx" / "raw" / "fx" / "_" / "FXUSDCAD"
+FX_FIXTURE_DIR = RAW_DIR / "fx" / "_" / "FXUSDCAD"
 
 
 def bank_of_canada_rates() -> dict[str, float]:

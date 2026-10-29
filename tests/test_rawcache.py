@@ -247,9 +247,12 @@ def test_verify_without_manifest_is_not_ok(tmp_path: Path) -> None:
 def test_verify_fixture_manifest() -> None:
     report = RawCache(FIXTURES).verify()
     assert report.ok, (report.missing[:5], report.mismatched[:5], report.unlisted[:5])
-    assert report.checked == 456
+    assert report.checked == 499
     assert set(report.inventory) == {"", "0001000275", "0000320193", "0001594805"}
     assert report.inventory[""]["company_tickers"] == 1
+    assert report.inventory[""]["fx"] == 1
+    assert report.inventory["0000320193"]["filing_index"] == 11
+    assert report.inventory["0000320193"]["documents"] == 19
 
 
 def test_cli_verify_fixtures_and_tampered_cache(tmp_path: Path) -> None:
@@ -263,7 +266,11 @@ def test_cli_verify_fixtures_and_tampered_cache(tmp_path: Path) -> None:
     assert good.returncode == 0, good.stderr
     assert "manifest OK" in good.stdout
     assert "0001000275: 210 files" in good.stdout
-    assert "_: 1 files (company_tickers=1)" in good.stdout
+    assert (
+        "0000320193: 109 files (submissions=1, submissions_page=1, companyfacts=1, "
+        "headers=76, filing_index=11, documents=19)" in good.stdout
+    )
+    assert "_: 2 files (company_tickers=1, fx=1)" in good.stdout
 
     cache = RawCache(tmp_path)
     cache.write(

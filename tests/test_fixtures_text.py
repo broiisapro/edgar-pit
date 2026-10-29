@@ -1,12 +1,13 @@
-"""Fixture-tree checks for the real SEC 8-K documents under tests/fixtures/sec_text.
+"""Fixture-tree checks for the real SEC 8-K documents under tests/fixtures/sec.
 
 These tests never touch the network.  They verify the tree produced by
-``tools/build_fixtures.py --text`` (decision A-30): the decision A-30 layout,
-the manifest hashes and URLs, the required Item 2.02 / non-2.02 / amendment
-selection from the submissions fixtures, that every ``-index-headers.html``
-page accounts for exactly the documents stored for its filing, the size
-budget, and that ``tests/fixtures/text_expected.json`` is consistent with the
-stored bytes.
+``tools/build_fixtures.py --text`` on the merged SEC fixture cache (decisions
+A-30 and A-44): the decision A-30 layout of the ``filing_index`` and
+``documents`` endpoints, the manifest hashes and URLs, the required Item 2.02 /
+non-2.02 / amendment selection from the submissions fixtures, that every
+``-index-headers.html`` page accounts for exactly the documents stored for its
+filing, the size budget, and that ``tests/fixtures/text_expected.json`` is
+consistent with the stored bytes.
 
 The extractor at the bottom is a reference used only to confirm that the
 hand-checked headings and sentences are visible text rather than markup; the
@@ -25,10 +26,13 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
+from edgarpit.rawcache import RawCache
+
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 SEC_ROOT = FIXTURE_ROOT / "sec"
-TEXT_ROOT = FIXTURE_ROOT / "sec_text"
-TEXT_RAW_DIR = TEXT_ROOT / "raw"
+TEXT_RAW_DIR = SEC_ROOT / "raw"
 MANIFEST_PATH = TEXT_RAW_DIR / "manifest.jsonl"
 EXPECTED_PATH = FIXTURE_ROOT / "text_expected.json"
 
@@ -40,6 +44,7 @@ RY_CIK = "0001000275"
 
 EVENT_FORMS = frozenset({"8-K", "8-K/A"})
 SIZE_BUDGET_BYTES = 20 * 1024 * 1024
+TEXT_ENDPOINTS = frozenset({"filing_index", "documents"})
 
 STAMP_RE = re.compile(r"\d{8}T\d{6}\d{6}Z")
 ACCESSION_RE = re.compile(r"\d{10}-\d{2}-\d{6}")
@@ -58,14 +63,15 @@ def load_fixture_builder() -> ModuleType:
 
 
 def load_manifest() -> list[dict[str, Any]]:
-    """Return the rows of the text fixture manifest (decision A-15 format)."""
+    """Return the 8-K text rows of the shared SEC fixture manifest (decision A-15)."""
     rows = [
         json.loads(line)
         for line in MANIFEST_PATH.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert rows, "tests/fixtures/sec_text/raw/manifest.jsonl is empty"
-    return rows
+    text_rows = [row for row in rows if row["endpoint"] in TEXT_ENDPOINTS]
+    assert text_rows, "tests/fixtures/sec/raw/manifest.jsonl lists no 8-K text rows"
+    return text_rows
 
 
 def accession_of(row: dict[str, Any]) -> str:
@@ -84,7 +90,7 @@ def filename_of(row: dict[str, Any]) -> str:
 
 def stored_path(row: dict[str, Any]) -> Path:
     """Return the on-disk path of a text manifest row."""
-    return TEXT_ROOT / row["path"]
+    return SEC_ROOT / row["path"]
 
 
 def selected_filings() -> dict[tuple[str, str], list[dict[str, Any]]]:
@@ -130,9 +136,11 @@ def test_text_manifest_and_stored_files_agree() -> None:
     rows = load_manifest()
     listed = {row["path"] for row in rows}
     stored = {
-        path.relative_to(TEXT_ROOT).as_posix() for path in TEXT_RAW_DIR.rglob("*") if path.is_file()
+        path.relative_to(SEC_ROOT).as_posix()
+        for endpoint in TEXT_ENDPOINTS
+        for path in (TEXT_RAW_DIR / endpoint).rglob("*")
+        if path.is_file()
     }
-    stored.discard("raw/manifest.jsonl")
     assert stored == listed, "text manifest and stored files disagree"
     for row in rows:
         parts = row["path"].split("/")
@@ -310,6 +318,73 @@ def test_stored_selection_matches_the_builder() -> None:
         if row["endpoint"] == "filing_index"
     }
     assert stored == expected
+
+
+def test_build_text_writes_into_the_merged_cache_and_keeps_other_endpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``--text`` run reproduces the committed text rows in the merged cache.
+
+    The builder runs on a temporary root that holds only the submissions, page
+    and ``company_tickers`` fixtures, with HTTP served from the committed bytes.
+    It must add the ``filing_index`` and ``documents`` endpoints to that root's
+    manifest, reproduce every committed text row byte for byte, keep the other
+    endpoints, and replace its own rows on a second run instead of duplicating
+    them (decision A-44).
+    """
+    builder = load_fixture_builder()
+    committed = builder.load_manifest_rows()
+    text_rows = [row for row in committed if row["endpoint"] in TEXT_ENDPOINTS]
+    bodies = {row["url"]: (SEC_ROOT / row["path"]).read_bytes() for row in text_rows}
+    kept_endpoints = ("submissions", "submissions_page", "company_tickers")
+
+    root = tmp_path / "sec"
+    kept_rows = []
+    for row in committed:
+        if row["endpoint"] not in kept_endpoints:
+            continue
+        target = root / row["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((SEC_ROOT / row["path"]).read_bytes())
+        kept_rows.append(row)
+    (root / "raw" / "manifest.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in kept_rows), encoding="utf-8"
+    )
+    monkeypatch.setattr(builder, "now_stamp", lambda: "20261028T000000000000Z")
+    monkeypatch.setattr(builder, "_fetch", lambda url, *, agent, limiter: (200, bodies[url]))
+
+    summary = builder.build_text(
+        agent="Test User test@example.com", limiter=builder.RateLimiter(1.0), root=root
+    )
+
+    assert summary["filings"] == 15
+    assert summary["documents"] == 27
+    assert summary["exhibits"] == 12
+    written = builder.load_manifest_rows(root)
+    assert {row["endpoint"] for row in written} == set(kept_endpoints) | TEXT_ENDPOINTS
+    assert [row for row in written if row["endpoint"] == "company_tickers"] == [
+        row for row in kept_rows if row["endpoint"] == "company_tickers"
+    ]
+    new_text_rows = [row for row in written if row["endpoint"] in TEXT_ENDPOINTS]
+    assert len(new_text_rows) == len(text_rows)
+    committed_by_url = {row["url"]: row for row in text_rows}
+    assert {row["url"] for row in new_text_rows} == set(committed_by_url)
+    for row in new_text_rows:
+        original = committed_by_url[row["url"]]
+        assert row["sha256"] == original["sha256"], row["url"]
+        assert row["bytes"] == original["bytes"], row["url"]
+        assert row["trimmed"] is False
+        assert row["path"].split("/")[1:-1] == original["path"].split("/")[1:-1]
+        assert (root / row["path"]).read_bytes() == (SEC_ROOT / original["path"]).read_bytes()
+
+    report = RawCache(root).verify()
+    assert not report.missing and not report.mismatched and not report.unlisted
+
+    second = builder.build_text(
+        agent="Test User test@example.com", limiter=builder.RateLimiter(1.0), root=root
+    )
+    assert second["documents"] == 27
+    assert len(builder.load_manifest_rows(root)) == len(written)
 
 
 def test_fixture_documents_cover_the_formats_the_parser_must_survive() -> None:

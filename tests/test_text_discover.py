@@ -1,8 +1,8 @@
 """8-K document discovery from the filing's ``-index-headers.html`` page.
 
-The fixture tree is the real SEC responses under ``tests/fixtures/sec_text``
-(decision A-30); the expected exhibit file names are the hand-checked ones in
-``tests/fixtures/text_expected.json``. No test here touches the network.
+The fixture tree is the real SEC responses under ``tests/fixtures/sec``
+(decisions A-30, A-44); the expected exhibit file names are the hand-checked
+ones in ``tests/fixtures/text_expected.json``. No test here touches the network.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from hypothesis import strategies as st
 from edgarpit.text.discover import DocumentRef, exhibit_documents
 
 FIXTURES = Path(__file__).parent / "fixtures"
-TEXT_RAW = FIXTURES / "sec_text" / "raw"
+TEXT_RAW = FIXTURES / "sec" / "raw"
 INDEX_ROOT = TEXT_RAW / "filing_index"
 DOCUMENTS_ROOT = TEXT_RAW / "documents"
 EXPECTED = json.loads((FIXTURES / "text_expected.json").read_text(encoding="utf-8"))
