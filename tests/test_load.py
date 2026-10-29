@@ -394,7 +394,6 @@ def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -
 
     assert info["tables"]["raw.filings"] > 0
     assert info["tables"]["raw.facts_raw"] > 0
-    assert info["tables"]["raw.universe"] == 40
     assert info["tables"]["main.fundamentals_pit"] > 0
     assert info["tables"]["main.ratios_pit"] > 0
     assert info["dbt"].startswith("PASS=")
@@ -403,6 +402,38 @@ def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -
     assert {"main.fundamentals_pit", "main.ratios_pit", "main.events_8k", "main.filings"} <= set(
         info["tables"]
     )
+
+
+def test_build_universe_is_the_cached_issuers_with_their_tickers(tmp_path: Path) -> None:
+    """Every cached issuer is in ``raw.universe`` and every fact carries its ticker.
+
+    The fixture cache holds three issuers; a build that loaded
+    ``config/universe.csv`` wholesale would list 40 and leave the ticker of any
+    issuer that file does not carry null.
+    """
+    db = build_from_raw(FIXTURE_RAW, tmp_path / "build")
+    cached = sorted(
+        entry.name
+        for entry in (FIXTURE_RAW / "raw" / "submissions").iterdir()
+        if entry.is_dir() and entry.name.isdigit()
+    )
+
+    con = duckdb.connect(str(db))
+    try:
+        assert con.execute("SELECT cik FROM raw.universe ORDER BY cik").fetchall() == [
+            (cik,) for cik in cached
+        ]
+        assert con.execute(
+            "SELECT count(*) FROM raw.universe WHERE ticker IS NULL OR ticker = ''"
+        ).fetchone() == (0,)
+        assert con.execute(
+            "SELECT count(*) FROM main.fundamentals_pit WHERE ticker IS NULL"
+        ).fetchone() == (0,)
+        assert con.execute(
+            "SELECT count(*) FROM main.filings WHERE ticker IS NULL"
+        ).fetchone() == (0,)
+    finally:
+        con.close()
 
 
 def test_a_phase1_cache_builds_with_the_phase2_tables_empty(tmp_path: Path) -> None:
