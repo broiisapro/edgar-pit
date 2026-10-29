@@ -19,7 +19,7 @@ Everything below describes the merged workflows at the commit that added this do
 
 One job, `refresh`, on `ubuntu-24.04` with a 360-minute timeout. It runs on a schedule at `43 10 * * *` UTC — 02:43 or 03:43 US Pacific, outside the 06:00–09:00 window when the owner's machine and the network are busy — and on manual dispatch. It has no `push` or `pull_request` trigger, so a fork cannot run it and cannot read its secret.
 
-The job carries `if: vars.REFRESH_ENABLED == 'true'`. With the variable unset or any other value the job is skipped and the run reports green without doing anything; a manual dispatch obeys the same switch, so there is no way to bypass it. The workflow's token is read-only (`permissions: contents: read`), and its concurrency group `refresh-data` with `cancel-in-progress: false` makes a slow night hold the slot instead of overlapping the next one.
+The job carries `if: vars.REFRESH_ENABLED == 'true'`. With the variable unset or any other value the job is skipped and the run reports green without doing anything; a manual dispatch obeys the same switch, so there is no way to bypass it. The workflow's token is read-only (`permissions: contents: read`), and its concurrency group `edgarpit-scheduled`, shared with the weekly release, with `cancel-in-progress: false` makes a slow night hold the slot instead of overlapping the next one, and makes a release that enters the lane wait for the running refresh rather than race it.
 
 The steps, in order:
 
@@ -39,7 +39,7 @@ The database itself is not uploaded: it can be rebuilt from the cache at any tim
 
 ### The weekly release (`release.yml`, issue #118/PR #120; full fetch in issue #131/PR #135)
 
-Two jobs. The first, `build`, has a read-only token and runs on `ubuntu-24.04` with a 180-minute timeout. It runs on Sunday at `17 12 * * 0` UTC — 04:17 or 05:17 Pacific, after the nightly refresh — and on manual dispatch, under the same `REFRESH_ENABLED` gate and its own `data-release` concurrency group.
+Two jobs. The first, `build`, has a read-only token and runs on `ubuntu-24.04` with a 180-minute timeout. It runs on Sunday at `17 12 * * 0` UTC — 04:17 or 05:17 Pacific, after the nightly refresh — and on manual dispatch, under the same `REFRESH_ENABLED` gate and the `edgarpit-scheduled` concurrency group it shares with the nightly refresh.
 
 1. **Restore the raw cache read-only** with the same key scheme and `fail-on-cache-miss: true`: publishing a database built from an empty cache would be worse than not publishing. The release never saves a cache.
 2. **Check `SEC_USER_AGENT`** before the first request.
@@ -51,6 +51,8 @@ Two jobs. The first, `build`, has a read-only token and runs on `ubuntu-24.04` w
 8. **Upload** `assets/` and `meta/` as the `release-assets` artifact (7 days), plus `build/build-info.json` and `build/qa.txt` as `release-report` (14 days, uploaded even when the job failed).
 
 The second job, `publish`, is the only job with `contents: write` and a 30-minute timeout. It downloads the artifact and runs `gh release create` with the tag, the notes file and every asset, targeting the commit the run was built from so the tag records which code produced the data. If a release with that tag already exists it fails with a message instead of overwriting: published data releases are immutable, so a same-day re-run waits for the next weekly run. Release tags are append-only, like the `epic-NN-complete` tags.
+
+Both workflows sit in the single concurrency group `edgarpit-scheduled` with `cancel-in-progress: false`, so whichever starts first keeps the lane: a release that arrives while the nightly refresh is running waits for it, a refresh that fires while a release is running waits for the release, and neither cancels the other. Each run holds its own 5 requests/s SEC limiter, so an overlap would send up to 10 requests/s against the fair-access limit; sharing the lane means the two never fetch at the same time, and the release's Sunday slot after the night is a convenience rather than the thing that keeps them apart.
 
 ### Security choices
 
@@ -115,7 +117,6 @@ The workflow tests were shown to fail by mutation: removing the release's full f
 - **Neither workflow has run on GitHub yet.** They are disabled by default and the repository's Actions history has no scheduled run; the first enabled dispatch is the owner's cold backfill.
 - **The first run is expensive.** A cold 250-issuer backfill is tens of thousands of requests at 5 requests/s and usually needs several dispatches; the cache is saved each time, so the runs resume rather than restart.
 - **A cache eviction repeats the cost.** GitHub's 10 GB/7-day cache can evict the tree; the next refresh is then a full fetch again.
-- **The refresh and the release use different concurrency groups.** A long nightly refresh and the Sunday release can overlap, and each run has its own 5 requests/s limiter, so the combined SEC traffic can exceed 5 requests/s for the overlap. Scheduling the release after the night reduces but does not eliminate the window; a shared concurrency group would serialise them.
 - **The workflow's inline release-notes template still lists the five Phase 1 Parquet files.** The assemble step copies every `release/*.parquet`, so a Phase 2 database ships all eight; only the attached notes text is stale. [`docs/release-notes-v1.1.0.md`](release-notes-v1.1.0.md) is the corrected stranger-facing text.
 - **There is no alerting.** A failed schedule is visible in the Actions tab and in the `refresh-report` artifact, not in an inbox or a pager.
 - **The cron times are UTC.** The local Pacific time shifts by an hour across daylight saving; the nightly window avoids the working morning in both offsets, but the release's 04:17/05:17 Pacific is not a fixed wall-clock time.
