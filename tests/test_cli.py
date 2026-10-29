@@ -45,6 +45,7 @@ ASOF_JSON_KEYS = {
     "is_restatement",
     "restatement_kind",
     "ts_imputed",
+    "asof_ts",
 }
 
 
@@ -149,6 +150,8 @@ def test_asof_json_matches_expected_asof(tmp_path: Path) -> None:
     assert row["is_restatement"] is False
     assert row["restatement_kind"] == "none"
     assert row["ts_imputed"] is False
+    # A reported read has no separate known time: its filing's acceptance time is it.
+    assert row["asof_ts"] is None
 
 
 def test_asof_text_output_prints_the_required_fields(tmp_path: Path) -> None:
@@ -175,6 +178,8 @@ def test_asof_text_output_prints_the_required_fields(tmp_path: Path) -> None:
     assert "period_end: 2023-10-31" in result.stdout
     assert "accession: 0001193125-23-285639" in result.stdout
     assert "acceptance_ts: 2023-11-30T11:45:12Z" in result.stdout
+    # A reported read prints no asof_ts line: acceptance_ts is its known time.
+    assert "asof_ts:" not in result.stdout
 
 
 def test_asof_without_a_known_value_exits_1(tmp_path: Path) -> None:
