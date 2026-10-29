@@ -3,10 +3,12 @@
 Commands::
 
     edgarpit universe resolve [--universe CSV] (--offline --fixtures DIR | --data DIR) [--write]
-    edgarpit fetch --universe CSV --out DIR
+    edgarpit fetch --universe CSV --out DIR [--incremental]
+    edgarpit fetch-text --db PATH --items ITEM [--items ITEM ...] [--limit N] [--data DIR]
+    edgarpit fx --out DIR
     edgarpit build (--offline --fixtures DIR | --data DIR) --out DIR
     edgarpit asof --db PATH (--cik CIK | --ticker T) --field F --asof TS
-        [--period FY|Q] [--n N] [--json]
+        [--period FY|Q] [--n N] [--currency USD] [--json]
     edgarpit qa --db PATH
     edgarpit export --db PATH --out DIR
 
@@ -30,12 +32,14 @@ import typer
 from edgarpit.config import ConfigError, Settings
 from edgarpit.export import export_release
 from edgarpit.fetch import FetchReport, fetch_universe
+from edgarpit.fx.valet import FxFetchReport, fetch_fx
 from edgarpit.load import BUILD_INFO_NAME, BUILD_INFO_TABLES, build_from_raw
-from edgarpit.qa import QaReport, run_qa
+from edgarpit.qa import QaReport, format_phase2, run_qa
 from edgarpit.query import AsOfResult
 from edgarpit.query import asof as query_asof
 from edgarpit.rawcache import MANIFEST_NAME, RawCache
 from edgarpit.sec_client import SecClient, SecClientError, company_tickers_url
+from edgarpit.text.fetch import TextFetchReport, fetch_text_documents
 from edgarpit.universe import ResolveReport, UniverseError, load_universe, resolve, write_universe
 
 DEFAULT_UNIVERSE = Path("config/universe.csv")
@@ -169,12 +173,24 @@ def _print_resolve(report: ResolveReport) -> None:
 def fetch(
     universe: Annotated[Path, typer.Option("--universe", help="universe CSV with resolved CIKs")],
     out: Annotated[Path, typer.Option("--out", help="raw-cache directory to fetch into")],
+    incremental: Annotated[
+        bool,
+        typer.Option(
+            "--incremental",
+            help="probe each issuer with one submissions request and skip the unchanged ones",
+        ),
+    ] = False,
 ) -> None:
     """Fetch submissions, pages, companyfacts and SGML headers for the universe.
 
     One rate-limited client is used for the whole run; headers already in the
     cache are never re-fetched. A header 404 is tolerated; any other final HTTP
     error fails that issuer and the command exits 1.
+
+    With ``--incremental`` each issuer costs one submissions request: an issuer
+    whose newest accession and filing count are unchanged keeps its cached
+    pages, companyfacts and headers (decision A-34). The report then prints
+    ``skipped N unchanged`` and marks each skipped issuer ``unchanged``.
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
@@ -189,33 +205,140 @@ def fetch(
         )
     try:
         with SecClient(Settings(), cache=RawCache(out)) as client:
-            report = fetch_universe(issuers, out, client=client)
+            report = fetch_universe(issuers, out, client=client, incremental=incremental)
     except ConfigError as error:
         _fail(str(error), code=2)
-    _print_fetch(report, out)
+    _print_fetch(report, out, incremental=incremental)
     if not report.ok:
         raise typer.Exit(1)
 
 
-def _print_fetch(report: FetchReport, out: Path) -> None:
+def _print_fetch(report: FetchReport, out: Path, *, incremental: bool) -> None:
+    """Print the fetch report; ``incremental`` widens the status column and adds the skip count."""
+    status_width = 9 if incremental else 6
     for line in report.errors:
         typer.echo(f"error: {line}", err=True)
     typer.echo(
-        f"{'issuer':<8} {'cik':<10} {'status':<6} {'requests':>8} "
+        f"{'issuer':<8} {'cik':<10} {'status':<{status_width}} {'requests':>8} "
         f"{'headers':>7} {'cached':>6} {'404':>4}"
     )
     for row in report.issuers:
+        if row.errors:
+            status = "failed"
+        elif row.unchanged:
+            status = "unchanged"
+        else:
+            status = "ok"
         typer.echo(
             f"{row.ticker:<8} {row.cik or '-':<10} "
-            f"{'failed' if row.errors else 'ok':<6} {row.requests:>8} "
+            f"{status:<{status_width}} {row.requests:>8} "
             f"{row.headers_fetched:>7} {row.headers_cached:>6} {row.headers_not_found:>4}"
         )
+    if incremental:
+        typer.echo(f"skipped {report.skipped_unchanged} unchanged")
     typer.echo(
         f"summary: {report.issuers_ok} issuers ok, {report.issuers_failed} failed; "
         f"{report.requests} requests; {report.elapsed_seconds:.1f}s; "
         f"headers {report.headers_fetched} fetched, {report.headers_cached} cached, "
         f"{report.headers_not_found} not found"
     )
+    typer.echo(f"raw cache: {out}")
+
+
+@app.command("fetch-text")
+def fetch_text(
+    db: Annotated[Path, typer.Option("--db", help="built database holding raw.events_8k")],
+    items: Annotated[
+        list[str],
+        typer.Option("--items", help="8-K item code whose filings to fetch, repeatable"),
+    ],
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="stop after this many filings (default: all)"),
+    ] = None,
+    data: Annotated[
+        Path,
+        typer.Option("--data", help="raw-cache directory to fetch into (default ./data)"),
+    ] = Path("data"),
+) -> None:
+    """Fetch filing indexes and 8-K documents for the filings carrying ``--items``.
+
+    ``--db`` is a built database whose ``raw.events_8k`` selects the filings;
+    ``--items`` is repeatable (``--items 2.02 --items 7.01``); ``--limit`` caps
+    the number of filings. The filing index page and every in-scope document
+    (the primary 8-K document and each ``EX-99.1`` exhibit) go into the raw
+    cache under ``--data``; an already cached one is never requested again
+    (decisions A-30, A-37, A-40). Nothing is written to the database: the next
+    ``edgarpit build`` ingests the cached text.
+
+    The client is built before the database is read, so a missing or malformed
+    ``SEC_USER_AGENT`` exits 2 before any request, exactly like ``fetch``. A
+    database without ``raw.events_8k`` exits 1 with the selection's message; a
+    404 on one index or document is printed as ``not found`` and the run
+    continues (exit 0), because the item is permanently absent rather than
+    transiently unavailable.
+    """
+    if limit is not None and limit < 0:
+        raise typer.BadParameter("--limit must be zero or positive")
+    try:
+        client = SecClient(Settings(), cache=RawCache(data))
+    except ConfigError as error:
+        _fail(str(error), code=2)
+    try:
+        with client:
+            report = fetch_text_documents(db, data, items, limit=limit, client=client)
+    except (SecClientError, ValueError) as error:
+        _fail(str(error))
+    except OSError as error:
+        _fail(f"{type(error).__name__}: {error}")
+    _print_text_fetch(report, data)
+
+
+def _print_text_fetch(report: TextFetchReport, data: Path) -> None:
+    """Print the five counts of a text fetch and every key that answered 404."""
+    typer.echo(f"filings selected: {report.filings}")
+    typer.echo(f"index pages fetched: {report.indexes_fetched}")
+    typer.echo(f"documents fetched: {report.documents_fetched}")
+    typer.echo(f"already cached: {report.already_cached}")
+    for key in report.failed:
+        typer.echo(f"  not found: {key}", err=True)
+    typer.echo(f"failed: {len(report.failed)}")
+    typer.echo(f"raw cache: {data}")
+
+
+@app.command()
+def fx(
+    out: Annotated[Path, typer.Option("--out", help="raw-cache directory to write into")],
+) -> None:
+    """Fetch the Bank of Canada ``FXUSDCAD`` series into the raw cache.
+
+    One request fetches the whole series (Canadian dollars per US dollar,
+    business daily). The body is stored under ``raw/fx/_/FXUSDCAD/`` only when
+    it differs from the latest cached copy, so a repeat run on an unchanged
+    series adds no file. Prints the series id, the observation count, the first
+    and last observation dates and whether a file was stored (decisions A-32,
+    A-37). Exits 2 without a valid ``SEC_USER_AGENT`` (the Bank asks automated
+    clients to identify themselves, and the client sends the same contact) and
+    1 on an HTTP or parse failure.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        report = fetch_fx(out)
+    except ConfigError as error:
+        _fail(str(error), code=2)
+    except (SecClientError, ValueError) as error:
+        _fail(str(error))
+    except OSError as error:
+        _fail(f"{type(error).__name__}: {error}")
+    _print_fx(report, out)
+
+
+def _print_fx(report: FxFetchReport, out: Path) -> None:
+    """Print one Valet fetch: series, counts, date range and whether it was stored."""
+    first = _iso_date(report.first_date) or "-"
+    last = _iso_date(report.last_date) or "-"
+    typer.echo(f"{report.series}: {report.observations} observations {first}..{last}")
+    typer.echo("stored: yes" if report.stored else "stored: no (unchanged)")
     typer.echo(f"raw cache: {out}")
 
 
@@ -293,6 +416,10 @@ def asof(
     n: Annotated[
         int, typer.Option("--n", help="how many of the most recent periods to return")
     ] = 1,
+    currency: Annotated[
+        str | None,
+        typer.Option("--currency", help="read the USD view: USD"),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="print JSON instead of text")] = False,
 ) -> None:
     """Print the value of ``field`` as it was known at ``--asof``.
@@ -302,6 +429,13 @@ def asof(
     acceptance_ts; ``--json`` prints an array with those keys plus the rest of
     the result (ticker, period_type, form, version, is_restatement,
     restatement_kind, ts_imputed) and the echoed ``asof``/``period`` arguments.
+
+    ``--currency USD`` reads ``main.fundamentals_pit_usd`` and applies the
+    point-in-time rule to each row's ``asof_ts``, the later of the filing's
+    acceptance time and the FX rate's known time (decisions A-32, A-41), so a
+    CAD amount is not returned before the rate that converted it was published.
+    A database without that model exits 1 with the query's message; any other
+    currency is a usage error (exit 2).
     """
     if (cik is None) == (ticker is None):
         raise typer.BadParameter("exactly one of --cik or --ticker is required")
@@ -310,8 +444,18 @@ def asof(
         raise typer.BadParameter("exactly one of --cik or --ticker is required")
     if period not in ("FY", "Q"):
         raise typer.BadParameter("--period must be FY or Q")
+    if currency not in (None, "USD"):
+        raise typer.BadParameter("--currency must be USD")
     try:
-        results = query_asof(identifier, field, asof_ts, cast(Literal["FY", "Q"], period), n, db=db)
+        results = query_asof(
+            identifier,
+            field,
+            asof_ts,
+            cast(Literal["FY", "Q"], period),
+            n,
+            db=db,
+            currency=cast(Literal["USD"] | None, currency),
+        )
     except ValueError as error:
         _fail(str(error), code=2)
     except LookupError as error:
@@ -453,11 +597,20 @@ def _print_qa(report: QaReport) -> None:
             typer.echo(
                 f"  {violation.table} ({violation.key}): {violation.duplicates} duplicate keys"
             )
+    for line in format_phase2(report):
+        typer.echo(line)
 
 
 @app.command()
 def qa(db: Annotated[Path, typer.Option("--db", help="DuckDB file to report on")]) -> None:
-    """Print the data-quality report; exit 1 when a contract key is duplicated."""
+    """Print the data-quality report; exit 1 on a duplicate key or an ``asof_ts`` leak.
+
+    The Phase 2 sections (FX coverage, USD conversion, 8-K text) follow the
+    Phase 1 sections and render ``not built`` for a database that predates them.
+    A non-zero exit names every failing check: duplicated contract keys and
+    ``main.fundamentals_pit_usd`` rows whose ``asof_ts`` precedes their
+    acceptance time or FX known time (decisions A-32, A-41).
+    """
     try:
         con = duckdb.connect(str(db), read_only=True)
     except Exception as error:  # the CLI boundary turns any connect failure into exit 1
@@ -470,8 +623,16 @@ def qa(db: Annotated[Path, typer.Option("--db", help="DuckDB file to report on")
         con.close()
     _print_qa(report)
     if not report.ok:
-        tables = ", ".join(violation.table for violation in report.key_violations)
-        _fail(f"key uniqueness violated in {tables}")
+        reasons: list[str] = []
+        if report.key_violations:
+            tables = ", ".join(violation.table for violation in report.key_violations)
+            reasons.append(f"key uniqueness violated in {tables}")
+        if report.usd_conversion.asof_violation_count:
+            reasons.append(
+                f"{report.usd_conversion.asof_violation_count} asof_ts violations in "
+                "main.fundamentals_pit_usd (asof_ts before acceptance_ts or fx_known_at)"
+            )
+        _fail("; ".join(reasons))
 
 
 @app.command()

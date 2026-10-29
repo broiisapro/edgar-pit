@@ -48,6 +48,7 @@ REFRESH_COMMANDS: tuple[str, ...] = (
 )
 
 RELEASE_COMMANDS: tuple[str, ...] = (
+    r"^edgarpit fetch --universe config/universe_large\.csv --out data$",
     r"^edgarpit build --data data --out build$",
     r"^edgarpit qa --db build/edgarpit\.duckdb( \| tee build/qa\.txt)?$",
     r"^edgarpit export --db build/edgarpit\.duckdb --out release$",
@@ -57,6 +58,7 @@ RELEASE_COMMANDS: tuple[str, ...] = (
 SECRET_RECEIVERS = frozenset(
     {"Check SEC_USER_AGENT", "Fetch (incremental)", "Fetch filing text", "Fetch FX rates"}
 )
+RELEASE_SECRET_RECEIVERS = frozenset({"Check SEC_USER_AGENT", "Fetch (full)"})
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -390,10 +392,33 @@ def test_refresh_fails_fast_without_the_sec_user_agent() -> None:
     assert names.index("Check SEC_USER_AGENT") < names.index("Fetch (incremental)")
 
 
-def test_release_needs_no_sec_credential() -> None:
+def test_release_passes_the_sec_user_agent_only_to_the_fetching_steps() -> None:
+    """The weekly release fetches, so it needs the secret - but only where it fetches."""
+    document = load(RELEASE_PATH)
+    assert SECRET not in str(document.get("env", {}))
+    receivers: set[str] = set()
+    for job_name, job in document["jobs"].items():
+        assert SECRET not in str(job.get("env", {})), job_name
+        for step in job.get("steps", []):
+            if SECRET in str(step.get("env", {})):
+                receivers.add(step["name"])
+    assert receivers == RELEASE_SECRET_RECEIVERS
     text = RELEASE_PATH.read_text(encoding="utf-8")
-    assert "SEC_USER_AGENT" not in text
+    for _, _, run in run_blocks(RELEASE_PATH):
+        for line in run.splitlines():
+            assert "$SEC_USER_AGENT" not in line or 'if [ -z "$SEC_USER_AGENT" ]; then' in line
     assert "secrets.GITHUB_TOKEN" in text
+    assert "set -x" not in text
+
+
+def test_release_fails_fast_without_the_sec_user_agent() -> None:
+    guard = step_named(RELEASE_PATH, "Check SEC_USER_AGENT")
+    assert "::error::" in guard["run"]
+    assert "SEC_USER_AGENT" in guard["run"]
+    assert "exit 1" in guard["run"]
+    # Before the first request, so an empty secret costs no rate-limit slot.
+    names = [step.get("name") for _, step in steps(RELEASE_PATH)]
+    assert names.index("Check SEC_USER_AGENT") < names.index("Fetch (full)")
 
 
 # --- release ------------------------------------------------------------------
@@ -411,15 +436,23 @@ def test_release_reads_the_cache_without_writing_it() -> None:
     assert restore["with"]["fail-on-cache-miss"] is True
 
 
-def test_release_builds_checks_and_exports_in_order() -> None:
+def test_release_fetches_the_whole_universe_before_building() -> None:
     lines = command_lines(RELEASE_PATH)
     assert lines == [
+        "edgarpit fetch --universe config/universe_large.csv --out data",
         "edgarpit build --data data --out build",
         "edgarpit qa --db build/edgarpit.duckdb | tee build/qa.txt",
         "edgarpit export --db build/edgarpit.duckdb --out release",
     ]
+    # The weekly run is the full-fetch safety net (decision A-42); only the
+    # nightly refresh may use the incremental probe.
+    assert "--incremental" not in RELEASE_PATH.read_text(encoding="utf-8")
     # QA runs before the export, so a key violation stops the release.
     assert_ordered(lines, RELEASE_COMMANDS)
+    names = [step.get("name") for _, step in steps(RELEASE_PATH)]
+    assert names.index("Restore raw cache") < names.index("Fetch (full)")
+    assert names.index("Check SEC_USER_AGENT") < names.index("Fetch (full)")
+    assert names.index("Fetch (full)") < names.index("Build")
 
 
 def test_release_assembles_every_documented_asset() -> None:

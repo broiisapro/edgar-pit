@@ -1,10 +1,14 @@
-# Weekly data release: rebuild from the latest raw cache, prove the data with QA,
-# export the Parquet release and publish it as a GitHub Release.
+# Weekly data release: refresh the whole raw cache from the SEC, rebuild, prove
+# the data with QA, export the Parquet release and publish it as a GitHub Release.
 #
 # Like the nightly refresh this workflow is inert until the repository variable
-# REFRESH_ENABLED is "true". It never fetches from the SEC: the raw cache it
-# restores was filled by the refresh workflow, so a release is reproducible from
-# cached responses and costs the SEC nothing. See docs/operations.md.
+# REFRESH_ENABLED is "true", and it needs the same SEC_USER_AGENT secret. The
+# fetch is deliberately full rather than incremental (decision A-42): once a
+# week it re-reads every submissions page and companyfacts document, so a late
+# XBRL correction that added no filing cannot hide behind the incremental probe
+# for more than a week. Headers and 8-K documents are immutable and cached, so
+# the run costs about one submissions and one companyfacts request per issuer.
+# See docs/operations.md.
 name: Data release
 
 on:
@@ -53,6 +57,25 @@ jobs:
           # An empty cache means the refresh has not run yet; publishing a
           # database built from nothing would be worse than failing.
           fail-on-cache-miss: true
+
+      - name: Check SEC_USER_AGENT
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          if [ -z "$SEC_USER_AGENT" ]; then
+            echo "::error::The repository secret SEC_USER_AGENT is empty. Set it to a real contact such as 'Your Name you@example.com' (SEC fair-access policy) and re-run."
+            exit 1
+          fi
+
+      # Full, not incremental (decision A-42): the weekly run is the safety net
+      # for companyfacts corrections that add no filing, so it re-reads every
+      # submissions page and companyfacts document rather than trusting the
+      # change probe. Headers and 8-K documents stay cached and are not
+      # re-fetched.
+      - name: Fetch (full)
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: uv run edgarpit fetch --universe config/universe_large.csv --out data
 
       - name: Build
         run: uv run edgarpit build --data data --out build
