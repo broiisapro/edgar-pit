@@ -32,7 +32,6 @@ from edgarpit.load import build_from_raw
 from edgarpit.qa import run_qa
 from edgarpit.rawcache import RawCache
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).parent / "fixtures" / "sec"
 EXPECTED_TEXT = Path(__file__).parent / "fixtures" / "text_expected.json"
 
@@ -44,7 +43,6 @@ RY_FY2023_RATE = 1.3871
 RY_FY2023_RATE_DATE = date(2023, 10, 31)
 RY_FY2023_RATE_KNOWN_AT = datetime(2023, 10, 31, 21, 0, tzinfo=UTC)
 
-APPLE_CIK = "0000320193"
 APPLE_TICKER = "AAPL"
 
 FX_SERIES = "FXUSDCAD"
