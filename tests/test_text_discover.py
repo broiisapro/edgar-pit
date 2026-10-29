@@ -253,6 +253,44 @@ def test_two_primary_documents_raise_instead_of_picking_one() -> None:
     assert ACCESSION in str(excinfo.value)
 
 
+def test_an_html_primary_wins_over_the_pdf_of_the_whole_filing() -> None:
+    """McDonald's filing 0000063908-14-000056 lists both, as ``FORM 8-K`` and PDF.
+
+    The live page stores the HTML primary as sequence 1 and a ``PDF OF ENTIRE
+    FORM 8-K`` as sequence 4, so the HTML is the one the text table can use.
+    """
+    page = index_page(
+        [
+            document("1", "8-K", "a8-kcoverexhibitlistingand.htm"),
+            document("2", "EX-99.1", "exhibit991-6302014.htm"),
+            document("4", "8-K", "form8k.pdf"),
+            document("5", "GRAPHIC", "blackjpeglogo.jpg"),
+        ]
+    )
+    assert exhibit_documents(page) == [
+        DocumentRef(
+            accession=ACCESSION, filename="a8-kcoverexhibitlistingand.htm", doc_type="primary"
+        ),
+        DocumentRef(accession=ACCESSION, filename="exhibit991-6302014.htm", doc_type="EX-99.1"),
+    ]
+
+
+def test_a_single_pdf_primary_is_kept() -> None:
+    page = index_page([document("1", "8-K", "form8k.pdf")])
+    assert exhibit_documents(page) == [
+        DocumentRef(accession=ACCESSION, filename="form8k.pdf", doc_type="primary")
+    ]
+
+
+def test_two_html_primary_documents_still_raise() -> None:
+    page = index_page(
+        [document("1", "8-K", "form8k.htm"), document("2", "8-K", "form8k-cover.html")]
+    )
+    with pytest.raises(ValueError, match="2 primary 8-K/8-K/A") as excinfo:
+        exhibit_documents(page)
+    assert ACCESSION in str(excinfo.value)
+
+
 def test_a_page_without_an_accession_raises() -> None:
     page = index_page(
         [document()], comment_accession=None, tag_accession=None, label_accession=None

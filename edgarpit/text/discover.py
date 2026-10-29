@@ -4,7 +4,13 @@ The ``index.json`` of a filing has no document types, so the text work starts
 from the SGML index page at
 ``https://www.sec.gov/Archives/edgar/data/<cik-int>/<accession-no-dashes>/<accession>-index-headers.html``:
 each document row carries a ``<TYPE>`` and a ``<FILENAME>``. Only the primary
-8-K/8-K/A document and the ``EX-99.1`` exhibits are in scope.
+8-K/8-K/A document and the ``EX-99.1`` exhibits are in scope. When the page
+lists more than one 8-K/8-K/A document, a single HTML candidate is the primary:
+EDGAR sometimes lists the HTML primary together with a PDF of the entire filing
+(McDonald's ``0000063908-14-000056`` lists ``a8-kcoverexhibitlistingand.htm``
+as ``FORM 8-K`` and ``form8k.pdf`` as ``PDF OF ENTIRE FORM 8-K``), and only the
+HTML converts to text. Any other multiplicity stays an error rather than a
+guess.
 
 Survey of exhibit ``<TYPE>`` spellings (2026-10-28). Besides the 15 fixture pages
 under ``tests/fixtures/sec_text``, 93 live pages were read from SEC EDGAR: 49
@@ -42,6 +48,12 @@ _DOCUMENT_OPEN_RE = re.compile(r"<DOCUMENT>", re.IGNORECASE)
 _DOCUMENT_CLOSE_RE = re.compile(r"</DOCUMENT>", re.IGNORECASE)
 _PRIMARY_TYPES = frozenset({"8-K", "8-K/A"})
 _EXHIBIT_TYPE_RE = re.compile(r"EX\s*-?\s*99\s*[._\- ]\s*\(?0*1\)?", re.IGNORECASE)
+# EDGAR sometimes lists an HTML primary document and a PDF rendering of the
+# whole filing under the same 8-K type (McDonald's 0000063908-14-000056 lists
+# "FORM 8-K" a8-kcoverexhibitlistingand.htm and "PDF OF ENTIRE FORM 8-K"
+# form8k.pdf). Only HTML carries extractable text, so one HTML candidate
+# disambiguates the pair; two HTML candidates remain an error.
+_HTML_SUFFIXES = (".htm", ".html")
 
 
 @dataclass(frozen=True)
@@ -128,6 +140,35 @@ def _is_exhibit_99_1(doc_type: str) -> bool:
     return _EXHIBIT_TYPE_RE.fullmatch(doc_type.strip()) is not None
 
 
+def _is_html(filename: str) -> bool:
+    """True when ``filename`` has an HTML extension (case-insensitive)."""
+    return filename.strip().lower().endswith(_HTML_SUFFIXES)
+
+
+def _primary_document(accession: str, blocks: list[tuple[int, int, str, str]]) -> str:
+    """Return the filename of the filing's one primary 8-K/8-K/A document.
+
+    ``blocks`` are the page's ``(sequence, position, doc_type, filename)`` rows.
+    Raises :class:`ValueError` naming the ``accession`` when the page has no
+    primary document or when more than one remains after the HTML tie-break
+    described in the module docstring.
+    """
+    primary = [block for block in blocks if block[2].upper() in _PRIMARY_TYPES]
+    if not primary:
+        raise ValueError(f"filing {accession} index page lists no primary 8-K/8-K/A document")
+    if len(primary) > 1:
+        html_primary = [block for block in primary if _is_html(block[3])]
+        if len(html_primary) == 1:
+            primary = html_primary
+    if len(primary) > 1:
+        listed = ", ".join(f"{block[3]} (<TYPE> {block[2]})" for block in primary)
+        raise ValueError(
+            f"filing {accession} index page lists {len(primary)} primary 8-K/8-K/A "
+            f"documents: {listed}"
+        )
+    return primary[0][3]
+
+
 def exhibit_documents(index_headers_html: str) -> list[DocumentRef]:
     """Return the primary document and the ``EX-99.1`` exhibits of a filing.
 
@@ -152,29 +193,23 @@ def exhibit_documents(index_headers_html: str) -> list[DocumentRef]:
     Raises :class:`ValueError` naming the accession when the page carries no
     accession number (or conflicting ones), when it has no ``<DOCUMENT>`` block,
     when its ``<DOCUMENT>`` tags are unbalanced, when a block has no usable
-    ``<SEQUENCE>``, ``<TYPE>`` or ``<FILENAME>``, or when it does not list exactly
-    one primary 8-K/8-K/A document.
+    ``<SEQUENCE>``, ``<TYPE>`` or ``<FILENAME>``, or when it does not list one
+    primary 8-K/8-K/A document. Several candidates are resolved only by the
+    HTML rule of the module docstring: exactly one HTML filename wins, and two
+    HTML candidates or no HTML among them still raise.
     """
     body = html.unescape(index_headers_html)
     accession = _accession(body)
     blocks = _blocks(body, accession)
 
-    primary = [block for block in blocks if block[2].upper() in _PRIMARY_TYPES]
-    if not primary:
-        raise ValueError(f"filing {accession} index page lists no primary 8-K/8-K/A document")
-    if len(primary) > 1:
-        listed = ", ".join(f"{block[3]} (<TYPE> {block[2]})" for block in primary)
-        raise ValueError(
-            f"filing {accession} index page lists {len(primary)} primary 8-K/8-K/A "
-            f"documents: {listed}"
-        )
+    primary = _primary_document(accession, blocks)
 
     exhibits = sorted(
         (block for block in blocks if _is_exhibit_99_1(block[2])),
         key=lambda block: (block[0], block[1]),
     )
     return [
-        DocumentRef(accession=accession, filename=primary[0][3], doc_type="primary"),
+        DocumentRef(accession=accession, filename=primary, doc_type="primary"),
         *(
             DocumentRef(accession=accession, filename=block[3], doc_type="EX-99.1")
             for block in exhibits
