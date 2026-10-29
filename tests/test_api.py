@@ -153,7 +153,7 @@ def test_health(client: TestClient) -> None:
 def test_app_version_matches_the_package_version(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
 
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.1.0"
     assert app.version == __version__
     assert schema["info"]["version"] == __version__
 

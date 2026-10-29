@@ -173,10 +173,15 @@ common ones:
   continues. `refresh-report` and `release-report` are uploaded even when a job
   fails, so the QA text of a failed run is always available.
 
-Both workflows have `concurrency` with `cancel-in-progress: false`: a run that
-starts while another is going waits for it instead of racing it for the cache
-key or the SEC's rate limit. To abandon a stuck run, cancel it from the
-Actions page; the save step then uploads whatever was fetched.
+Both workflows share one `concurrency` group, `edgarpit-scheduled`, with
+`cancel-in-progress: false`: a run that starts while either workflow is going
+waits for it instead of racing it for the cache key or the SEC. The shared
+group matters because every run holds its own 5 requests/s token bucket, so a
+nightly refresh and a weekly release running together would send up to 10
+requests/s and break the SEC's fair-access limit. A manual dispatch therefore
+queues behind a running nightly run, and the Sunday release queues behind
+Saturday night's refresh. To abandon a stuck run, cancel it from the Actions
+page; the save step then uploads whatever was fetched.
 
 ## First run
 
