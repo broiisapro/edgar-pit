@@ -5,7 +5,7 @@ Two GitHub Actions workflows keep the dataset current without a server:
 | Workflow | Trigger | What it produces |
 |---|---|---|
 | `.github/workflows/refresh.yml` | nightly `43 10 * * *` UTC (02:43 or 03:43 US Pacific) and manual dispatch | a refreshed raw cache in the Actions cache, `build-info.json` and the QA report as artifacts |
-| `.github/workflows/release.yml` | weekly Sunday `17 12 * * *` UTC (04:17 or 05:17 Pacific) and manual dispatch | a full (non-incremental) SEC fetch into the restored cache, then a GitHub Release `data-YYYY-MM-DD` with the DuckDB database, five Parquet files, `manifest.json`, `build-info.json` and `SHA256SUMS` |
+| `.github/workflows/release.yml` | weekly Sunday `17 12 * * *` UTC (04:17 or 05:17 Pacific) and manual dispatch | a full (non-incremental) SEC fetch into the restored cache, then a GitHub Release `data-YYYY-MM-DD` with the DuckDB database, eight Parquet files, `manifest.json`, `build-info.json` and `SHA256SUMS` |
 
 Both are inert until the owner switches them on. Nothing in this repository
 fetches SEC data on a schedule until the two settings in the next section
@@ -27,15 +27,17 @@ Actions**:
    both workflows fails with a clear `::error::` when the secret is empty,
    before any request is made.
 
-With `gh` authenticated as a repository admin:
+With `gh` authenticated as a repository admin, [First run](#first-run) has the
+two commands that set both settings, plus how to load `SEC_USER_AGENT` from
+`.env` without printing it.
+
+To pause the schedules, set the variable to `false` (or delete it):
 
 ```bash
-gh variable set REFRESH_ENABLED --body true
-gh secret set SEC_USER_AGENT   # paste the value at the prompt
+gh variable set REFRESH_ENABLED --body false
 ```
 
-To pause the schedules, set the variable to `false` (or delete it). The
-workflows, their history and the existing cache stay in place.
+The workflows, their history and the existing cache stay in place.
 
 The release workflow uses the same `SEC_USER_AGENT`, because it runs a full
 fetch of its own before building; it has no separate secret. It publishes with
@@ -74,9 +76,12 @@ One job, `refresh`, on `ubuntu-24.04` with a 360-minute timeout. In order:
    run dbt. This build exists so the next step can read the list of 8-K
    filings that carry Item 2.02.
 5. `edgarpit fetch-text --db build/edgarpit.duckdb --items 2.02 --data data` —
-   fetch the filing index and documents of every 8-K with Item 2.02 that is
-   not cached yet. It only fetches: the text sections are built by the next
-   step, so the database stays a pure function of the cache.
+   fetch the filing index page and the in-scope documents (the primary 8-K
+   document and each `EX-99.1` exhibit) of every 8-K with Item 2.02 into the
+   raw cache, skipping whatever is already cached. It reads the database only
+   to choose the accessions; it writes nothing to it. The text sections are
+   built by the next step, so the database stays a pure function of the cache
+   (decision A-37).
 6. `edgarpit fx --out data` — request the Bank of Canada `FXUSDCAD` series
    once; the body is stored in the cache only when it differs from the latest
    copy, so an unchanged series adds no file.
@@ -115,15 +120,16 @@ with a 180-minute timeout:
 4. `edgarpit build --data data --out build`.
 5. `edgarpit qa --db build/edgarpit.duckdb | tee build/qa.txt`. A key violation
    exits 1 and stops the job here, so nothing is exported or published.
-6. `edgarpit export --db build/edgarpit.duckdb --out release` — the five
-   Parquet files and `manifest.json`, with a fixed row order and fixed writer
+6. `edgarpit export --db build/edgarpit.duckdb --out release` — one Parquet
+   file per released table (`fundamentals_pit`, `fundamentals_pit_usd`,
+   `ratios_pit`, `events_8k`, `filings`, `filings_text`, `fx_daily`,
+   `facts_raw`) and `manifest.json`, with a fixed row order and fixed writer
    settings, so the same cache exports byte-identically.
-7. **Assemble the assets** in `assets/`: `edgarpit.duckdb`,
-   `build-info.json`, the five `.parquet` files, `manifest.json`, then
-   `SHA256SUMS` over all of them, verified immediately with
-   `sha256sum -c SHA256SUMS`. The same step writes `meta/release-tag.txt`
-   (`data-$(date -u +%F)`) and `meta/release-notes.md`, the stranger-facing
-   release text.
+7. **Assemble the assets** in `assets/`: `edgarpit.duckdb`, `build-info.json`,
+   the eight `.parquet` files, `manifest.json`, then `SHA256SUMS` over all of
+   them, verified immediately with `sha256sum -c SHA256SUMS`. The same step
+   writes `meta/release-tag.txt` (`data-$(date -u +%F)`) and
+   `meta/release-notes.md`, the stranger-facing release text.
 8. **Upload** `assets/` and `meta/` as the `release-assets` artifact (7 days),
    plus `build/build-info.json` and `build/qa.txt` as `release-report`
    (14 days, uploaded even when the job failed).
@@ -172,27 +178,70 @@ starts while another is going waits for it instead of racing it for the cache
 key or the SEC's rate limit. To abandon a stuck run, cancel it from the
 Actions page; the save step then uploads whatever was fetched.
 
-## The first run: a cold backfill
+## First run
+
+The owner does this once, from a clone that has the `.env` file holding the
+declared SEC contact (copy `.env.example` and fill in `SEC_USER_AGENT`; `.env`
+is never committed). Nothing below prints the value: the shell loads it from
+`.env` and pipes it into `gh`, and `gh secret list` shows names and update
+times only.
+
+```bash
+# Load the contact into this shell without echoing it, and fail loudly if empty.
+set -a
+. ./.env
+set +a
+: "${SEC_USER_AGENT:?SEC_USER_AGENT is not set in .env}"
+
+printf '%s' "$SEC_USER_AGENT" | gh secret set SEC_USER_AGENT
+gh variable set REFRESH_ENABLED --body true
+gh secret list
+gh variable list
+```
+
+`gh secret set` reads the value from standard input when `--body` is not
+given, so the contact never appears on screen, in shell history or in the
+process list; `gh secret list` shows names and update times only. Run these
+`gh` commands from the repository root so they target this repository, or add
+`--repo <owner>/edgarpit` to each of them.
+
+Then dispatch the refresh by hand and watch it:
+
+```bash
+gh workflow run refresh.yml
+gh run list --workflow=refresh.yml --limit 1 --json databaseId,status --jq '.[0].databaseId'
+gh run watch <run-id>
+```
+
+A freshly dispatched run can take a few seconds to appear in the list; repeat
+the `gh run list` command if it prints `null`.
 
 The cache starts empty, and one cold fetch of 250 issuers needs tens of
 thousands of requests at the 5 requests/s fair-access ceiling: several hours,
-which is more than a single run usually gets. The design assumes that
-(decision A-42):
+more than the 360-minute job cap (decision A-42). If the run hits the cap,
+**dispatch it again**. Every response already fetched is immutable and the
+`Save raw cache` step runs even when a job times out, so each re-dispatch
+resumes from where the last one stopped instead of from zero. Repeat until a
+run finishes inside the cap and exits 0; that run is the backfill, and nothing
+has to be marked done because the raw cache is its own progress record.
 
-1. Set the two repository settings, then start the refresh **by hand** with
-   `gh workflow run refresh.yml` and watch it (`gh run watch <run-id>`).
-2. If it hits the time cap, **run it again**. Every response already fetched
-   is immutable and the cache is saved even when the job times out, so each
-   re-dispatch starts from where the last one stopped instead of from zero.
-3. Repeat until a run reports success and the next night's schedule runs in
-   minutes. That run is the backfill: nothing extra has to be marked done, and
-   the raw cache is its own progress record.
+Only then dispatch the release, once:
 
-Do not start the weekly release until the backfill has finished at least
-once: the release restores the cache with `fail-on-cache-miss: true` and
-refuses to publish a database built from an empty one. A cold backfill also
-cannot be finished by the weekly release, because the release does not save
-the cache it fills.
+```bash
+gh workflow run release.yml
+gh run list --workflow=release.yml --limit 1 --json databaseId,status --jq '.[0].databaseId'
+gh run watch <run-id>
+```
+
+The release restores the cache with `fail-on-cache-miss: true` and refuses to
+publish a database built from an empty one, so it cannot run before the
+backfill has finished at least once. It also never saves the cache it fills, so
+a cold backfill cannot be completed through the release. A second release on
+the same day fails instead of replacing the first: published data releases are
+immutable, and the next one is the following Sunday's scheduled run.
+
+After that, the nightly schedule only fetches what changed and the weekly
+release re-reads everything once.
 
 ## The Actions cache
 
@@ -230,12 +279,14 @@ with a partial tree.
 - `refresh-report` artifact: `build-info.json` (package version, table row
   counts, raw-cache document counts, SEC fetch range) and `qa.txt` (coverage,
   restatements, imputed timestamps, anomalies, key uniqueness). Kept 14 days.
-- GitHub Release `data-YYYY-MM-DD`: `edgarpit.duckdb`, `fundamentals_pit.parquet`,
+- GitHub Release `data-YYYY-MM-DD`: `edgarpit.duckdb`, the eight Parquet files
+  (`fundamentals_pit.parquet`, `fundamentals_pit_usd.parquet`,
   `ratios_pit.parquet`, `events_8k.parquet`, `filings.parquet`,
-  `facts_raw.parquet`, `manifest.json`, `build-info.json` and `SHA256SUMS`.
-  Verify a download with `sha256sum -c SHA256SUMS` in the directory holding the
-  files. The release page also carries the query snippet and the
-  point-in-time rule, so a stranger who lands there knows what the numbers are.
+  `filings_text.parquet`, `fx_daily.parquet`, `facts_raw.parquet`),
+  `manifest.json`, `build-info.json` and `SHA256SUMS`. Verify a download with
+  `sha256sum -c SHA256SUMS` in the directory holding the files. The release
+  page also carries the query snippet and the point-in-time rule, so a
+  stranger who lands there knows what the numbers are.
 
 ## Security posture
 

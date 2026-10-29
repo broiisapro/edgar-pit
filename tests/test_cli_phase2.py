@@ -642,6 +642,22 @@ def test_asof_usd_json_shows_the_converted_currency(tmp_path: Path) -> None:
     assert payload[0]["currency"] == "USD"
     assert payload[0]["unit"] == "USD"
     assert payload[0]["value"] == pytest.approx(RY_USD)
+    assert payload[0]["asof_ts"] == "2024-01-02T22:00:00Z"
+
+
+def test_asof_usd_text_shows_the_later_known_time(tmp_path: Path) -> None:
+    """A rate published after the filing moves the row's known time past acceptance."""
+    # The premise of this test: the rate is known after the filing is accepted.
+    assert RY_FX_KNOWN_AT > RY_ACCEPTANCE
+    db = create_usd_db(tmp_path / "edgarpit.duckdb")
+    result = RUNNER.invoke(app, asof_args(db, "2024-01-03T00:00:00Z", "--currency", "USD"))
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    acceptance = f"acceptance_ts: {RY_ACCEPTANCE.isoformat().replace('+00:00', 'Z')}"
+    known = f"asof_ts: {RY_FX_KNOWN_AT.isoformat().replace('+00:00', 'Z')}"
+    assert acceptance in lines
+    assert known in lines
+    assert lines.index(known) == lines.index(acceptance) + 1
 
 
 def test_asof_usd_waits_for_the_fx_known_time(tmp_path: Path) -> None:

@@ -69,7 +69,12 @@ def _format_value(value: float) -> str:
 
 
 def _asof_payload(row: AsOfResult, *, asof_ts: str, period: str) -> dict[str, Any]:
-    """The ``--json`` object for one result: the fields of expected_asof.json plus the rest."""
+    """The ``--json`` object for one result: the fields of expected_asof.json plus the rest.
+
+    ``asof_ts`` is the row's known time for a ``--currency USD`` read (the later
+    of the filing's acceptance time and the FX rate's known time, decision A-41)
+    and ``None`` for a reported read.
+    """
     return {
         "cik": row.cik,
         "ticker": row.ticker,
@@ -89,6 +94,7 @@ def _asof_payload(row: AsOfResult, *, asof_ts: str, period: str) -> dict[str, An
         "is_restatement": row.is_restatement,
         "restatement_kind": row.restatement_kind,
         "ts_imputed": row.ts_imputed,
+        "asof_ts": None if row.asof_ts is None else _iso_ts(row.asof_ts),
     }
 
 
@@ -426,14 +432,18 @@ def asof(
 
     One of ``--cik`` or ``--ticker`` identifies the issuer. Text output prints
     value, currency, unit, period_start, period_end, accession and
-    acceptance_ts; ``--json`` prints an array with those keys plus the rest of
-    the result (ticker, period_type, form, version, is_restatement,
-    restatement_kind, ts_imputed) and the echoed ``asof``/``period`` arguments.
+    acceptance_ts, plus ``asof_ts`` for a ``--currency USD`` read; ``--json``
+    prints an array with those keys plus the rest of the result (ticker,
+    period_type, form, version, is_restatement, restatement_kind, ts_imputed)
+    and the echoed ``asof``/``period`` arguments.
 
     ``--currency USD`` reads ``main.fundamentals_pit_usd`` and applies the
     point-in-time rule to each row's ``asof_ts``, the later of the filing's
     acceptance time and the FX rate's known time (decisions A-32, A-41), so a
     CAD amount is not returned before the rate that converted it was published.
+    Each USD row carries that known time as ``asof_ts`` (ISO UTC in ``--json``,
+    an ``asof_ts:`` line in text output); a reported read prints nothing there
+    because its known time is its filing's ``acceptance_ts``.
     A database without that model exits 1 with the query's message; any other
     currency is a usage error (exit 2).
     """
@@ -478,6 +488,8 @@ def asof(
         typer.echo(f"period_end: {_iso_date(row.period_end)}")
         typer.echo(f"accession: {row.accession}")
         typer.echo(f"acceptance_ts: {_iso_ts(row.acceptance_ts)}")
+        if row.asof_ts is not None:
+            typer.echo(f"asof_ts: {_iso_ts(row.asof_ts)}")
 
 
 def _year_list(years: list[int]) -> str:
