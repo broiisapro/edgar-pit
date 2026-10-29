@@ -341,7 +341,7 @@ def test_a_pdf_exhibit_contributes_no_row_and_is_not_converted(
     frame = ingest.ingest_text(cache, CIK, [ACCESSION], filings_frame())
 
     assert pdf not in frame["document"].to_list()
-    assert frame["doc_type"].unique().to_list() == ["EX-99.1", "primary"]
+    assert sorted(frame["doc_type"].unique().to_list()) == ["EX-99.1", "primary"]
     assert any(
         "skipped 1 document(s) that are not HTML or text" in record.getMessage()
         for record in caplog.records

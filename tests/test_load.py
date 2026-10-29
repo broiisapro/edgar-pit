@@ -407,9 +407,8 @@ def test_build_from_raw_writes_build_info_next_to_the_database(tmp_path: Path) -
 def test_build_universe_is_the_cached_issuers_with_their_tickers(tmp_path: Path) -> None:
     """Every cached issuer is in ``raw.universe`` and every fact carries its ticker.
 
-    The fixture cache holds three issuers; a build that loaded
-    ``config/universe.csv`` wholesale would list 40 and leave the ticker of any
-    issuer that file does not carry null.
+    The fixture cache holds three issuers; loading ``config/universe.csv``
+    wholesale would list all 40, 37 of them with no filings in this build.
     """
     db = build_from_raw(FIXTURE_RAW, tmp_path / "build")
     cached = sorted(

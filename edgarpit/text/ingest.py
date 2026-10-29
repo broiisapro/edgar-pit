@@ -35,10 +35,10 @@ _TEXT_COLUMNS = list(_TEXT_DTYPES)
 
 # Documents the text pipeline can read: HTML markup and plain text. An
 # ``EX-99.1`` can also be a PDF (7 of the 13,883 documents in the 250-issuer
-# live cache), which carries no markup and no plain text; converting its bytes
-# would produce garbage or, on a compressed stream, a RecursionError in the
-# HTML renderer. Those documents stay in the raw cache as fetched evidence and
-# contribute no ``raw.filings_text`` row.
+# live cache fetched on 2026-10-29), which carries no markup and no plain text;
+# converting its bytes would produce garbage or, on a compressed stream, a
+# RecursionError in the HTML renderer. Those documents stay in the raw cache as
+# fetched evidence and contribute no ``raw.filings_text`` row.
 _TEXT_SUFFIXES = (".htm", ".html", ".txt")
 
 
