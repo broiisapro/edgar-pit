@@ -522,7 +522,7 @@ def test_release_notes_list_every_exported_asset() -> None:
     # No stale or invented Parquet name in the notes.
     mentioned = set(re.findall(r"\b([a-z][a-z0-9_]*)\.parquet\b", notes))
     assert mentioned == set(tables)
-    # A stranger must learn what the two Phase 2 tables mean, not just see names.
+    # A stranger must learn what the two Phase 2 additions mean, not just their names.
     assert "8-K text is split on the filing's own Item headings" in notes
     assert "USD values are converted with the latest Bank of Canada rate" in notes
 
