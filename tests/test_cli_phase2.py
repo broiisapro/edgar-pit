@@ -16,6 +16,7 @@ the checkout has.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -231,9 +232,21 @@ class StubClient:
         return None
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_PANEL_CHARS = "─│╭╮╰╯"
+
+
 def flat(text: str) -> str:
-    """Collapse whitespace and Rich's panel border, so a wrapped usage error is searchable."""
-    return " ".join(text.replace("│", " ").split())
+    """Strip ANSI colour, panel borders and line wrapping from a Typer usage error.
+
+    Rich styles each token, so ``--limit`` can arrive as ``-`` + colour + ``-limit``,
+    and the bordered panel can split a phrase over two lines. Both depend on the
+    terminal and CI settings, so assertions search the flattened text.
+    """
+    plain = _ANSI_RE.sub("", text)
+    for char in _PANEL_CHARS:
+        plain = plain.replace(char, " ")
+    return " ".join(plain.split())
 
 
 # --- fetch --incremental ------------------------------------------------------
