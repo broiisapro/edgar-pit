@@ -429,9 +429,9 @@ def test_build_universe_is_the_cached_issuers_with_their_tickers(tmp_path: Path)
         assert con.execute(
             "SELECT count(*) FROM main.fundamentals_pit WHERE ticker IS NULL"
         ).fetchone() == (0,)
-        assert con.execute(
-            "SELECT count(*) FROM main.filings WHERE ticker IS NULL"
-        ).fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM main.filings WHERE ticker IS NULL").fetchone() == (
+            0,
+        )
     finally:
         con.close()
 

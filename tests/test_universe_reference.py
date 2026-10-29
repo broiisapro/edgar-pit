@@ -65,9 +65,7 @@ def test_reference_universe_returns_nothing_for_an_empty_cache() -> None:
 def test_reference_universe_rejects_files_that_disagree_about_an_issuer(
     tmp_path: Path,
 ) -> None:
-    first = write_universe(
-        tmp_path / "first.csv", ["RY,0001000275,ROYAL BANK OF CANADA,CA,40-F"]
-    )
+    first = write_universe(tmp_path / "first.csv", ["RY,0001000275,ROYAL BANK OF CANADA,CA,40-F"])
     second = write_universe(tmp_path / "second.csv", ["RY,0001000275,ROYAL BANK,CA,10-K"])
 
     with pytest.raises(ValueError, match=r"disagree about CIK\(s\) \['0001000275'\]"):
